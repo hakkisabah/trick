@@ -234,3 +234,20 @@ def test_arxiv_url_encodes_terms_without_raw_quotes():
     assert "%20" in url or "+" in url
     assert url.count("all:") == 3
     assert "max_results=3" in url
+
+
+def test_contact_email_joins_the_polite_pool(monkeypatch):
+    monkeypatch.setenv("TRICK_CONTACT_EMAIL", "trick@example.org")
+    url = OpenAlexAdapter(transport(b"{}")).url_for("mixed effects", 3)
+    assert "mailto=trick%40example.org" in url
+    crossref = CrossrefAdapter(transport(b"{}")).url_for("mixed effects", 3)
+    assert "mailto=trick%40example.org" in crossref
+
+
+def test_contact_email_is_optional_and_validated(monkeypatch):
+    monkeypatch.delenv("TRICK_CONTACT_EMAIL", raising=False)
+    url = OpenAlexAdapter(transport(b"{}")).url_for("mixed effects", 3)
+    assert "mailto" not in url
+    for bad in ("", "not-an-email", "a@b" + "c" * 300):
+        monkeypatch.setenv("TRICK_CONTACT_EMAIL", bad)
+        assert "mailto" not in OpenAlexAdapter(transport(b"{}")).url_for("q", 3), bad

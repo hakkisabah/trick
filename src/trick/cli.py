@@ -3,13 +3,17 @@
 Subcommands:
 
     trick query "mixed effects convergence" [--live] [--limit 8] [--json]
+    trick tui                        interactive terminal session (Enter submits)
+    trick serve                      the core service: unix socket + loopback HTTP
+    trick mcp                        MCP server on stdio, for Gemini CLI / Open WebUI
     trick ingest [--source cran,bioc] [--max-docs N]
     trick doctor
     trick probe                      one real laya call, prints latency and usage
 
-The interactive terminal UI (Enter to submit, history, arrows) is added in the
-next phase on top of the same engine; this module stays the scripting surface,
-so an editor plugin or a test can call exactly what a human sees.
+``tui``, ``mcp`` and the HTTP bridge all talk to the same core: if ``trick serve``
+is running they forward to it, otherwise they build an engine in process. That is
+why a query typed in the terminal and a query asked through Open WebUI cannot
+disagree about ranking.
 """
 
 from __future__ import annotations
@@ -17,12 +21,17 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import sys
+import time
 from pathlib import Path
 
+from .bridge import BridgeServer, cors_from_env
 from .credentials import DEFAULT_CREDENTIALS_PATH, load_laya_credentials
 from .errors import ConfigError, TrickError
 from .laya import LayaClient, build_scorer
+from .mcp import EngineBackend, McpServer, build_backend
+from .render import render_json, render_outcome
 from .retrieval import (
     CRAN_DOWNLOAD_REF,
     CranDownloadsAdapter,
@@ -30,17 +39,47 @@ from .retrieval import (
     log_weight,
 )
 from .search import SearchEngine, build_engine
+from .service import (
+    Service,
+    ServiceClient,
+    UnixServiceServer,
+    load_or_create_token,
+)
 from .textindex import DocumentStore
 
 DEFAULT_HOME = Path(os.environ.get("TRICK_HOME", Path.home() / ".local" / "share" / "trick"))
 DEFAULT_DB = DEFAULT_HOME / "trick.db"
 DEFAULT_MATRIX = DEFAULT_HOME / "scores.trk"
+DEFAULT_SOCKET = DEFAULT_HOME / "run" / "trick.sock"
+DEFAULT_TOKEN = DEFAULT_HOME / "bridge.token"
+DEFAULT_HISTORY = DEFAULT_HOME / "history"
 
 
 def _engine(args) -> SearchEngine:
     db = Path(args.db or DEFAULT_DB)
     matrix = Path(args.matrix) if getattr(args, "matrix", None) else DEFAULT_MATRIX
     return build_engine(db, matrix_path=matrix, scorer_mode=args.scorer, use_cache=not args.no_cache)
+
+
+def _engine_factory(args):
+    """A zero-argument constructor, so a service builds its engine lazily."""
+
+    def factory() -> SearchEngine:
+        return _engine(args)
+
+    return factory
+
+
+def _backend(args):
+    """Prefer the running core service; otherwise search in this process."""
+    socket_path = Path(getattr(args, "socket", None) or DEFAULT_SOCKET)
+    client = ServiceClient(socket_path)
+    try:
+        client.call("ping")
+    except TrickError:
+        client.close()
+        return EngineBackend(_engine(args))
+    return client
 
 
 def cmd_query(args) -> int:
@@ -51,24 +90,101 @@ def cmd_query(args) -> int:
         engine.store.close()
 
     if args.json:
-        print(json.dumps(outcome.as_dict(), indent=2, ensure_ascii=False))
+        print(render_json(outcome))
         return 0 if outcome.rows else 1
 
-    if not outcome.rows:
-        print("no results", file=sys.stderr)
-        if outcome.degraded:
-            print(f"degraded: {', '.join(outcome.degraded)}", file=sys.stderr)
-        return 1
+    print(render_outcome(outcome, verbose=args.verbose))
+    return 0 if outcome.rows else 1
 
-    print(f"trick: {outcome.query}  ({outcome.report.get('elapsed_ms')} ms, "
-          f"scorer={outcome.report.get('scorer')})")
-    if outcome.degraded:
-        print(f"degraded: {', '.join(outcome.degraded)}")
-    for row in outcome.rows:
-        marker = "*" if row.scored_by_laya else "-"
-        print(f"{row.rank:2d}{marker} {row.final_score:5.3f}  [{row.source}] {row.title[:96]}")
-        if row.url:
-            print(f"       {row.url}")
+
+def cmd_tui(args) -> int:
+    from .tui import TerminalUI
+
+    backend = _backend(args)
+    ui = TerminalUI(
+        backend,
+        limit=args.limit,
+        live=not args.offline,
+        history_path=Path(args.history) if args.history else DEFAULT_HISTORY,
+    )
+    return ui.run()
+
+
+def cmd_mcp(args) -> int:
+    socket_path = Path(args.socket or DEFAULT_SOCKET)
+    backend = build_backend(socket_path, _engine_factory(args))
+    server = McpServer(backend)
+    try:
+        return server.serve()
+    finally:
+        closer = getattr(backend, "close", None)
+        if callable(closer):
+            closer()
+
+
+def cmd_serve(args) -> int:
+    """Run the core service: one engine, a unix socket and an optional bridge."""
+    socket_path = Path(args.socket or DEFAULT_SOCKET)
+    service = Service(_engine_factory(args))
+    server = UnixServiceServer(socket_path, service)
+    try:
+        server.bind()
+    except TrickError as exc:
+        print(f"trick serve: {exc.s_code} {exc}", file=sys.stderr)
+        return 1
+    server.start()
+    print(f"trick serve: socket {socket_path}", file=sys.stderr, flush=True)
+
+    bridge = None
+    if not args.no_http:
+        token_path = Path(args.token_file or DEFAULT_TOKEN)
+        try:
+            token = load_or_create_token(token_path)
+            bridge = BridgeServer(
+                service,
+                token,
+                host=args.http_host,
+                port=args.http_port,
+                cors_origins=cors_from_env(),
+            )
+            port = bridge.start()
+        except TrickError as exc:
+            print(f"trick serve: bridge disabled: {exc.s_code} {exc}", file=sys.stderr, flush=True)
+            bridge = None
+        else:
+            print(
+                f"trick serve: http http://{args.http_host}:{port}/v1/search  token {token_path}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    stopping = {"done": False}
+
+    def _stop(signum, _frame):  # noqa: ANN001 - signal handler signature
+        if stopping["done"]:
+            return
+        stopping["done"] = True
+        print(f"trick serve: stopping (signal {signum})", file=sys.stderr, flush=True)
+        server.stop()
+        if bridge is not None:
+            bridge.stop()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, _stop)
+        except (ValueError, OSError):  # pragma: no cover - not the main thread
+            pass
+
+    try:
+        while not stopping["done"]:
+            time.sleep(0.2)
+    except KeyboardInterrupt:  # pragma: no cover - Ctrl-C without a handler
+        _stop(2, None)
+    finally:
+        server.stop()
+        if bridge is not None:
+            bridge.stop()
+        service.close()
     return 0
 
 
@@ -189,7 +305,27 @@ def build_parser() -> argparse.ArgumentParser:
     query.add_argument("--live", action="store_true", help="include live source APIs (default on)")
     query.add_argument("--offline", action="store_true", help="local store and matrix only")
     query.add_argument("--json", action="store_true")
+    query.add_argument("--verbose", action="store_true", help="show score components")
     query.set_defaults(func=cmd_query)
+
+    tui = sub.add_parser("tui", help="interactive terminal session")
+    tui.add_argument("--limit", type=int, default=8)
+    tui.add_argument("--offline", action="store_true")
+    tui.add_argument("--socket", help=f"core service socket (default {DEFAULT_SOCKET})")
+    tui.add_argument("--history", help=f"history file (default {DEFAULT_HISTORY})")
+    tui.set_defaults(func=cmd_tui)
+
+    serve = sub.add_parser("serve", help="run the core service (unix socket + loopback HTTP)")
+    serve.add_argument("--socket", help=f"socket path (default {DEFAULT_SOCKET})")
+    serve.add_argument("--http-host", default="127.0.0.1")
+    serve.add_argument("--http-port", type=int, default=8765)
+    serve.add_argument("--token-file", help=f"bridge token file (default {DEFAULT_TOKEN})")
+    serve.add_argument("--no-http", action="store_true", help="unix socket only")
+    serve.set_defaults(func=cmd_serve)
+
+    mcp = sub.add_parser("mcp", help="MCP server on stdio")
+    mcp.add_argument("--socket", help=f"core service socket (default {DEFAULT_SOCKET})")
+    mcp.set_defaults(func=cmd_mcp)
 
     ingest = sub.add_parser("ingest", help="download bulk catalogues into the store")
     ingest.add_argument("--source", default="cran,bioc")

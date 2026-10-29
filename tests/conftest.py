@@ -13,6 +13,23 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 
+@pytest.fixture(autouse=True)
+def no_live_sources(monkeypatch):
+    """Guarantee that no test opens a network connection.
+
+    ``SearchEngine`` builds the live adapters when it is given none, so a test
+    that simply constructs an engine would query arXiv and OpenAlex. That makes a
+    suite slow, flaky, and dependent on somebody else's uptime. Patching the two
+    module-level names here means a forgotten ``adapters=[]`` cannot leak out to
+    the internet.
+    """
+    import trick.retrieval as retrieval
+    import trick.search as search
+
+    monkeypatch.setattr(retrieval, "live_adapters", lambda *args, **kwargs: [])
+    monkeypatch.setattr(search, "live_adapters", lambda *args, **kwargs: [])
+
+
 @pytest.fixture()
 def rng() -> random.Random:
     return random.Random(20261029)

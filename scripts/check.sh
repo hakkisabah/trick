@@ -2,13 +2,16 @@
 # Repository control gate. Every failure class this project has hit so far is
 # checked here, so a regression fails the gate instead of surfacing later.
 #
-#   1. tests            unit, corruption, contention, budget, adapters, pipeline
-#   2. compile          every module imports and byte-compiles
-#   3. layout           on-disk constants are still what the design promises
-#   4. ranking          pipeline constants still match the measured defaults
-#   5. offline          the test suite never reaches the network
-#   6. language         no Turkish-specific characters in tracked files
-#   7. secrets          no obvious credentials in tracked files
+#      1. tests         unit, corruption, contention, budget, adapters, pipeline
+#      2. compile       every module imports and byte-compiles
+#      3. layout        on-disk constants are still what the design promises
+#      4. ranking       pipeline constants still match the measured defaults
+#      5. offline       the test suite cannot reach the network
+#      6. surfaces      the CLI, the MCP tool schema and the bridge are intact
+#      7. transport     socket and token permissions are the secure ones
+#      8. language      no Turkish-specific characters in tracked files
+#      9. secrets       no obvious credentials in tracked files
+#     10. stdio         the MCP server writes nothing but JSON-RPC to stdout
 set -eu
 
 cd "$(dirname "$0")/.."
@@ -19,13 +22,13 @@ if [ ! -x "$PY" ]; then
   exit 2
 fi
 
-echo "== 1/7 tests"
+echo "== 1/10 tests"
 "$PY" -m pytest -q
 
-echo "== 2/7 compile"
+echo "== 2/10 compile"
 "$PY" -m compileall -q src scripts >/dev/null
 
-echo "== 3/7 layout"
+echo "== 3/10 layout"
 "$PY" - <<'PYCODE'
 import sys
 sys.path.insert(0, "src")
@@ -36,32 +39,89 @@ assert HEADER_SIZE == 48, HEADER_SIZE
 print("layout ok: 48 byte header, 24 byte records")
 PYCODE
 
-echo "== 4/7 ranking contracts"
+echo "== 4/10 ranking contracts"
 "$PY" - <<'PYCODE'
 import sys
 sys.path.insert(0, "src")
 from trick.laya import DEFAULT_INSTRUCTIONS, MAX_LABELS
-from trick.search import DEFAULT_GATE, DEFAULT_PRIOR, DEFAULT_WEIGHTS
+from trick.search import (
+    DEFAULT_BLEND_MODE,
+    DEFAULT_FUSION,
+    DEFAULT_GATE,
+    DEFAULT_PRIOR,
+    DEFAULT_WEIGHTS,
+)
 assert MAX_LABELS == 26
 assert abs(sum(DEFAULT_WEIGHTS) - 1.0) < 1e-9, DEFAULT_WEIGHTS
-assert DEFAULT_WEIGHTS[0] < DEFAULT_WEIGHTS[1], "laya must stay the tie-breaker"
+assert DEFAULT_WEIGHTS[0] < DEFAULT_WEIGHTS[1], "laya must stay the smaller share"
+assert 0.1 <= DEFAULT_WEIGHTS[0] <= 0.3, "the model must neither vanish nor dominate"
+# 0.6 is the measured cliff: niche recall@12 falls 1.0 -> 0.6 there.
+assert 0.3 <= DEFAULT_PRIOR < 0.6, DEFAULT_PRIOR
+assert DEFAULT_FUSION == "linear", DEFAULT_FUSION
+assert DEFAULT_BLEND_MODE == "fused", DEFAULT_BLEND_MODE
 assert 0.0 <= DEFAULT_GATE < 1.0
-assert 0.0 <= DEFAULT_PRIOR < 1.0
 assert len(DEFAULT_INSTRUCTIONS.split()) <= 8, "a long instruction measured worse"
-print(f"ranking ok: weights={DEFAULT_WEIGHTS} prior={DEFAULT_PRIOR} gate={DEFAULT_GATE}")
+print(f"ranking ok: weights={DEFAULT_WEIGHTS} prior={DEFAULT_PRIOR} "
+      f"fusion={DEFAULT_FUSION} blend={DEFAULT_BLEND_MODE} gate={DEFAULT_GATE}")
 PYCODE
 
-echo "== 5/7 offline tests"
+echo "== 5/10 offline tests"
 if grep -rnE '(live_adapters\(\)|bulk_adapters\(\)\.fetch|http_get\()' tests/ >/dev/null 2>&1; then
   echo "gate: the test suite must not use a real transport" >&2
   exit 1
 fi
+if ! grep -q 'no_live_sources' tests/conftest.py; then
+  echo "gate: tests/conftest.py must patch live_adapters so no test reaches the network" >&2
+  exit 1
+fi
 echo "offline ok"
 
-echo "== 6/7 language (english only in the repository)"
+echo "== 6/10 surfaces"
+"$PY" - <<'PYCODE'
+import sys
+sys.path.insert(0, "src")
+from trick.mcp import TOOLS
+from trick.bridge import BridgeServer
+from trick.errors import ConfigError
+
+names = [tool["name"] for tool in TOOLS]
+assert names == ["trick_search", "trick_health"], names
+search = TOOLS[0]
+assert search["inputSchema"]["required"] == ["query"]
+assert search["inputSchema"]["additionalProperties"] is False
+assert search["inputSchema"]["properties"]["limit"]["maximum"] == 26
+assert search["inputSchema"]["properties"]["live"]["type"] == "boolean"
+
+# A bridge bound to anything but loopback would expose the service to the LAN.
+try:
+    BridgeServer(object(), "x" * 40, host="0.0.0.0")
+except ConfigError as exc:
+    assert "loopback" in str(exc)
+else:
+    raise AssertionError("BridgeServer accepted a non-loopback host")
+print("surfaces ok: mcp tools + loopback-only bridge")
+PYCODE
+
+echo "== 7/10 transport permissions"
+"$PY" - <<'PYCODE'
+import inspect
+import sys
+sys.path.insert(0, "src")
+from trick import service
+
+source = inspect.getsource(service.UnixServiceServer)
+assert "0o600" in source, "the socket file must be owner-only"
+assert "0o700" in source, "the socket directory must be owner-only"
+token_source = inspect.getsource(service.load_or_create_token)
+assert "0o600" in token_source, "the bridge token file must be owner-only"
+assert "O_EXCL" in token_source, "token creation must not race"
+print("transport ok: 0600 socket and token, 0700 directory")
+PYCODE
+
+echo "== 8/10 language (english only in the repository)"
 "$PY" scripts/language_gate.py
 
-echo "== 7/7 secrets"
+echo "== 9/10 secrets"
 if git grep -n -I -E '(AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{20,}|aws_secret_access_key[[:space:]]*=)' -- . >/dev/null 2>&1; then
   echo "gate: credential-shaped string found in tracked files" >&2
   exit 1
@@ -71,5 +131,41 @@ if git grep -n -I -E '^LAYA_API_KEY=[A-Za-z0-9_-]{12,}$' -- src tests scripts RE
   exit 1
 fi
 echo "secrets ok"
+
+echo "== 10/10 stdio purity"
+"$PY" - <<'PYCODE'
+import io
+import json
+import sys
+sys.path.insert(0, "src")
+from trick.mcp import McpServer
+
+
+class Backend:
+    def search(self, query, *, limit=8, live=None):
+        raise RuntimeError("never called")
+
+    def health(self):
+        return {"store": {"docs": 0}}
+
+
+messages = [
+    {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+    {"jsonrpc": "2.0", "method": "notifications/initialized"},
+    {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+    {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "trick_health", "arguments": {}}},
+    "{broken",
+]
+stdin_text = "\n".join(json.dumps(m) if isinstance(m, dict) else m for m in messages) + "\n"
+stdout = io.StringIO()
+McpServer(Backend(), stdin=io.StringIO(stdin_text), stdout=stdout, stderr=io.StringIO()).serve()
+lines = [line for line in stdout.getvalue().splitlines() if line.strip()]
+assert lines, "the server produced no output"
+for line in lines:
+    message = json.loads(line)
+    assert message["jsonrpc"] == "2.0", message
+    assert "id" in message, message
+print(f"stdio ok: {len(lines)} well-formed responses, nothing else")
+PYCODE
 
 echo "gate: all checks passed"

@@ -18,13 +18,13 @@ Pipeline (each stage may degrade, none may crash the search)::
       +-- laya choice question over labels ---> probabilities
       |                                       |  S5: retrieval order only
       |
-      +-- final = 0.7 * laya + 0.3 * retrieval -> rows + provenance
+      +-- final = 0.2 * laya + 0.8 * retrieval -> rows + provenance
 
 Why the blend: laya answers "which candidate answers this state", which is the
 decision we want, but a 12-way choice is noisy at the tail; the retrieval score
-keeps factual lexicographic overlap in play. The weights are configuration, and
-every row carries both components so a wrong ranking can be diagnosed instead of
-argued about.
+keeps factual lexicographic overlap in play. The 0.2/0.8 split is measured, not
+assumed (see DEFAULT_WEIGHTS), and every row carries both components so a wrong
+ranking can be diagnosed instead of argued about.
 """
 
 from __future__ import annotations
@@ -43,11 +43,35 @@ from .textindex import DocumentStore
 
 DEFAULT_SHORTLIST = 12
 DEFAULT_PREFILTER = 200
-DEFAULT_WEIGHTS = (0.3, 0.7)
+# Model vs retrieval weight. Was 0.3/0.7 in phase 2; a sweep with the live model
+# over both gold sets moved it to 0.2/0.8 (canonical nDCG@10 0.797 -> 0.803,
+# niche 0.810 -> 0.846). Below 0.2 the curve is flat, so the model keeps a real
+# share instead of the ranking becoming a pure keyword sort.
+DEFAULT_WEIGHTS = (0.2, 0.8)
 # How much the ingested canonicality prior (CRAN downloads, Bioconductor reverse
-# dependencies) counts against raw BM25. Tuned on scripts/eval_ranking.py; set to
-# 0.0 to rank on text alone.
+# dependencies) counts against raw BM25. Tuned on scripts/eval_ranking.py.
+#
+# Raising this was tried and rejected with numbers: at 0.58 the *retrieval-only*
+# ranking improves (mock nDCG@10 0.835 -> 0.895) but the end-to-end result gets
+# worse (0.831 -> 0.74..0.78) because extra popular candidates enter the
+# shortlist and the model then ranks them low, while genuinely specific niche
+# matches get evicted (niche recall@12 1.0 -> 0.6 at 0.62). The prior is a
+# tie-breaker for text relevance, not a ranking signal of its own.
 DEFAULT_PRIOR = 0.45
+# Blend the prior into the retrieval term shown to the ranker? Only useful when
+# there is no model score at all - see ``SearchEngine.blend_uses_prior``.
+DEFAULT_BLEND_PRIOR = False
+# How the two retrieval signals (text relevance, canonicality prior) are combined.
+# "linear" mixes the scores, which works while the prior stays a tie-breaker.
+# "rrf" fuses ranks instead; it preserves both signals' sharpness but measurably
+# over-popularises at a high prior (niche recall@12 1.0 -> 0.6), so it is kept as
+# an option, not as the default.
+DEFAULT_FUSION = "linear"
+RRF_K = 60
+# How the model probability meets the retrieval score. See SearchEngine._blend.
+# "fused" (prior included in the retrieval term) measured 0.803/0.846 against
+# "linear" (text only) 0.807/0.612 - the prior belongs in the blend.
+DEFAULT_BLEND_MODE = "fused"
 # Skip the scorer when the retrieval top-1 leads top-2 by this fraction of its
 # score: measured 7/22 queries gated with no change in nDCG@10.
 DEFAULT_GATE = 0.15
@@ -115,6 +139,27 @@ class SearchOutcome:
             "rows": [row.as_dict() for row in self.rows],
         }
 
+    @classmethod
+    def from_dict(cls, payload: dict) -> "SearchOutcome":
+        """Rebuild an outcome that crossed a process boundary.
+
+        The socket client and the MCP server both hand back plain JSON, so this is
+        the single place that decides how a row survives serialisation. A row that
+        lost its ``score_label`` is treated as retrieval-only, because claiming a
+        model score that was not there is the one mistake worth preventing.
+        """
+        rows = [
+            row_from_dict(position, item)
+            for position, item in enumerate(payload.get("rows") or [], start=1)
+            if isinstance(item, dict)
+        ]
+        return cls(
+            query=str(payload.get("query") or ""),
+            rows=rows,
+            degraded=[str(code) for code in payload.get("degraded") or []],
+            report=dict(payload.get("report") or {}),
+        )
+
 
 class SearchEngine:
     """Wires a document store, an optional matrix and a scorer into one call."""
@@ -130,6 +175,9 @@ class SearchEngine:
         prefilter: int = DEFAULT_PREFILTER,
         weights: tuple[float, float] = DEFAULT_WEIGHTS,
         prior_weight: float = DEFAULT_PRIOR,
+        blend_prior: bool = DEFAULT_BLEND_PRIOR,
+        fusion: str = DEFAULT_FUSION,
+        blend_mode: str = DEFAULT_BLEND_MODE,
         gate_margin: float = DEFAULT_GATE,
         budget_s: float = 1.5,
         use_cache: bool = True,
@@ -143,6 +191,9 @@ class SearchEngine:
         total = sum(weights) or 1.0
         self.weights = (weights[0] / total, weights[1] / total)
         self.prior_weight = max(0.0, min(float(prior_weight), 0.9))
+        self.blend_prior = bool(blend_prior)
+        self.fusion = "rrf" if str(fusion).lower() == "rrf" else "linear"
+        self.blend_mode = str(blend_mode).lower() if str(blend_mode).lower() in ("linear", "fused", "rrf") else "linear"
         # When the retrieval top-1 is this much better than top-2, asking the
         # scorer cannot change the answer, so we do not spend a call.
         self.gate_margin = max(0.0, float(gate_margin))
@@ -242,7 +293,7 @@ class SearchEngine:
         # Stage 4: rescore the union with BM25 restricted to those ids, then cut.
         stage = time.monotonic()
         priors = self.store.weights_for(list(candidates))
-        shortlist_ids, shortlist_scores = self._shortlist(query, candidates, priors)
+        shortlist_ids, cut_scores, text_scores = self._shortlist(query, candidates, priors)
         timings["shortlist_ms"] = (time.monotonic() - stage) * 1000.0
 
         # Stage 5: ask laya.
@@ -251,7 +302,7 @@ class SearchEngine:
         ordered_ids = [doc_id for doc_id in shortlist_ids if doc_id in docs]
         probabilities: dict[int, float] = {}
         scored = False
-        gated = self._gate_closed(shortlist_scores)
+        gated = self._gate_closed(text_scores)
         if len(ordered_ids) >= 2 and not gated:
             texts = [_text_for(docs[doc_id]) for doc_id in ordered_ids]
             try:
@@ -268,7 +319,7 @@ class SearchEngine:
         timings["laya_ms"] = (time.monotonic() - stage) * 1000.0
 
         # Stage 6: blend and order.
-        rows = self._blend(ordered_ids, docs, shortlist_scores, probabilities, scored, limit)
+        rows = self._blend(ordered_ids, docs, text_scores, cut_scores, probabilities, scored, limit)
         if self.use_cache and rows:
             self.store.cache_put(
                 query,
@@ -296,34 +347,41 @@ class SearchEngine:
 
     def _shortlist(
         self, query: str, candidates: dict[int, float], priors: dict[int, float]
-    ) -> tuple[list[int], dict[int, float]]:
-        """Cut the candidate union to the laya shortlist, returning retrieval scores too.
+    ) -> tuple[list[int], dict[int, float], dict[int, float]]:
+        """Cut the candidate union to the laya shortlist.
 
-        The cut matters more than it looks: whatever falls out of the shortlist can
-        never be rescued by the scorer. Raw BM25 favours short keyword-dense
-        packages over canonical tools, so the ingested prior is mixed in here and
-        in the retrieval component that the final blend uses.
+        Returns ``(keep, cut_scores, text_scores)``. The cut mixes in the ingested
+        canonicality prior - raw BM25 favours short keyword-dense packages over
+        canonical tools, and whatever falls out of the shortlist can never be
+        rescued by the scorer. ``text_scores`` stays pure BM25, because that is
+        the discriminative signal the blend wants once the model has spoken.
         """
         ids = list(candidates)
         beta = self.prior_weight
-        retrieval = {
-            doc_id: (1.0 - beta) * max(candidates.get(doc_id, 0.0), 0.0) + beta * priors.get(doc_id, 0.0)
-            for doc_id in ids
-        }
+        text: dict[int, float] = {doc_id: max(candidates.get(doc_id, 0.0), 0.0) for doc_id in ids}
+        if self.fusion == "rrf":
+            cut = _weighted_rrf(ids, text, priors, beta)
+        else:
+            cut = {
+                doc_id: (1.0 - beta) * text[doc_id] + beta * priors.get(doc_id, 0.0) for doc_id in ids
+            }
         if len(ids) <= self.shortlist:
-            return ids, retrieval
+            return ids, cut, text
 
         stage_scores = self.store.rescore(query, ids)
-        merged: list[tuple[float, int]] = []
         for doc_id in ids:
-            bm25 = stage_scores.get(doc_id, 0.0)
-            prior = priors.get(doc_id, 0.0)
-            combined = (1.0 - beta) * bm25 + beta * prior
-            merged.append((combined, doc_id))
-            retrieval[doc_id] = max(retrieval[doc_id], combined)
-        merged.sort(key=lambda item: (-item[0], item[1]))
+            text[doc_id] = max(text[doc_id], stage_scores.get(doc_id, 0.0))
+        if self.fusion == "rrf":
+            cut = _weighted_rrf(ids, text, priors, beta)
+        else:
+            for doc_id in ids:
+                cut[doc_id] = max(
+                    cut[doc_id],
+                    (1.0 - beta) * text[doc_id] + beta * priors.get(doc_id, 0.0),
+                )
+        merged = sorted(((cut[doc_id], doc_id) for doc_id in ids), key=lambda item: (-item[0], item[1]))
         keep = [doc_id for _, doc_id in merged[: self.shortlist]]
-        return keep, {doc_id: retrieval[doc_id] for doc_id in keep}
+        return keep, {doc_id: cut[doc_id] for doc_id in keep}, {doc_id: text[doc_id] for doc_id in keep}
 
     def _gate_closed(self, scores: dict[int, float]) -> bool:
         """True when the retrieval margin is wide enough to skip the scorer."""
@@ -339,21 +397,64 @@ class SearchEngine:
         self,
         ordered_ids: list[int],
         docs: dict,
-        candidates: dict[int, float],
+        text_scores: dict[int, float],
+        cut_scores: dict[int, float],
         probabilities: dict[int, float],
         scored: bool,
         limit: int,
     ) -> list[ResultRow]:
+        """Order the shortlist and attach both component scores to every row.
+
+        ``blend_mode`` decides how the two signals meet:
+
+        ``linear``  w*laya + (1-w)*bm25, the first thing that worked;
+        ``fused``   w*laya + (1-w)*rrf(text, prior) - keeps the prior's opinion;
+        ``rrf``     rank fusion of the model rank and the retrieval rank, which is
+                    the only variant that cannot be swamped by a different score
+                    scale on either side.
+
+        Every mode falls back to retrieval order when the scorer did not answer,
+        so a dead endpoint degrades the ordering instead of the answer.
+        """
         w_laya, w_retrieval = self.weights
+        mode = self.blend_mode if (scored and probabilities) else "linear"
+        if not scored:
+            retrieval_scores = cut_scores
+        elif mode == "fused" or self.blend_prior:
+            retrieval_scores = cut_scores
+        else:
+            retrieval_scores = text_scores
+
         raw: list[tuple[float, int]] = []
-        for doc_id in ordered_ids:
-            retrieval = candidates.get(doc_id, 0.0)
-            probability = probabilities.get(doc_id)
-            if scored and probability is not None:
-                final = w_laya * probability + w_retrieval * retrieval
-            else:
-                final = retrieval
-            raw.append((final, doc_id))
+        if mode == "rrf":
+            retr_rank = {
+                doc_id: position
+                for position, doc_id in enumerate(
+                    sorted(ordered_ids, key=lambda i: (-retrieval_scores.get(i, 0.0), i)), start=1
+                )
+            }
+            laya_rank = {
+                doc_id: position
+                for position, doc_id in enumerate(
+                    sorted(ordered_ids, key=lambda i: (-(probabilities.get(i) or 0.0), i)), start=1
+                )
+            }
+            for doc_id in ordered_ids:
+                value = w_retrieval / (RRF_K + retr_rank[doc_id])
+                if doc_id in probabilities:
+                    value += w_laya / (RRF_K + laya_rank[doc_id])
+                raw.append((value, doc_id))
+            best = max((value for value, _ in raw), default=0.0) or 1.0
+            raw = [(value / best, doc_id) for value, doc_id in raw]
+        else:
+            for doc_id in ordered_ids:
+                retrieval = retrieval_scores.get(doc_id, 0.0)
+                probability = probabilities.get(doc_id)
+                if scored and probability is not None:
+                    final = w_laya * probability + w_retrieval * retrieval
+                else:
+                    final = retrieval
+                raw.append((final, doc_id))
         raw.sort(key=lambda item: (-item[0], item[1]))
         rows: list[ResultRow] = []
         for position, (final, doc_id) in enumerate(raw[:limit], start=1):
@@ -367,7 +468,7 @@ class SearchEngine:
                     title=doc.title,
                     summary=doc.summary,
                     url=doc.url,
-                    retrieval_score=candidates.get(doc_id, 0.0),
+                    retrieval_score=retrieval_scores.get(doc_id, 0.0),
                     laya_probability=probabilities.get(doc_id),
                     final_score=final,
                     scored_by_laya=scored and probabilities.get(doc_id) is not None,
@@ -382,6 +483,9 @@ class SearchEngine:
             "scorer": getattr(self.scorer, "name", "unknown"),
             "shortlist": self.shortlist,
             "weights": list(self.weights),
+            "prior_weight": self.prior_weight,
+            "fusion": self.fusion,
+            "blend_mode": self.blend_mode,
         }
         matrix = self._open_matrix()
         if matrix is not None:
@@ -391,6 +495,35 @@ class SearchEngine:
         else:
             info["matrix"] = None
         return info
+
+
+def _weighted_rrf(
+    ids: Sequence[int], text: dict[int, float], priors: dict[int, float], beta: float
+) -> dict[int, float]:
+    """Fuse a text ranking and a prior ranking by weighted reciprocal rank.
+
+    A linear mix of scores assumes both signals live on comparable scales. They do
+    not: the prior is a log-scaled popularity value that sits near 1.0 for every
+    established package, so mixing it into a normalised BM25 compresses the
+    differences until the small model term decides the order. Fusing ranks keeps
+    both signals equally sharp whatever their scale, which is what lets a stronger
+    prior actually help instead of quietly wrecking the blend.
+    """
+    if not ids:
+        return {}
+    by_text = sorted(ids, key=lambda i: (-text.get(i, 0.0), i))
+    by_prior = sorted(ids, key=lambda i: (-priors.get(i, 0.0), i))
+    text_rank = {doc_id: position for position, doc_id in enumerate(by_text, start=1)}
+    prior_rank = {doc_id: position for position, doc_id in enumerate(by_prior, start=1)}
+    weight = max(0.0, min(float(beta), 1.0))
+    fused: dict[int, float] = {}
+    for doc_id in ids:
+        value = (1.0 - weight) / (RRF_K + text_rank[doc_id])
+        if weight > 0.0:
+            value += weight / (RRF_K + prior_rank[doc_id])
+        fused[doc_id] = value
+    best = max(fused.values()) or 1.0
+    return {doc_id: value / best for doc_id, value in fused.items()}
 
 
 def _text_for(doc) -> str:
@@ -409,6 +542,26 @@ def _stats(scorer: Scorer) -> dict:
     if isinstance(stats, ScorerStats):
         return stats.as_dict()
     return {}
+
+
+def row_from_dict(rank: int, item: dict) -> ResultRow:
+    """Rebuild one result row from its JSON form (see ``SearchOutcome.from_dict``)."""
+    label = str(item.get("score_label") or "")
+    probability = item.get("laya_probability")
+    return ResultRow(
+        rank=int(item.get("rank") or rank),
+        doc_id=int(item.get("doc_id") or 0),
+        source=str(item.get("source") or ""),
+        key=str(item.get("key") or ""),
+        title=str(item.get("title") or ""),
+        summary=str(item.get("summary") or ""),
+        url=str(item.get("url") or ""),
+        retrieval_score=float(item.get("retrieval_score") or 0.0),
+        laya_probability=None if probability is None else float(probability),
+        final_score=float(item.get("final_score") or 0.0),
+        scored_by_laya=(label == "laya") and probability is not None,
+        from_cache=bool(item.get("from_cache")),
+    )
 
 
 def _row_from_cache(rank: int, item: dict) -> ResultRow:
@@ -455,4 +608,5 @@ __all__ = [
     "SearchEngine",
     "SearchOutcome",
     "build_engine",
+    "row_from_dict",
 ]

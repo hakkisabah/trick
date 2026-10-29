@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import time
 import urllib.error
@@ -289,7 +290,15 @@ class OpenAlexAdapter(QueryAdapter):
     def url_for(self, query: str, limit: int) -> str:
         terms = urllib.parse.quote_plus(query)
         fields = "id,doi,title,publication_year,primary_location,abstract_inverted_index"
-        return f"{OPENALEX_URL}?search={terms}&per-page={max(1, limit)}&select={fields}"
+        url = f"{OPENALEX_URL}?search={terms}&per-page={max(1, limit)}&select={fields}"
+        # OpenAlex puts a caller that identifies itself in the polite pool, which
+        # has a much higher rate limit. Without it the anonymous bucket answers
+        # HTTP 429 after a handful of searches (measured: an evaluation run of 22
+        # queries tripped it, and every later search degraded on S4).
+        contact = _contact_email()
+        if contact:
+            url += f"&mailto={urllib.parse.quote(contact)}"
+        return url
 
     def documents(self, payload: bytes, query: str) -> list[SourceDoc]:
         try:
@@ -330,7 +339,11 @@ class CrossrefAdapter(QueryAdapter):
 
     def url_for(self, query: str, limit: int) -> str:
         terms = urllib.parse.quote_plus(query)
-        return f"{CROSSREF_URL}?query={terms}&rows={max(1, limit)}&select=DOI,title,URL,abstract,container-title,issued"
+        url = f"{CROSSREF_URL}?query={terms}&rows={max(1, limit)}&select=DOI,title,URL,abstract,container-title,issued"
+        contact = _contact_email()
+        if contact:
+            url += f"&mailto={urllib.parse.quote(contact)}"
+        return url
 
     def documents(self, payload: bytes, query: str) -> list[SourceDoc]:
         try:
@@ -370,6 +383,20 @@ def _venue(item: dict) -> str:
         if isinstance(source, dict):
             return str(source.get("display_name") or "")
     return ""
+
+
+def _contact_email(environ: dict[str, str] | None = None) -> str:
+    """The address that identifies this caller to the scholarly APIs.
+
+    Set ``TRICK_CONTACT_EMAIL`` to join the polite pools: OpenAlex then allows far
+    more requests per second, and Crossref treats the caller as identifiable
+    rather than anonymous. Empty means the header is simply not sent.
+    """
+    env = os.environ if environ is None else environ
+    value = (env.get("TRICK_CONTACT_EMAIL") or "").strip()
+    if "@" not in value or len(value) > 200:
+        return ""
+    return value
 
 
 def _words(text: str) -> list[str]:

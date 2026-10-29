@@ -11,18 +11,75 @@ configured.
 
 ## Status
 
-Phase 2 of 7 is complete: the storage core plus retrieval adapters, the laya
-client and the ranking pipeline. The terminal UI, the MCP server and the Open
-WebUI integration follow; every one of them sits on the same engine.
+Phase 3 of 7 is complete: the storage core, the retrieval adapters, the laya
+client and the ranking pipeline, plus every surface that talks to them - a
+terminal UI, an MCP server, a unix-socket core service and a loopback HTTP
+bridge. Open WebUI and the Gemini extension sit on the same server in phase 4.
 
-Measured on 22 gold queries (see `scripts/eval_ranking.py`), no re-ranking
-shortcuts:
+Measured on 22 gold queries with the live model and live sources, no re-ranking
+shortcuts (see `scripts/eval_ranking.py`):
 
 ```
                      recall@12   mrr@10   ndcg@10
-retrieval only          0.955     0.763    0.811
-blend (shipped)         0.955     0.777    0.822
+laya alone              0.682     0.326    0.414
+retrieval only          0.955     0.788    0.829
+blend (shipped)         0.955     0.779    0.823
+
+canonical set (12)      0.917     0.764    0.803
+niche set (10)          1.000     0.798    0.846
 ```
+
+End-to-end latency with live sources and one laya call: p50 1175 ms, min 810 ms,
+max 1953 ms. The confidence gate skipped the model on 6 of 22 queries.
+
+## Surfaces
+
+One engine, four doors. They cannot disagree, because they share one process and
+one ranking path:
+
+```sh
+trick tui                     # terminal session, Enter submits, arrows, history
+trick serve                   # core service: unix socket + loopback HTTP bridge
+trick mcp                     # MCP server on stdio (Gemini CLI, Open WebUI, Claude)
+trick query "..." --json      # one shot, scriptable
+```
+
+The core service exists so a plugin does not need its own SQLite connection and
+its own copy of the ranking code:
+
+```
+plugin / CLI / MCP host
+        |
+        +-- unix socket  $TRICK_HOME/run/trick.sock   owner-only (0600)
+        +-- http bridge  127.0.0.1:8765/v1/search     bearer token from a 0600 file
+                              |
+                        trick serve  (one engine, one thread, one worker queue)
+```
+
+Why the worker queue: a `sqlite3.Connection` is bound to the thread that created
+it, and an mmap has no lock of its own. Requests are queued to a single engine
+thread, which is also why 12 concurrent searches over HTTP answer in 570 ms
+without a single cross-thread error.
+
+Security defaults, each one deliberate: the socket file is 0600 in a 0700
+directory; the bridge token is 32 random bytes compared with `hmac.compare_digest`
+and never logged; the bridge refuses any host that is not loopback; request
+bodies are capped at 32 KB; CORS is off unless `TRICK_CORS_ORIGINS` names exact
+origins, because a wildcard would let any page in the user's browser spend their
+laya credits.
+
+### MCP tools
+
+| Tool | Arguments | Returns |
+| --- | --- | --- |
+| `trick_search` | `query`, `limit` 1-26, `live`, `verbose` | text summary + `structuredContent` with every row, both score components and the `S<n>` codes |
+| `trick_health` | none | store, matrix, scorer and service state |
+
+A tool failure is a result (`isError: true` plus the `S<n>` code), never a dead
+session: the model can tell the user "laya did not answer" instead of hanging.
+stdout carries JSON-RPC and nothing else; every diagnostic goes to stderr, and
+the repository gate asserts it.
+
 
 ## Why two layers
 
@@ -38,13 +95,13 @@ query
   -> BM25 rescore + canonicality prior -> shortlist of 12
   -> confidence gate: skip the scorer when top-1 clearly leads
   -> laya choice question over opaque labels A..L                   S5: retrieval order
-  -> ranking: 0.3 laya + 0.7 retrieval
+  -> ranking: 0.2 laya + 0.8 retrieval
   -> decision cache, so an identical query never calls laya twice
 ```
 
 ### What the measurements changed
 
-Three parts of the design were decided by numbers, not taste:
+Four parts of the design were decided by numbers, not taste:
 
 * **The canonicality prior is not optional.** Raw BM25 ranks short
   keyword-dense packages above established tools: `ggplot2` came 15th, `forecast`
@@ -52,16 +109,34 @@ Three parts of the design were decided by numbers, not taste:
   (CRAN monthly downloads, Bioconductor reverse dependencies) lifted recall@12
   from 0.333 to 0.917 on the canonical set.
 * **laya is a tie-breaker, not the ranker.** Given the same 12 candidates, laya
-  alone reaches nDCG@10 0.691 while retrieval reaches 0.811. Trusting it with
-  70% of the blend scored 0.709; 30% scores 0.822, and the gate removes a third
-  of the calls without moving the metric.
+  alone reaches nDCG@10 0.414 while retrieval reaches 0.829. The shipped blend is
+  0.2 model / 0.8 retrieval: at 0.3 the canonical set scored 0.797, at 0.2 it
+  scored 0.803, and below 0.2 the curve is flat - so the model keeps a real share
+  without being trusted with the order.
+* **Raising the prior was tried and rejected.** At 0.58 the retrieval-only
+  ranking improves (mock nDCG@10 0.835 -> 0.895) but the end-to-end result gets
+  worse, because extra popular candidates enter the shortlist and the model then
+  ranks them low, while specific niche matches are evicted (niche recall@12
+  1.0 -> 0.6 at 0.62). The prior is a tie-breaker for text relevance, and that is
+  how it is wired.
 * **Presentation matters more than the prompt.** Tagging candidates with
   `[cran/r-package]` dropped laya's nDCG@10 from 0.760 to 0.650, and a long
   "you are an expert" instruction was worse than a four-word question.
 
-The numbers are small-sample and the gold sets are two lists of 12 queries, one
-biased towards popular tools, one towards niche exact matches. They are enough to
-catch a regression, not enough to claim a ranking is optimal.
+The numbers are small-sample and the gold sets are two lists of 12 and 10
+queries, one biased towards popular tools, one towards niche exact matches. They
+are enough to catch a regression, not enough to claim a ranking is optimal.
+
+### Known limit
+
+Live papers can crowd the local catalogue out of the shortlist: for
+`croston method intermittent demand forecasting` the OpenAlex hits displaced
+`tsintermittent` entirely after the store grew with fetched papers. The measured
+aggregate is stable (niche nDCG@10 0.846), but a per-source quota on the
+shortlist is the next ranking change, together with the query expansion that the
+`data.table` miss ("Extension of data.frame" vs "fast aggregation and joins")
+actually needs.
+
 
 ## The matrix
 
@@ -125,13 +200,19 @@ src/trick/laya.py         laya client: opaque labels, retries, breaker, usage
 src/trick/textindex.py    SQLite store: documents, FTS5, priors, decision cache
 src/trick/retrieval.py    bulk and live source adapters, dedupe, budgets
 src/trick/search.py       the pipeline above, with provenance on every row
-src/trick/cli.py          query / ingest / doctor / probe
-tests/                    131 tests: layout, corruption, contention, budget,
-                          adapters, client, pipeline, credentials
+src/trick/render.py       one formatter for every surface
+src/trick/service.py      core service: unix socket, worker queue, bridge token
+src/trick/bridge.py       loopback HTTP bridge with bearer auth
+src/trick/mcp.py          MCP server on stdio (JSON-RPC 2.0)
+src/trick/tui.py          terminal session: Enter submits, history, commands
+src/trick/cli.py          query / tui / serve / mcp / ingest / doctor / probe
+tests/                    229 tests: layout, corruption, contention, budget,
+                          adapters, client, pipeline, credentials, protocol,
+                          permissions, concurrency, session behaviour
 scripts/bench.py          produced numbers (not estimates) for this host
 scripts/eval_ranking.py   22-query ranking harness, three orderings per query
 scripts/laya_probe.py     one real call, prints the response shape only
-scripts/check.sh          repository gate
+scripts/check.sh          repository gate (10 checks)
 ```
 
 ## Install and verify
@@ -150,7 +231,24 @@ First run:
 .venv/bin/python -m trick doctor                 # store, matrix, credential state
 .venv/bin/python -m trick query "mixed effects model does not converge" 
 .venv/bin/python -m trick query "simple features spatial" --offline --json
+.venv/bin/python -m trick tui                    # interactive; /help lists the commands
 ```
+
+Run the service once, then point every host at it:
+
+```sh
+.venv/bin/python -m trick serve            # prints the socket and the bridge URL
+.venv/bin/python -m trick tui              # attaches to the running service
+.venv/bin/python -m trick mcp              # attaches too; the host spawns this
+curl -s http://127.0.0.1:8765/v1/search \
+  -H "Authorization: Bearer $(cat ~/.local/share/trick/bridge.token)" \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"mixed effects model does not converge","limit":5}'
+```
+
+Without a running service each command builds its own engine. That works, but
+two processes then hold two SQLite connections and two decision caches, so the
+service is the recommended mode as soon as more than one surface is in use.
 
 ## Configuration
 
@@ -167,8 +265,14 @@ LAYA_API_KEY=your-key
 LAYA_TIMEOUT_MS=20000
 ```
 
-Data lives in `~/.local/share/trick/` (`trick.db`, `scores.trk`); override with
-`--db`, `--matrix` or `TRICK_HOME`.
+Data lives in `~/.local/share/trick/` (`trick.db`, `scores.trk`, `run/trick.sock`,
+`bridge.token`, `history`); override with `--db`, `--matrix`, `--socket` or
+`TRICK_HOME`.
+
+`TRICK_CONTACT_EMAIL` puts the caller in the scholarly APIs' polite pools
+(OpenAlex's anonymous bucket answers HTTP 429 after a handful of searches, which
+shows up as `S4` on every result). `TRICK_CORS_ORIGINS` is a comma-separated
+allow-list for browser callers; empty means no CORS headers at all.
 
 `--scorer auto` uses laya when credentials exist and the offline scorer
 otherwise. A configured endpoint that is down surfaces as `S5`, never as a silent

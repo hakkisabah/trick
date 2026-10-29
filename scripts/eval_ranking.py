@@ -5,7 +5,7 @@ three comparable orderings:
 
     retrieval   BM25/prefilter only      (what a plain keyword search gives)
     laya        the model's probability  (what the model thinks answers it)
-    blend       0.7 * laya + 0.3 * bm25  (what Trick shows)
+    blend       0.2 * laya + 0.8 * retrieval  (what Trick shows)
 
 Metrics are computed on the gold key of each query: recall@shortlist, MRR@10 and
 nDCG@10 with binary relevance. The point is not a pretty number, it is a
@@ -114,7 +114,10 @@ def main() -> int:
     parser.add_argument("--blend", default="", help="override blend weights, e.g. 0.4,0.6")
     parser.add_argument("--gate", type=float, default=None, help="skip the scorer when the retrieval margin is this wide")
     parser.add_argument("--json", action="store_true")
-    parser.add_argument("--prior", type=float, default=None, help="override the canonicality prior weight")
+    parser.add_argument("--prior", type=float, default=None, help="override the canonicality prior weight used for the shortlist cut")
+    parser.add_argument("--blend-prior", action="store_true", help="also mix the prior into the blended retrieval term")
+    parser.add_argument("--fusion", default=None, choices=["linear", "rrf"], help="how text relevance and the prior are fused")
+    parser.add_argument("--blend-mode", default=None, choices=["linear", "fused", "rrf"], help="how the model probability meets retrieval")
     parser.add_argument("--set", dest="gold_set", default="both", choices=["canonical", "niche", "both"])
     args = parser.parse_args()
 
@@ -129,6 +132,9 @@ def main() -> int:
         use_cache=False,
         shortlist=args.limit,
         **({"prior_weight": args.prior} if args.prior is not None else {}),
+        blend_prior=args.blend_prior,
+        **({"fusion": args.fusion} if args.fusion else {}),
+        **({"blend_mode": args.blend_mode} if args.blend_mode else {}),
         **({"weights": tuple(float(x) for x in args.blend.split(","))} if args.blend else {}),
         **({"gate_margin": args.gate} if args.gate is not None else {}),
     )
@@ -188,8 +194,9 @@ def main() -> int:
 
     gated_count = sum(1 for row in detail if row.get("gated"))
     print(f"queries={query_count} scorer={engine.scorer.name} live={not args.no_live} "
-          f"shortlist={args.limit} prior={engine.prior_weight} blend={engine.weights} "
-          f"gate={engine.gate_margin} skipped={gated_count}")
+          f"shortlist={args.limit} prior={engine.prior_weight} blend_prior={engine.blend_prior} "
+          f"fusion={engine.fusion} mode={engine.blend_mode} "
+          f"blend={engine.weights} gate={engine.gate_margin} skipped={gated_count}")
     for set_name, block in per_set.items():
         print(f"  [{set_name}]")
         for name, metrics in block.items():
