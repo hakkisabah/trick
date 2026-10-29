@@ -13,6 +13,7 @@ S5  scorer-unavailable     laya endpoint refused, timed out or rejected the key
 S6  storage-io             disk full, permission denied, read-only filesystem
 S7  contention             another writer holds the matrix lock
 S8  contract-violation     caller passed data that breaks the file contract
+S9  config                 credentials or settings are missing or unsafe
 
 Each exception carries ``s_code`` and ``degraded_action`` so a caller can decide
 what to do without string matching.
@@ -69,6 +70,11 @@ class ScorerUnavailable(TrickError):
     s_code = "S5"
     degraded_action = "retrieval-order-only"
 
+    def __init__(self, reason: str = "unreachable", detail: str = "") -> None:
+        self.reason = reason
+        self.detail = detail
+        super().__init__(f"scorer unavailable ({reason})" + (f": {detail}" if detail else ""))
+
 
 class StorageIO(TrickError):
     """A write or read failed below the file contract (disk, permissions)."""
@@ -89,3 +95,10 @@ class ContractViolation(TrickError, ValueError):
 
     s_code = "S8"
     degraded_action = "reject-input"
+
+
+class ConfigError(TrickError, RuntimeError):
+    """Credentials or settings are missing, malformed or unsafe."""
+
+    s_code = "S9"
+    degraded_action = "run-offline"
