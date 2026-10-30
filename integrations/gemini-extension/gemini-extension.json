@@ -1,0 +1,19 @@
+{
+  "name": "trick",
+  "version": "0.4.0",
+  "description": "Scored retrieval over scientific and engineering catalogues, ranked by laya. Local, free, offline capable.",
+  "contextFileName": "GEMINI.md",
+  "settings": [
+    {
+      "name": "Trick Python",
+      "description": "Optional absolute path to the python interpreter that can import trick. Leave empty to use the repository's .venv or python3.",
+      "envVar": "TRICK_PYTHON"
+    }
+  ],
+  "mcpServers": {
+    "trick": {
+      "command": "/bin/sh",
+      "args": ["${extensionPath}/trick-mcp.sh"]
+    }
+  }
+}

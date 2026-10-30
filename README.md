@@ -11,10 +11,11 @@ configured.
 
 ## Status
 
-Phase 3 of 7 is complete: the storage core, the retrieval adapters, the laya
+Phase 4 of 7 is complete: the storage core, the retrieval adapters, the laya
 client and the ranking pipeline, plus every surface that talks to them - a
-terminal UI, an MCP server, a unix-socket core service and a loopback HTTP
-bridge. Open WebUI and the Gemini extension sit on the same server in phase 4.
+terminal UI, an MCP server, a unix-socket core service, a loopback HTTP bridge,
+the Open WebUI Pipe and the Gemini CLI extension. A per-source quota keeps a
+live API from evicting the local catalogue from the shortlist.
 
 Measured on 22 gold queries with the live model and live sources, no re-ranking
 shortcuts (see `scripts/eval_ranking.py`):
@@ -34,7 +35,7 @@ max 1953 ms. The confidence gate skipped the model on 6 of 22 queries.
 
 ## Surfaces
 
-One engine, four doors. They cannot disagree, because they share one process and
+One engine, six doors. They cannot disagree, because they share one process and
 one ranking path:
 
 ```sh
@@ -42,7 +43,16 @@ trick tui                     # terminal session, Enter submits, arrows, history
 trick serve                   # core service: unix socket + loopback HTTP bridge
 trick mcp                     # MCP server on stdio (Gemini CLI, Open WebUI, Claude)
 trick query "..." --json      # one shot, scriptable
+integrations/openwebui        # Open WebUI Pipe (a model that answers with rows)
+integrations/gemini-extension # Gemini CLI extension: /trick:search, /trick:health
 ```
+
+The Open WebUI Pipe and the Gemini extension are clients of the same bridge, not
+second implementations. See `integrations/README.md` for the two steps that
+actually bite: the bridge must bind the docker bridge address (a container
+cannot reach the host's `127.0.0.1`), and Gemini CLI spawns MCP servers with a
+sanitised `PATH`, so the extension ships a wrapper that resolves the interpreter
+itself.
 
 The core service exists so a plugin does not need its own SQLite connection and
 its own copy of the ranking code:
@@ -129,13 +139,41 @@ are enough to catch a regression, not enough to claim a ranking is optimal.
 
 ### Known limit
 
-Live papers can crowd the local catalogue out of the shortlist: for
-`croston method intermittent demand forecasting` the OpenAlex hits displaced
-`tsintermittent` entirely after the store grew with fetched papers. The measured
-aggregate is stable (niche nDCG@10 0.846), but a per-source quota on the
-shortlist is the next ranking change, together with the query expansion that the
-`data.table` miss ("Extension of data.frame" vs "fast aggregation and joins")
-actually needs.
+`data.table` is still missed on `fast aggregation and joins for large tables`:
+its title is "Extension of data.frame" and no amount of popularity weighting
+fixes a lexical gap. That is query expansion's job, measured separately in
+phase 5.
+
+### Source quota
+
+A live abstract repeats the query; a package description usually does not. On
+raw BM25 alone, one paper API can take every shortlist slot, and whatever falls
+out of the shortlist can never be rescued by the scorer. So the cut reserves
+`local_floor` (default 4 of 12) slots for catalogue entries and lets one live
+source take at most `live_cap` (default 4):
+
+```
+ranked candidates ──> reserve local slots ──> walk with per-source cap ──> fill
+                                                                  round-robin
+```
+
+Both are bounds, not targets: an unfilled reservation is handed back to the
+global order, and if nothing else can fill the list the remaining slots are
+filled round-robin, so a duplicate-heavy query degrades into a balanced list
+instead of a truncated one. The quota decides membership, never order.
+
+Measured with `scripts/eval_quota.py` (22 gold queries, live sources, one
+retrieval per query reused across configurations): **the quota never binds on
+the current corpus** - shortlists are already 90% catalogue entries, 0 of 22
+queries have an empty local share, and every configuration returns identical
+recall (0.955) and nDCG@10 (0.846). It is shipped as a guard, and its cost is
+measured as zero. `tests/test_source_quota.py` proves the behaviour when it does
+bind, including the flood case the phase 3 report observed.
+
+```sh
+.venv/bin/python scripts/eval_quota.py --scorer mock --configs 0/0,4/4,6/4
+trick query "..." --local-floor 4 --live-cap 4     # or TRICK_LOCAL_FLOOR / TRICK_LIVE_CAP
+```
 
 
 ## The matrix

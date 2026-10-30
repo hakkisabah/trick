@@ -38,7 +38,7 @@ from .retrieval import (
     bulk_adapters,
     log_weight,
 )
-from .search import SearchEngine, build_engine
+from .search import DEFAULT_LIVE_CAP, DEFAULT_LOCAL_FLOOR, SearchEngine, build_engine
 from .service import (
     Service,
     ServiceClient,
@@ -58,7 +58,14 @@ DEFAULT_HISTORY = DEFAULT_HOME / "history"
 def _engine(args) -> SearchEngine:
     db = Path(args.db or DEFAULT_DB)
     matrix = Path(args.matrix) if getattr(args, "matrix", None) else DEFAULT_MATRIX
-    return build_engine(db, matrix_path=matrix, scorer_mode=args.scorer, use_cache=not args.no_cache)
+    return build_engine(
+        db,
+        matrix_path=matrix,
+        scorer_mode=args.scorer,
+        use_cache=not args.no_cache,
+        local_floor=int(getattr(args, "local_floor", DEFAULT_LOCAL_FLOOR)),
+        live_cap=int(getattr(args, "live_cap", DEFAULT_LIVE_CAP)),
+    )
 
 
 def _engine_factory(args):
@@ -146,6 +153,7 @@ def cmd_serve(args) -> int:
                 host=args.http_host,
                 port=args.http_port,
                 cors_origins=cors_from_env(),
+                allow_network=bool(getattr(args, "expose_network", False)),
             )
             port = bridge.start()
         except TrickError as exc:
@@ -297,6 +305,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scorer", default=os.environ.get("TRICK_SCORER", "auto"),
                         choices=["auto", "remote", "mock"], help="scorer backend")
     parser.add_argument("--no-cache", action="store_true", help="ignore the decision cache")
+    parser.add_argument("--local-floor", type=int,
+                        default=int(os.environ.get("TRICK_LOCAL_FLOOR", DEFAULT_LOCAL_FLOOR)),
+                        help="shortlist slots reserved for local catalogue entries")
+    parser.add_argument("--live-cap", type=int,
+                        default=int(os.environ.get("TRICK_LIVE_CAP", DEFAULT_LIVE_CAP)),
+                        help="shortlist slots one live source may take")
     sub = parser.add_subparsers(dest="command", required=True)
 
     query = sub.add_parser("query", help="run one search")
@@ -318,6 +332,8 @@ def build_parser() -> argparse.ArgumentParser:
     serve = sub.add_parser("serve", help="run the core service (unix socket + loopback HTTP)")
     serve.add_argument("--socket", help=f"socket path (default {DEFAULT_SOCKET})")
     serve.add_argument("--http-host", default="127.0.0.1")
+    serve.add_argument("--expose-network", action="store_true",
+                       help="allow --http-host to be a non-loopback local address (e.g. the docker bridge)")
     serve.add_argument("--http-port", type=int, default=8765)
     serve.add_argument("--token-file", help=f"bridge token file (default {DEFAULT_TOKEN})")
     serve.add_argument("--no-http", action="store_true", help="unix socket only")

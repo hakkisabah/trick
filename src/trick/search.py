@@ -75,6 +75,16 @@ DEFAULT_BLEND_MODE = "fused"
 # Skip the scorer when the retrieval top-1 leads top-2 by this fraction of its
 # score: measured 7/22 queries gated with no change in nDCG@10.
 DEFAULT_GATE = 0.15
+# Sources that live in the local store as bulk catalogue snapshots. They are the
+# reason Trick exists, and they lose to live APIs on raw BM25 very easily: a paper
+# abstract repeats the query words, a package description rarely does.
+LOCAL_SOURCES = frozenset({"cran", "bioconductor"})
+# How many of the shortlist slots are reserved for local catalogue entries when
+# such candidates exist, and how many one live source may take. Measured in
+# phase 4: see scripts/eval_quota.py. Both are bounds, not targets - an unused
+# reservation is handed back to the global ranking order.
+DEFAULT_LOCAL_FLOOR = 4
+DEFAULT_LIVE_CAP = 4
 
 
 @dataclass(frozen=True)
@@ -181,6 +191,8 @@ class SearchEngine:
         gate_margin: float = DEFAULT_GATE,
         budget_s: float = 1.5,
         use_cache: bool = True,
+        local_floor: int = DEFAULT_LOCAL_FLOOR,
+        live_cap: int = DEFAULT_LIVE_CAP,
     ) -> None:
         self.store = store
         self.scorer: Scorer = scorer if scorer is not None else MockScorer()
@@ -197,6 +209,8 @@ class SearchEngine:
         # When the retrieval top-1 is this much better than top-2, asking the
         # scorer cannot change the answer, so we do not spend a call.
         self.gate_margin = max(0.0, float(gate_margin))
+        self.local_floor = max(0, int(local_floor))
+        self.live_cap = max(0, int(live_cap))
         self.budget_s = budget_s
         self.use_cache = use_cache
         self._matrix: MatrixIndex | None = None
@@ -380,7 +394,14 @@ class SearchEngine:
                     (1.0 - beta) * text[doc_id] + beta * priors.get(doc_id, 0.0),
                 )
         merged = sorted(((cut[doc_id], doc_id) for doc_id in ids), key=lambda item: (-item[0], item[1]))
-        keep = [doc_id for _, doc_id in merged[: self.shortlist]]
+        ranked = [doc_id for _, doc_id in merged]
+        keep = apply_source_quota(
+            ranked,
+            self.shortlist,
+            self.store.sources_for(ids),
+            local_floor=self.local_floor,
+            live_cap=self.live_cap,
+        )
         return keep, {doc_id: cut[doc_id] for doc_id in keep}, {doc_id: text[doc_id] for doc_id in keep}
 
     def _gate_closed(self, scores: dict[int, float]) -> bool:
@@ -486,6 +507,7 @@ class SearchEngine:
             "prior_weight": self.prior_weight,
             "fusion": self.fusion,
             "blend_mode": self.blend_mode,
+            "source_quota": {"local_floor": self.local_floor, "live_cap": self.live_cap},
         }
         matrix = self._open_matrix()
         if matrix is not None:
@@ -495,6 +517,92 @@ class SearchEngine:
         else:
             info["matrix"] = None
         return info
+
+
+def apply_source_quota(
+    ranked: Sequence[int],
+    size: int,
+    sources: dict[int, str],
+    *,
+    local_floor: int = 0,
+    live_cap: int = 0,
+) -> list[int]:
+    """Keep the ranking order while bounding what one source family may take.
+
+    Two failure modes motivate this, and they are not symmetric:
+
+    * a live API fills the whole shortlist, so the local catalogue - the thing
+      the user actually asked for - never reaches the scorer. A short package
+      description cannot out-BM25 a paper abstract that repeats the query, so
+      this happens on realistic queries, not on pathological ones. The floor
+      reserves slots for local entries *before* the global walk;
+    * one live source returns twelve near-duplicates of the same paper and
+      crowds out the other sources. ``live_cap`` bounds each live source.
+
+    Both parameters are bounds, never targets. A reservation nobody fills is
+    handed back to the global order in the third pass, so a query with no local
+    candidates still gets a full live shortlist. The result keeps the original
+    ranking order - the quota decides *membership*, not order, because the
+    scorer and the blend own the order.
+    """
+    if size <= 0 or not ranked:
+        return []
+    limit = min(int(size), len(ranked))
+    if local_floor <= 0 and live_cap <= 0:
+        return list(ranked[:limit])
+
+    reserved_budget = min(max(0, int(local_floor)), limit)
+    chosen: list[int] = []
+    seen: set[int] = set()
+    taken: dict[str, int] = {}
+
+    def take(doc_id: int) -> None:
+        chosen.append(doc_id)
+        seen.add(doc_id)
+        source = sources.get(doc_id, "")
+        taken[source] = taken.get(source, 0) + 1
+
+    if reserved_budget:
+        for doc_id in ranked:
+            if len(chosen) >= reserved_budget:
+                break
+            if sources.get(doc_id) in LOCAL_SOURCES:
+                take(doc_id)
+
+    for doc_id in ranked:
+        if len(chosen) >= limit:
+            break
+        if doc_id in seen:
+            continue
+        source = sources.get(doc_id, "")
+        if source not in LOCAL_SOURCES and live_cap > 0 and taken.get(source, 0) >= live_cap:
+            continue
+        take(doc_id)
+
+    if len(chosen) < limit:
+        # Nothing could fill the list under the cap. An empty slot is worse than
+        # an over-cap entry, so the rest is filled round-robin across the
+        # remaining sources: a duplicate-heavy query degrades into a *balanced*
+        # list instead of one source taking every leftover slot.
+        queues: dict[str, list[int]] = {}
+        order: list[str] = []
+        for doc_id in ranked:
+            if doc_id in seen:
+                continue
+            source = sources.get(doc_id, "")
+            if source not in queues:
+                queues[source] = []
+                order.append(source)
+            queues[source].append(doc_id)
+        while len(chosen) < limit and any(queues[source] for source in order):
+            for source in order:
+                if len(chosen) >= limit:
+                    break
+                if queues[source]:
+                    take(queues[source].pop(0))
+
+    position = {doc_id: index for index, doc_id in enumerate(ranked)}
+    return sorted(chosen, key=lambda doc_id: position[doc_id])
 
 
 def _weighted_rrf(
@@ -588,6 +696,8 @@ def build_engine(
     scorer_mode: str = "auto",
     use_cache: bool = True,
     budget_s: float = 1.5,
+    local_floor: int = DEFAULT_LOCAL_FLOOR,
+    live_cap: int = DEFAULT_LIVE_CAP,
 ) -> SearchEngine:
     """Convenience constructor used by the CLI and the MCP server."""
     store = DocumentStore(db_path)
@@ -597,16 +707,22 @@ def build_engine(
         matrix_path=matrix_path,
         use_cache=use_cache,
         budget_s=budget_s,
+        local_floor=local_floor,
+        live_cap=live_cap,
     )
 
 
 __all__ = [
+    "DEFAULT_LIVE_CAP",
+    "DEFAULT_LOCAL_FLOOR",
     "DEFAULT_PREFILTER",
     "DEFAULT_SHORTLIST",
     "DEFAULT_WEIGHTS",
+    "LOCAL_SOURCES",
     "ResultRow",
     "SearchEngine",
     "SearchOutcome",
+    "apply_source_quota",
     "build_engine",
     "row_from_dict",
 ]

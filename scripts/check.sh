@@ -12,6 +12,8 @@
 #      8. language      no Turkish-specific characters in tracked files
 #      9. secrets       no obvious credentials in tracked files
 #     10. stdio         the MCP server writes nothing but JSON-RPC to stdout
+#     11. integrations  pipe metadata, MCP manifest, wrapper, commands, installer
+#     12. integ. secrets no literal credentials under integrations/
 set -eu
 
 cd "$(dirname "$0")/.."
@@ -22,13 +24,13 @@ if [ ! -x "$PY" ]; then
   exit 2
 fi
 
-echo "== 1/10 tests"
+echo "== 1/12 tests"
 "$PY" -m pytest -q
 
-echo "== 2/10 compile"
+echo "== 2/12 compile"
 "$PY" -m compileall -q src scripts >/dev/null
 
-echo "== 3/10 layout"
+echo "== 3/12 layout"
 "$PY" - <<'PYCODE'
 import sys
 sys.path.insert(0, "src")
@@ -39,7 +41,7 @@ assert HEADER_SIZE == 48, HEADER_SIZE
 print("layout ok: 48 byte header, 24 byte records")
 PYCODE
 
-echo "== 4/10 ranking contracts"
+echo "== 4/12 ranking contracts"
 "$PY" - <<'PYCODE'
 import sys
 sys.path.insert(0, "src")
@@ -65,7 +67,7 @@ print(f"ranking ok: weights={DEFAULT_WEIGHTS} prior={DEFAULT_PRIOR} "
       f"fusion={DEFAULT_FUSION} blend={DEFAULT_BLEND_MODE} gate={DEFAULT_GATE}")
 PYCODE
 
-echo "== 5/10 offline tests"
+echo "== 5/12 offline tests"
 if grep -rnE '(live_adapters\(\)|bulk_adapters\(\)\.fetch|http_get\()' tests/ >/dev/null 2>&1; then
   echo "gate: the test suite must not use a real transport" >&2
   exit 1
@@ -76,7 +78,7 @@ if ! grep -q 'no_live_sources' tests/conftest.py; then
 fi
 echo "offline ok"
 
-echo "== 6/10 surfaces"
+echo "== 6/12 surfaces"
 "$PY" - <<'PYCODE'
 import sys
 sys.path.insert(0, "src")
@@ -102,7 +104,7 @@ else:
 print("surfaces ok: mcp tools + loopback-only bridge")
 PYCODE
 
-echo "== 7/10 transport permissions"
+echo "== 7/12 transport permissions"
 "$PY" - <<'PYCODE'
 import inspect
 import sys
@@ -118,21 +120,21 @@ assert "O_EXCL" in token_source, "token creation must not race"
 print("transport ok: 0600 socket and token, 0700 directory")
 PYCODE
 
-echo "== 8/10 language (english only in the repository)"
+echo "== 8/12 language (english only in the repository)"
 "$PY" scripts/language_gate.py
 
-echo "== 9/10 secrets"
-if git grep -n -I -E '(AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{20,}|aws_secret_access_key[[:space:]]*=)' -- . >/dev/null 2>&1; then
+echo "== 9/12 secrets"
+if git grep --untracked -n -I -E '(AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{20,}|aws_secret_access_key[[:space:]]*=)' -- . >/dev/null 2>&1; then
   echo "gate: credential-shaped string found in tracked files" >&2
   exit 1
 fi
-if git grep -n -I -E '^LAYA_API_KEY=[A-Za-z0-9_-]{12,}$' -- src tests scripts README.md >/dev/null 2>&1; then
+if git grep --untracked -n -I -E '^LAYA_API_KEY=[A-Za-z0-9_-]{12,}$' -- src tests scripts README.md integrations >/dev/null 2>&1; then
   echo "gate: a real LAYA_API_KEY value is tracked" >&2
   exit 1
 fi
 echo "secrets ok"
 
-echo "== 10/10 stdio purity"
+echo "== 10/12 stdio purity"
 "$PY" - <<'PYCODE'
 import io
 import json
@@ -167,5 +169,51 @@ for line in lines:
     assert "id" in message, message
 print(f"stdio ok: {len(lines)} well-formed responses, nothing else")
 PYCODE
+
+echo "== 11/12 integration surfaces"
+"$PY" - <<'PYCODE'
+import json
+from pathlib import Path
+
+root = Path(".")
+pipe = (root / "integrations/openwebui/trick_pipe.py").read_text(encoding="utf-8")
+# Open WebUI reads these from the docstring block; a missing one is a silent
+# install failure (the function loads with no title and cannot be found).
+for field in ("title: Trick", "version:", "required_open_webui_version:"):
+    assert field in pipe, f"pipe metadata missing {field!r}"
+assert "class Pipe" in pipe and "def pipes(" in pipe and "def pipe(" in pipe
+assert "0.0.0.0" not in pipe, "the pipe must not point at a wildcard address"
+
+manifest = json.loads((root / "integrations/gemini-extension/gemini-extension.json").read_text(encoding="utf-8"))
+assert manifest["name"] == "trick"
+server = manifest["mcpServers"]["trick"]
+# Measured on Gemini CLI 0.66.0: it spawns MCP servers with a sanitised PATH, so
+# "command": "trick" fails with ENOENT. The wrapper is the fix; keep it.
+assert server["command"] != "trick", "MCP command must not depend on PATH"
+assert server["command"].startswith("/"), server["command"]
+assert any("trick-mcp.sh" in arg for arg in server["args"]), server["args"]
+wrapper = root / "integrations/gemini-extension/trick-mcp.sh"
+assert wrapper.exists(), "wrapper script missing"
+assert wrapper.stat().st_mode & 0o111, "wrapper script is not executable"
+
+for command in ("search", "health"):
+    path = root / "integrations/gemini-extension/commands/trick" / f"{command}.toml"
+    text = path.read_text(encoding="utf-8")
+    assert text.startswith("description ="), f"{path} needs a description"
+    assert "prompt = " in text, f"{path} needs a prompt"
+
+# The installer must never accept the key as an argument (shell history, ps).
+installer = (root / "integrations/openwebui/install.py").read_text(encoding="utf-8")
+assert "TRICK_OPENWEBUI_API_KEY" in installer
+assert "--api-key" not in installer, "the API key belongs in the environment, not in argv"
+print("integrations ok: pipe metadata, MCP manifest, wrapper, commands, installer")
+PYCODE
+
+echo "== 12/12 no secrets in the integration files"
+if git grep --untracked -n -I -E '(api[_-]?key|token)[^=]*[:=][[:space:]]*["'"'"'][A-Za-z0-9_-]{24,}["'"'"']' -- integrations >/dev/null 2>&1; then
+  echo "gate: a literal credential is tracked under integrations/" >&2
+  exit 1
+fi
+echo "integration secrets ok"
 
 echo "gate: all checks passed"

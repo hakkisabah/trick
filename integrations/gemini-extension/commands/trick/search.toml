@@ -1,0 +1,17 @@
+description = "Rank scientific sources for a question with Trick"
+prompt = """
+Use the `trick_search` tool with exactly this query:
+
+{{args}}
+
+Then answer with the returned rows only:
+
+- one line per source: the title as a markdown link to its `url`, then the
+  source label (CRAN, Bioconductor, arXiv, OpenAlex, Crossref) and the `key`;
+- the top three at most if the user did not ask for more;
+- if `score_label` is `retrieval-only` for a row, add "(text-only ranking)";
+- if `degraded` is not empty, one short line saying which stage failed.
+
+Do not invent sources, versions or citations. If `rows` is empty, say so and
+quote the `degraded` codes.
+"""

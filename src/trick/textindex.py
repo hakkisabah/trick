@@ -295,6 +295,23 @@ class DocumentStore:
         rows = self.conn.execute(f"SELECT * FROM docs WHERE doc_id IN ({placeholders})", ids).fetchall()
         return {int(row["doc_id"]): _to_doc(row) for row in rows}
 
+    def sources_for(self, doc_ids: Sequence[int]) -> dict[int, str]:
+        """Map ``doc_id -> source`` for the given ids.
+
+        The shortlist cut needs the source of every candidate to apply a
+        per-source quota, and it needs it cheaply: fetching whole rows for the
+        prefilter union would read columns nobody looks at. Ids missing from the
+        store are simply absent from the result.
+        """
+        ids = [int(i) for i in doc_ids]
+        if not ids:
+            return {}
+        placeholders = ",".join("?" * len(ids))
+        rows = self.conn.execute(
+            f"SELECT doc_id, source FROM docs WHERE doc_id IN ({placeholders})", ids
+        ).fetchall()
+        return {int(row["doc_id"]): str(row["source"]) for row in rows}
+
     def iter_docs(self, *, limit: int | None = None) -> Iterable[StoredDoc]:
         sql = "SELECT * FROM docs ORDER BY doc_id"
         args: tuple = ()

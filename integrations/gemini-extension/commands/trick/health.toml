@@ -1,0 +1,12 @@
+description = "Report Trick's store size, scorer, shortlist and quota"
+prompt = """
+Call `trick_health` and report, in at most five lines:
+
+- the number of documents in the store and whether FTS5 is active;
+- the scorer in use and, if the matrix exists, how many records it holds;
+- the shortlist size, the blend weights and the source quota
+  (`local_floor` / `live_cap`);
+- any `matrix.error` value, quoted verbatim.
+
+Do not guess a value that the tool did not return.
+"""

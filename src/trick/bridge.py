@@ -35,6 +35,34 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 MAX_BODY_BYTES = 32 * 1024
 AUTH_HEADER = "Authorization"
+LOOPBACK_HOSTS = ("127.0.0.1", "::1", "localhost")
+WILDCARD_HOSTS = ("0.0.0.0", "", "::", "*")
+
+
+def validate_host(host: str, *, allow_network: bool = False) -> str:
+    """Accept loopback by default, one explicit local address when asked.
+
+    A wildcard bind is never allowed: the service has no user accounts, and a
+    machine on a shared network would then be one token away from spending the
+    owner's laya credits. A container cannot reach ``127.0.0.1`` on the host, so
+    the docker bridge address (``172.17.0.1``) is a legitimate choice - it is
+    reachable from containers and not from the LAN. Any other address has to be
+    requested explicitly, which is what ``allow_network`` records in the log.
+    """
+    host = (host or "").strip()
+    if host in WILDCARD_HOSTS:
+        raise ConfigError(
+            f"bridge refuses a wildcard bind, got {host!r}; the bridge is loopback-only "
+            "unless --expose-network names one specific local address"
+        )
+    if host in LOOPBACK_HOSTS:
+        return host
+    if not allow_network:
+        raise ConfigError(
+            f"bridge host must be loopback, got {host!r}; pass --http-host with "
+            "--expose-network only if this address is a local interface"
+        )
+    return host
 
 STATUS_FOR_CODE = {
     "S1": 503,
@@ -61,11 +89,11 @@ class BridgeServer:
         host: str = DEFAULT_HOST,
         port: int = DEFAULT_PORT,
         cors_origins: tuple[str, ...] = (),
+        allow_network: bool = False,
     ) -> None:
         if not token or len(token) < 32:
             raise ConfigError("bridge token must be at least 32 characters")
-        if host not in ("127.0.0.1", "::1", "localhost"):
-            raise ConfigError(f"bridge host must be loopback, got {host!r}")
+        host = validate_host(host, allow_network=allow_network)
         self.backend = backend
         self.token = token
         self.cors_origins = tuple(o for o in cors_origins if o)
@@ -254,4 +282,5 @@ __all__ = [
     "MAX_BODY_BYTES",
     "STATUS_FOR_CODE",
     "cors_from_env",
+    "validate_host",
 ]
