@@ -14,7 +14,10 @@
 #     10. stdio         the MCP server writes nothing but JSON-RPC to stdout
 #     11. integrations  pipe metadata, MCP manifest, wrapper, commands, installer
 #     12. integ. secrets no literal credentials under integrations/
+#     13. docs         every documented command and path actually exists
 set -eu
+
+TOTAL=13
 
 cd "$(dirname "$0")/.."
 PY="${PY:-.venv/bin/python}"
@@ -24,13 +27,13 @@ if [ ! -x "$PY" ]; then
   exit 2
 fi
 
-echo "== 1/12 tests"
+echo "== 1/$TOTAL tests"
 "$PY" -m pytest -q
 
-echo "== 2/12 compile"
+echo "== 2/$TOTAL compile"
 "$PY" -m compileall -q src scripts >/dev/null
 
-echo "== 3/12 layout"
+echo "== 3/$TOTAL layout"
 "$PY" - <<'PYCODE'
 import sys
 sys.path.insert(0, "src")
@@ -41,7 +44,7 @@ assert HEADER_SIZE == 48, HEADER_SIZE
 print("layout ok: 48 byte header, 24 byte records")
 PYCODE
 
-echo "== 4/12 ranking contracts"
+echo "== 4/$TOTAL ranking contracts"
 "$PY" - <<'PYCODE'
 import sys
 sys.path.insert(0, "src")
@@ -67,7 +70,7 @@ print(f"ranking ok: weights={DEFAULT_WEIGHTS} prior={DEFAULT_PRIOR} "
       f"fusion={DEFAULT_FUSION} blend={DEFAULT_BLEND_MODE} gate={DEFAULT_GATE}")
 PYCODE
 
-echo "== 5/12 offline tests"
+echo "== 5/$TOTAL offline tests"
 if grep -rnE '(live_adapters\(\)|bulk_adapters\(\)\.fetch|http_get\()' tests/ >/dev/null 2>&1; then
   echo "gate: the test suite must not use a real transport" >&2
   exit 1
@@ -78,7 +81,7 @@ if ! grep -q 'no_live_sources' tests/conftest.py; then
 fi
 echo "offline ok"
 
-echo "== 6/12 surfaces"
+echo "== 6/$TOTAL surfaces"
 "$PY" - <<'PYCODE'
 import sys
 sys.path.insert(0, "src")
@@ -104,7 +107,7 @@ else:
 print("surfaces ok: mcp tools + loopback-only bridge")
 PYCODE
 
-echo "== 7/12 transport permissions"
+echo "== 7/$TOTAL transport permissions"
 "$PY" - <<'PYCODE'
 import inspect
 import sys
@@ -120,10 +123,10 @@ assert "O_EXCL" in token_source, "token creation must not race"
 print("transport ok: 0600 socket and token, 0700 directory")
 PYCODE
 
-echo "== 8/12 language (english only in the repository)"
+echo "== 8/$TOTAL language (english only in the repository)"
 "$PY" scripts/language_gate.py
 
-echo "== 9/12 secrets"
+echo "== 9/$TOTAL secrets"
 if git grep --untracked -n -I -E '(AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{20,}|aws_secret_access_key[[:space:]]*=)' -- . >/dev/null 2>&1; then
   echo "gate: credential-shaped string found in tracked files" >&2
   exit 1
@@ -134,7 +137,7 @@ if git grep --untracked -n -I -E '^LAYA_API_KEY=[A-Za-z0-9_-]{12,}$' -- src test
 fi
 echo "secrets ok"
 
-echo "== 10/12 stdio purity"
+echo "== 10/$TOTAL stdio purity"
 "$PY" - <<'PYCODE'
 import io
 import json
@@ -170,7 +173,7 @@ for line in lines:
 print(f"stdio ok: {len(lines)} well-formed responses, nothing else")
 PYCODE
 
-echo "== 11/12 integration surfaces"
+echo "== 11/$TOTAL integration surfaces"
 "$PY" - <<'PYCODE'
 import json
 from pathlib import Path
@@ -209,11 +212,14 @@ assert "--api-key" not in installer, "the API key belongs in the environment, no
 print("integrations ok: pipe metadata, MCP manifest, wrapper, commands, installer")
 PYCODE
 
-echo "== 12/12 no secrets in the integration files"
+echo "== 12/$TOTAL no secrets in the integration files"
 if git grep --untracked -n -I -E '(api[_-]?key|token)[^=]*[:=][[:space:]]*["'"'"'][A-Za-z0-9_-]{24,}["'"'"']' -- integrations >/dev/null 2>&1; then
   echo "gate: a literal credential is tracked under integrations/" >&2
   exit 1
 fi
 echo "integration secrets ok"
+
+echo "== 13/$TOTAL docs (documented commands and paths exist)"
+"$PY" scripts/docs_gate.py
 
 echo "gate: all checks passed"

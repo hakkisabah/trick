@@ -39,13 +39,20 @@ One engine, six doors. They cannot disagree, because they share one process and
 one ranking path:
 
 ```sh
-trick tui                     # terminal session, Enter submits, arrows, history
-trick serve                   # core service: unix socket + loopback HTTP bridge
-trick mcp                     # MCP server on stdio (Gemini CLI, Open WebUI, Claude)
-trick query "..." --json      # one shot, scriptable
+.venv/bin/python -m trick tui                     # terminal session, Enter submits, arrows, history
+.venv/bin/python -m trick serve                   # core service: unix socket + loopback HTTP bridge
+.venv/bin/python -m trick mcp                     # MCP server on stdio (Gemini CLI, Open WebUI, Claude)
+.venv/bin/python -m trick query "..." --json      # one shot, scriptable
 integrations/openwebui        # Open WebUI Pipe (a model that answers with rows)
 integrations/gemini-extension # Gemini CLI extension: /trick:search, /trick:health
 ```
+
+There is no `trick` console script: the package declares no entry point, so the
+`python -m trick` form above is the only invocation that works on a clean
+machine, and the documentation gate fails the build if a document forgets it.
+Full installation, verification and removal steps for every artifact (venv,
+store, bridge token, systemd unit, Open WebUI function, Gemini extension) live in
+`docs/INSTALL.md`.
 
 The Open WebUI Pipe and the Gemini extension are clients of the same bridge, not
 second implementations. See `integrations/README.md` for the two steps that
@@ -63,7 +70,7 @@ plugin / CLI / MCP host
         +-- unix socket  $TRICK_HOME/run/trick.sock   owner-only (0600)
         +-- http bridge  127.0.0.1:8765/v1/search     bearer token from a 0600 file
                               |
-                        trick serve  (one engine, one thread, one worker queue)
+              python -m trick serve  (one engine, one thread, one worker queue)
 ```
 
 Why the worker queue: a `sqlite3.Connection` is bound to the thread that created
@@ -172,7 +179,7 @@ bind, including the flood case the phase 3 report observed.
 
 ```sh
 .venv/bin/python scripts/eval_quota.py --scorer mock --configs 0/0,4/4,6/4
-trick query "..." --local-floor 4 --live-cap 4     # or TRICK_LOCAL_FLOOR / TRICK_LIVE_CAP
+.venv/bin/python -m trick query "..." --local-floor 4 --live-cap 4   # or TRICK_LOCAL_FLOOR / TRICK_LIVE_CAP
 ```
 
 
