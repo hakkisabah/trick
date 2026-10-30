@@ -15,9 +15,10 @@
 #     11. integrations  pipe metadata, MCP manifest, wrapper, commands, installer
 #     12. integ. secrets no literal credentials under integrations/
 #     13. docs         every documented command and path actually exists
+#     14. chat quality conversation search still finds the planted passages
 set -eu
 
-TOTAL=13
+TOTAL=14
 
 cd "$(dirname "$0")/.."
 PY="${PY:-.venv/bin/python}"
@@ -187,29 +188,44 @@ for field in ("title: Trick", "version:", "required_open_webui_version:"):
 assert "class Pipe" in pipe and "def pipes(" in pipe and "def pipe(" in pipe
 assert "0.0.0.0" not in pipe, "the pipe must not point at a wildcard address"
 
-manifest = json.loads((root / "integrations/gemini-extension/gemini-extension.json").read_text(encoding="utf-8"))
-assert manifest["name"] == "trick"
-server = manifest["mcpServers"]["trick"]
-# Measured on Gemini CLI 0.66.0: it spawns MCP servers with a sanitised PATH, so
-# "command": "trick" fails with ENOENT. The wrapper is the fix; keep it.
-assert server["command"] != "trick", "MCP command must not depend on PATH"
-assert server["command"].startswith("/"), server["command"]
-assert any("trick-mcp.sh" in arg for arg in server["args"]), server["args"]
-wrapper = root / "integrations/gemini-extension/trick-mcp.sh"
-assert wrapper.exists(), "wrapper script missing"
-assert wrapper.stat().st_mode & 0o111, "wrapper script is not executable"
+# The conversation scope is the product's first requirement, and it travels as
+# one argument through four surfaces. A surface that forgets it does not fail:
+# it silently answers with catalogue rows, which reads as "your chat does not
+# mention it". So every hop is asserted here.
+import sys
+sys.path.insert(0, "src")
+from trick.mcp import TOOLS
+from trick.service import MAX_LINE_BYTES, MAX_TRANSCRIPT_CHARS, validate_messages_param
 
-for command in ("search", "health"):
-    path = root / "integrations/gemini-extension/commands/trick" / f"{command}.toml"
-    text = path.read_text(encoding="utf-8")
-    assert text.startswith("description ="), f"{path} needs a description"
-    assert "prompt = " in text, f"{path} needs a prompt"
+props = TOOLS[0]["inputSchema"]["properties"]
+assert "messages" in props, "the MCP tool must accept the conversation"
+assert props["messages"]["items"]["required"] == ["role", "content"]
+assert props["scope"]["enum"] == ["sources", "chat", "both"]
+assert "conversation" in TOOLS[0]["description"]
+
+# A 200-turn transcript must fit one frame; 64 KiB was too small.
+assert MAX_LINE_BYTES >= 1024 * 1024, MAX_LINE_BYTES
+assert 4 * MAX_TRANSCRIPT_CHARS <= MAX_LINE_BYTES, "the worst-case UTF-8 transcript must fit one frame"
+assert validate_messages_param([{"role": "user", "content": "hi"}]) == [
+    {"role": "user", "content": "hi"}
+]
+for bad in ("a string", 42, {"role": "user"}):
+    try:
+        validate_messages_param(bad)
+    except Exception as exc:
+        assert getattr(exc, "s_code", "") == "S8", (bad, exc)
+    else:
+        raise AssertionError(f"messages accepted {bad!r}")
+
+assert 'payload["scope"] = "both"' in pipe, "the pipe must ask for both scopes when it sends a chat"
+assert "_chat_lines" in pipe and "CHAT_TURNS" in pipe, "the pipe must render and window the chat"
+assert "conversation match" in pipe, "the pipe must show where in the chat it matched"
 
 # The installer must never accept the key as an argument (shell history, ps).
 installer = (root / "integrations/openwebui/install.py").read_text(encoding="utf-8")
 assert "TRICK_OPENWEBUI_API_KEY" in installer
 assert "--api-key" not in installer, "the API key belongs in the environment, not in argv"
-print("integrations ok: pipe metadata, MCP manifest, wrapper, commands, installer")
+print("integrations ok: pipe metadata, MCP schema, transcript contract, installer")
 PYCODE
 
 echo "== 12/$TOTAL no secrets in the integration files"
@@ -221,5 +237,40 @@ echo "integration secrets ok"
 
 echo "== 13/$TOTAL docs (documented commands and paths exist)"
 "$PY" scripts/docs_gate.py
+
+echo "== 14/$TOTAL chat quality (conversation search against planted needles)"
+"$PY" - <<'PYCODE'
+import json
+import subprocess
+import sys
+
+proc = subprocess.run(
+    [sys.executable, "scripts/eval_chat.py", "--json"],
+    capture_output=True,
+    text=True,
+    timeout=600,
+)
+if proc.returncode != 0:
+    print(proc.stderr.strip()[-800:])
+    raise SystemExit("the chat evaluation did not run")
+data = json.loads(proc.stdout)
+shipping = next(item for item in data["results"] if "shipping" in item["configuration"])
+# Thresholds are floors, not targets: they catch a ranking regression, and they
+# sit below the measured values so an honest change is not blocked by noise.
+problems = []
+if shipping["recall@3"] < 0.9:
+    problems.append(f"recall@3 {shipping['recall@3']} < 0.9")
+if shipping["mrr@10"] < 0.8:
+    problems.append(f"MRR@10 {shipping['mrr@10']} < 0.8")
+if shipping["decoy@1"] > 0.2:
+    problems.append(f"decoy@1 {shipping['decoy@1']} > 0.2")
+if problems:
+    raise SystemExit("chat quality regression: " + ", ".join(problems))
+print(
+    f"chat quality ok: recall@3 {shipping['recall@3']}, "
+    f"MRR@10 {shipping['mrr@10']}, decoy@1 {shipping['decoy@1']}, "
+    f"laya on {shipping['laya_calls']}/{shipping['queries']} queries"
+)
+PYCODE
 
 echo "gate: all checks passed"

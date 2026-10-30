@@ -5,7 +5,7 @@ Subcommands:
     trick query "mixed effects convergence" [--live] [--limit 8] [--json]
     trick tui                        interactive terminal session (Enter submits)
     trick serve                      the core service: unix socket + loopback HTTP
-    trick mcp                        MCP server on stdio, for Gemini CLI / Open WebUI
+    trick mcp                        MCP server on stdio, for any MCP host
     trick ingest [--source cran,bioc] [--max-docs N]
     trick doctor
     trick probe                      one real laya call, prints latency and usage
@@ -28,7 +28,7 @@ from pathlib import Path
 
 from .bridge import BridgeServer, cors_from_env
 from .credentials import DEFAULT_CREDENTIALS_PATH, load_laya_credentials
-from .errors import ConfigError, TrickError
+from .errors import ConfigError, ContractViolation, TrickError
 from .laya import LayaClient, build_scorer
 from .mcp import EngineBackend, McpServer, build_backend
 from .render import render_json, render_outcome
@@ -89,19 +89,46 @@ def _backend(args):
     return client
 
 
+def _load_transcript(path: str | None) -> list[dict] | None:
+    """Read a saved conversation (JSON array of {role, content}) for chat scope."""
+    if not path:
+        return None
+    file = Path(path)
+    try:
+        raw = file.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ContractViolation(f"cannot read transcript {file}: {exc}") from exc
+    try:
+        payload = json.loads(raw)
+    except ValueError as exc:
+        raise ContractViolation(f"transcript {file} is not JSON: {exc}") from exc
+    if isinstance(payload, dict) and isinstance(payload.get("messages"), list):
+        payload = payload["messages"]
+    if not isinstance(payload, list):
+        raise ContractViolation(f"transcript {file} must be a JSON array of {{role, content}}")
+    return payload
+
+
 def cmd_query(args) -> int:
     engine = _engine(args)
+    messages = _load_transcript(getattr(args, "transcript", None))
     try:
-        outcome = engine.search(args.text, limit=args.limit, use_live=None if not args.offline else False)
+        outcome = engine.search(
+            args.text,
+            limit=args.limit,
+            use_live=None if not args.offline else False,
+            messages=messages,
+            scope="both" if messages else "sources",
+        )
     finally:
         engine.store.close()
 
     if args.json:
         print(render_json(outcome))
-        return 0 if outcome.rows else 1
+        return 0 if outcome.rows or outcome.chat else 1
 
     print(render_outcome(outcome, verbose=args.verbose))
-    return 0 if outcome.rows else 1
+    return 0 if outcome.rows or outcome.chat else 1
 
 
 def cmd_tui(args) -> int:
@@ -113,6 +140,7 @@ def cmd_tui(args) -> int:
         limit=args.limit,
         live=not args.offline,
         history_path=Path(args.history) if args.history else DEFAULT_HISTORY,
+        messages=_load_transcript(getattr(args, "transcript", None)),
     )
     return ui.run()
 
@@ -320,6 +348,7 @@ def build_parser() -> argparse.ArgumentParser:
     query.add_argument("--offline", action="store_true", help="local store and matrix only")
     query.add_argument("--json", action="store_true")
     query.add_argument("--verbose", action="store_true", help="show score components")
+    query.add_argument("--transcript", help="JSON conversation to search inside ({role, content} array)")
     query.set_defaults(func=cmd_query)
 
     tui = sub.add_parser("tui", help="interactive terminal session")
@@ -327,6 +356,7 @@ def build_parser() -> argparse.ArgumentParser:
     tui.add_argument("--offline", action="store_true")
     tui.add_argument("--socket", help=f"core service socket (default {DEFAULT_SOCKET})")
     tui.add_argument("--history", help=f"history file (default {DEFAULT_HISTORY})")
+    tui.add_argument("--transcript", help="JSON conversation to search inside ({role, content} array)")
     tui.set_defaults(func=cmd_tui)
 
     serve = sub.add_parser("serve", help="run the core service (unix socket + loopback HTTP)")

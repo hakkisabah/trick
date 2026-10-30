@@ -198,7 +198,7 @@ def test_empty_result_is_an_answer_not_an_error(pipe_module):
         text = _pipe(pipe_module, server.url).pipe("nothing matches", "trick-search", [], {})
     finally:
         server.close()
-    assert "No scored sources" in text
+    assert "Nothing matched" in text
     assert "text for S4" in text
 
 
@@ -214,3 +214,106 @@ def test_limit_is_clamped_to_the_service_contract(pipe_module):
     finally:
         server.close()
     assert server.seen[0]["body"]["limit"] == 26
+
+
+# ---------------------------------------------------------------------------
+# conversation scope
+# ---------------------------------------------------------------------------
+def _chat_payload(chat: int = 2, rows: int = 1) -> dict:
+    payload = _search_payload(rows=rows)
+    payload["result"]["chat"] = [
+        {
+            "rank": index + 1,
+            "turn": 7 + index,
+            "role": "assistant" if index % 2 == 0 else "user",
+            "text": f"passage {index} about the spatial join",
+            "char_start": 10 * index,
+            "char_end": 10 * index + 40,
+            "retrieval_score": 5.0,
+            "laya_probability": 0.6,
+            "final_score": 4.1,
+            "score_label": "laya",
+            "scored_by_laya": True,
+        }
+        for index in range(chat)
+    ]
+    return payload
+
+
+def test_the_chat_is_sent_with_the_messages_it_was_given(pipe_module):
+    server = _Server(_chat_payload())
+    messages = [
+        {"role": "user", "content": "where did we discuss the spatial join?"},
+        {"role": "assistant", "content": [{"type": "text", "text": "turn about the polygon layer"}]},
+    ]
+    try:
+        text = _pipe(pipe_module, server.url).pipe("spatial join", "trick-search", messages, {})
+    finally:
+        server.close()
+    body = server.seen[0]["body"]
+    assert body["scope"] == "both"
+    assert body["messages"][0] == {
+        "role": "user",
+        "content": "where did we discuss the spatial join?",
+    }
+    # List-shaped content is flattened, not dropped.
+    assert body["messages"][1]["content"] == "turn about the polygon layer"
+    assert "conversation match" in text
+    assert "turn 7" in text
+
+
+def test_the_oldest_turns_are_dropped_and_the_reader_is_told(pipe_module):
+    server = _Server(_chat_payload(chat=1))
+    pipe = _pipe(pipe_module, server.url)
+    pipe.valves.CHAT_TURNS = 3
+    messages = [{"role": "user", "content": f"turn {index}"} for index in range(10)]
+    try:
+        text = pipe.pipe("q", "trick-search", messages, {})
+    finally:
+        server.close()
+    kept, dropped = pipe._transcript(messages)
+    assert [message["content"] for message in kept] == ["turn 7", "turn 8", "turn 9"]
+    assert dropped == 7
+    assert server.seen[0]["body"]["messages"] == kept
+    assert "1 conversation match" in text
+    assert "oldest 7 turns not searched" in text
+
+
+def test_the_character_budget_stops_at_the_newest_turns(pipe_module):
+    pipe = pipe_module.Pipe()
+    pipe.valves.CHAT_MAX_CHARS = 1000
+    messages = [{"role": "user", "content": "x" * 400} for _ in range(10)]
+    kept, dropped = pipe._transcript(messages)
+    assert kept and sum(len(item["content"]) for item in kept) <= 1000
+    assert dropped == 10 - len(kept)
+
+
+def test_search_chat_off_sends_no_transcript(pipe_module):
+    server = _Server(_chat_payload(chat=0, rows=1))
+    pipe = _pipe(pipe_module, server.url)
+    pipe.valves.SEARCH_CHAT = False
+    try:
+        pipe.pipe("q", "trick-search", [{"role": "user", "content": "hello"}], {})
+    finally:
+        server.close()
+    assert "messages" not in server.seen[0]["body"]
+    assert "scope" not in server.seen[0]["body"]
+
+
+def test_a_chat_only_answer_does_not_claim_a_catalogue_miss(pipe_module):
+    server = _Server(_chat_payload(chat=1, rows=0))
+    try:
+        text = _pipe(pipe_module, server.url).pipe("spatial join", "trick-search", [{"role": "user", "content": "x"}], {})
+    finally:
+        server.close()
+    assert "conversation match" in text
+    assert "No catalogue source matched" in text
+
+
+def test_an_empty_conversation_list_sends_nothing(pipe_module):
+    server = _Server(_search_payload(rows=1))
+    try:
+        _pipe(pipe_module, server.url).pipe("q", "trick-search", [{"role": "user", "content": "  "}], {})
+    finally:
+        server.close()
+    assert "messages" not in server.seen[0]["body"]

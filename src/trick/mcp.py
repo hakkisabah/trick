@@ -1,7 +1,7 @@
 """MCP server: expose Trick as tools over stdio.
 
-Model Context Protocol is the cheapest way to reach several hosts at once: Gemini
-CLI extensions, Open WebUI's tool servers, Claude and Codex all speak it, so one
+Model Context Protocol is the cheapest way to reach several hosts at once:
+Open WebUI's tool servers, Claude, Codex and any other MCP host speak it, so one
 server serves all of them instead of one adapter per product. The transport is
 newline-delimited JSON-RPC 2.0 on stdin/stdout.
 
@@ -24,7 +24,7 @@ from __future__ import annotations
 import json
 import os
 import sys
-from typing import Any, Callable, Mapping, Protocol, TextIO
+from typing import Any, Callable, Mapping, Protocol, Sequence, TextIO
 
 from .errors import TrickError
 from .render import render_compact, render_outcome
@@ -45,7 +45,15 @@ JSONRPC_INTERNAL_ERROR = -32603
 class ToolBackend(Protocol):
     """What the MCP layer needs; satisfied by the socket client or a local engine."""
 
-    def search(self, query: str, *, limit: int = 8, live: bool | None = None) -> SearchOutcome: ...
+    def search(
+        self,
+        query: str,
+        *,
+        limit: int = 8,
+        live: bool | None = None,
+        messages: Sequence[object] | None = None,
+        scope: str = "sources",
+    ) -> SearchOutcome: ...
 
     def health(self) -> dict[str, Any]: ...
 
@@ -54,10 +62,12 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "trick_search",
         "description": (
-            "Search scientific and engineering sources (CRAN, Bioconductor, arXiv, OpenAlex, "
-            "Crossref) and rank the candidates with the laya decision model. Use this when the "
-            "user needs a package, paper or tool for a technical problem: pass their problem "
-            "statement as the query, not just keywords."
+            "Search two things at once and rank them with the laya decision model: "
+            "(1) the conversation you pass in `messages`, so you can find the exact passage of a "
+            "long chat where something was said, and (2) scientific and engineering sources "
+            "(CRAN, Bioconductor, arXiv, OpenAlex, Crossref) for a technical need. "
+            "Always pass `messages` when the answer may already be in the chat. Pass the user's "
+            "problem statement as the query, not just keywords."
         ),
         "inputSchema": {
             "type": "object",
@@ -67,6 +77,29 @@ TOOLS: list[dict[str, Any]] = [
                     "description": "The problem or need in natural language, e.g. 'mixed effects model does not converge'.",
                     "minLength": 2,
                     "maxLength": 2000,
+                },
+                "messages": {
+                    "type": "array",
+                    "description": (
+                        "Optional conversation to search inside, oldest first, as {role, content} "
+                        "objects. Send the chat you are in; the result carries the matching passages "
+                        "with their turn numbers."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "role": {"type": "string", "description": "user, assistant or system."},
+                            "content": {"type": "string"},
+                        },
+                        "required": ["role", "content"],
+                    },
+                    "maxItems": 4000,
+                },
+                "scope": {
+                    "type": "string",
+                    "description": "sources, chat, or both (default both when messages are sent).",
+                    "enum": ["sources", "chat", "both"],
+                    "default": "both",
                 },
                 "limit": {
                     "type": "integer",
@@ -244,8 +277,27 @@ class McpServer:
         if not isinstance(live, bool):
             live = str(live).strip().lower() not in ("0", "false", "no", "off")
         verbose = bool(arguments.get("verbose", False))
+        messages = arguments.get("messages")
+        if messages is not None:
+            if not isinstance(messages, list):
+                return _tool_error("S8", "messages must be an array of {role, content} objects")
+            for position, item in enumerate(messages):
+                if not isinstance(item, dict):
+                    return _tool_error("S8", f"message {position} is not an object")
+        scope = arguments.get("scope")
+        if scope is None:
+            scope = "both"
+        scope = str(scope).strip().lower()
+        if scope not in ("sources", "chat", "both"):
+            return _tool_error("S8", f"unknown scope {scope!r}; use sources, chat or both")
         try:
-            outcome = self.backend.search(query.strip(), limit=limit, live=live)
+            outcome = self.backend.search(
+                query.strip(),
+                limit=limit,
+                live=live,
+                messages=messages,
+                scope=scope,
+            )
         except TrickError as exc:
             return _tool_error(exc.s_code, str(exc))
         except Exception as exc:  # noqa: BLE001 - surfaced to the caller as a tool error
@@ -297,8 +349,22 @@ class EngineBackend:
     def __init__(self, engine) -> None:
         self.engine = engine
 
-    def search(self, query: str, *, limit: int = 8, live: bool | None = None) -> SearchOutcome:
-        return self.engine.search(query, limit=limit, use_live=live)
+    def search(
+        self,
+        query: str,
+        *,
+        limit: int = 8,
+        live: bool | None = None,
+        messages: Sequence[object] | None = None,
+        scope: str = "sources",
+    ) -> SearchOutcome:
+        return self.engine.search(
+            query,
+            limit=limit,
+            use_live=live,
+            messages=messages,
+            scope=scope,
+        )
 
     def health(self) -> dict[str, Any]:
         return self.engine.health()

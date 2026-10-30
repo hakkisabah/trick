@@ -33,7 +33,12 @@ from .service import Backend, error_payload
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
-MAX_BODY_BYTES = 32 * 1024
+# 1 MiB: a request can carry a window of a long conversation (see
+# service.MAX_LINE_BYTES). The cap is still enforced before parsing so a single
+# POST cannot exhaust the host, and both transports agree on the same number.
+MAX_BODY_BYTES = 1024 * 1024
+# How much of a refused body is read and thrown away before the 413 is sent.
+MAX_DRAIN_BYTES = 2 * 1024 * 1024
 AUTH_HEADER = "Authorization"
 LOOPBACK_HOSTS = ("127.0.0.1", "::1", "localhost")
 WILDCARD_HOSTS = ("0.0.0.0", "", "::", "*")
@@ -148,6 +153,8 @@ class BridgeServer:
                 str(params.get("query") or ""),
                 limit=int(params.get("limit", 8) or 8),
                 live=params.get("live"),
+                messages=params.get("messages"),
+                scope=str(params.get("scope") or "sources"),
             )
             payload = outcome.as_dict()
             payload["degraded_text"] = [explain(code) for code in outcome.degraded]
@@ -194,6 +201,19 @@ def _make_handler(bridge: BridgeServer):
         def _unauthorised(self) -> None:
             self._fail(401, "S9", "missing or invalid bearer token")
 
+        def _drain(self, length: int) -> None:
+            """Read and discard at most ``MAX_DRAIN_BYTES`` of an announced body.
+
+            Bounded on purpose: the point is to let a well-behaved client read
+            the 413 rather than a connection reset, not to accept a flood.
+            """
+            remaining = min(length, MAX_DRAIN_BYTES)
+            while remaining > 0:
+                chunk = self.rfile.read(min(65536, remaining))
+                if not chunk:
+                    return
+                remaining -= len(chunk)
+
         # -- methods -----------------------------------------------------
         def do_OPTIONS(self) -> None:  # noqa: N802
             self.send_response(204)
@@ -234,6 +254,10 @@ def _make_handler(bridge: BridgeServer):
                 self._fail(400, "S8", "invalid Content-Length")
                 return
             if length > MAX_BODY_BYTES:
+                # Refuse before parsing, but drain what the client already
+                # announced (bounded) so it receives the 413 instead of a
+                # broken pipe it cannot interpret.
+                self._drain(length)
                 self._fail(413, "S8", f"body larger than {MAX_BODY_BYTES} bytes")
                 return
             body = self.rfile.read(length) if length else b""

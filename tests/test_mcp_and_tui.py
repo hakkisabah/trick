@@ -91,10 +91,12 @@ class FakeBackend:
     def __init__(self, *, error: Exception | None = None, degraded: list[str] | None = None) -> None:
         self.error = error
         self.degraded = degraded or []
-        self.calls: list[tuple[str, int, bool | None]] = []
+        self.calls: list[dict] = []
 
-    def search(self, query, *, limit=8, live=None):
-        self.calls.append((query, limit, live))
+    def search(self, query, *, limit=8, live=None, messages=None, scope="sources"):
+        self.calls.append(
+            {"query": query, "limit": limit, "live": live, "messages": messages, "scope": scope}
+        )
         if self.error is not None:
             raise self.error
         outcome = make_outcome(query)
@@ -187,7 +189,9 @@ def test_tools_call_search_returns_content_and_structured_data() -> None:
     assert result["content"][0]["type"] == "text"
     assert "lme4" in result["content"][0]["text"]
     assert result["structuredContent"]["rows"][0]["key"] == "lme4"
-    assert backend.calls == [("mixed effects", 3, True)]
+    assert len(backend.calls) == 1
+    call = backend.calls[0]
+    assert (call["query"], call["limit"], call["live"], call["messages"]) == ("mixed effects", 3, True, None)
 
 
 def test_tools_call_passes_live_false() -> None:
@@ -203,7 +207,8 @@ def test_tools_call_passes_live_false() -> None:
         ],
         backend,
     )
-    assert backend.calls == [("x y", 8, False)]
+    assert len(backend.calls) == 1
+    assert (backend.calls[0]["query"], backend.calls[0]["live"]) == ("x y", False)
 
 
 def test_tools_call_rejects_empty_query_and_bad_limit() -> None:
@@ -336,7 +341,7 @@ def test_tui_limit_command_changes_the_next_query() -> None:
     backend = FakeBackend()
     _code, _out, err = run(["/limit 2", "mixed effects"], backend)
     assert "limit set to 2" in err
-    assert backend.calls[0][1] == 2
+    assert backend.calls[0]["limit"] == 2
 
 
 def test_tui_limit_rejects_out_of_range() -> None:
@@ -348,7 +353,7 @@ def test_tui_live_command_toggles() -> None:
     backend = FakeBackend()
     _code, _out, err = run(["/live off", "x y"], backend)
     assert "live turned off" in err
-    assert backend.calls[0][2] is False
+    assert backend.calls[0]["live"] is False
 
 
 def test_tui_help_lists_every_command() -> None:

@@ -51,10 +51,12 @@ class TerminalUI:
         stderr: TextIO | None = None,
         history_path: str | os.PathLike[str] | None = None,
         interactive: bool | None = None,
+        messages: list | None = None,
     ) -> None:
         self.backend = backend
         self.limit = max(1, min(int(limit), 26))
         self.live = bool(live)
+        self.messages = list(messages) if messages else []
         self.stdin = stdin or sys.stdin
         self.stdout = stdout or sys.stdout
         self.stderr = stderr or sys.stderr
@@ -207,7 +209,13 @@ class TerminalUI:
     def search(self, query: str) -> SearchOutcome | None:
         """Run one query and print it. A failure prints and returns ``None``."""
         try:
-            outcome = self.backend.search(query, limit=self.limit, live=self.live)
+            outcome = self.backend.search(
+                query,
+                limit=self.limit,
+                live=self.live,
+                messages=self.messages or None,
+                scope="both" if self.messages else "sources",
+            )
         except TrickError as exc:
             self._error(f"{exc.s_code}: {exc}")
             if exc.degraded_action and exc.degraded_action != "none":

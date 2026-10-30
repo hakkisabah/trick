@@ -29,19 +29,35 @@ ranking can be diagnosed instead of argued about.
 
 from __future__ import annotations
 
+import hashlib
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Sequence
 
-from .errors import MatrixCorrupt, MatrixMissing, ResourceExhausted, ScorerUnavailable, TrickError
+from .errors import (
+    ContractViolation,
+    MatrixCorrupt,
+    MatrixMissing,
+    ResourceExhausted,
+    ScorerUnavailable,
+    TrickError,
+)
 from .laya import MockScorer, Scorer, ScorerStats, build_scorer
 from .matrix import MatrixIndex
 from .quant import feature_hash_signature
 from .retrieval import QueryAdapter, RetrievalReport, live_adapters, search_live
 from .textindex import DocumentStore
+from .transcript import ChatRow, ConversationSearch, Message, fingerprint, normalise_messages, window_messages
 
 DEFAULT_SHORTLIST = 12
+# Bump this whenever a cached payload would mean something different: the field
+# names, the blend, the response shape. Old entries then simply miss instead of
+# replaying yesterday's ranking as if it were today's. The ranking constants are
+# folded into the key automatically (see ``_pipeline_digest``), so tuning one of
+# them already invalidates the cache; this number is for algorithm changes that
+# keep the constants identical.
+CACHE_VERSION = 3
 DEFAULT_PREFILTER = 200
 # Model vs retrieval weight. Was 0.3/0.7 in phase 2; a sweep with the live model
 # over both gold sets moved it to 0.2/0.8 (canonical nDCG@10 0.797 -> 0.803,
@@ -130,22 +146,34 @@ class ResultRow:
 
 @dataclass
 class SearchOutcome:
-    """Rows plus everything a caller needs to explain them."""
+    """Rows plus everything a caller needs to explain them.
+
+    Two result blocks, never merged: ``chat`` holds passages from the
+    conversation the caller sent, ``rows`` holds catalogue sources. Their scores
+    come from different corpora, so mixing them into one numbered list would
+    invent a comparison that was never measured.
+    """
 
     query: str
     rows: list[ResultRow]
     degraded: list[str] = field(default_factory=list)
     report: dict = field(default_factory=dict)
+    chat: list[ChatRow] = field(default_factory=list)
+    chat_report: dict = field(default_factory=dict)
+    scope: str = "sources"
 
     @property
     def ok(self) -> bool:
-        return bool(self.rows)
+        return bool(self.rows or self.chat)
 
     def as_dict(self) -> dict:
         return {
             "query": self.query,
+            "scope": self.scope,
             "degraded": list(self.degraded),
             "report": dict(self.report),
+            "chat_report": dict(self.chat_report),
+            "chat": [row.as_dict() for row in self.chat],
             "rows": [row.as_dict() for row in self.rows],
         }
 
@@ -163,11 +191,19 @@ class SearchOutcome:
             for position, item in enumerate(payload.get("rows") or [], start=1)
             if isinstance(item, dict)
         ]
+        chat = [
+            ChatRow.from_dict(position, item)
+            for position, item in enumerate(payload.get("chat") or [], start=1)
+            if isinstance(item, dict)
+        ]
         return cls(
             query=str(payload.get("query") or ""),
             rows=rows,
             degraded=[str(code) for code in payload.get("degraded") or []],
             report=dict(payload.get("report") or {}),
+            chat=chat,
+            chat_report=dict(payload.get("chat_report") or {}),
+            scope=str(payload.get("scope") or "sources"),
         )
 
 
@@ -213,6 +249,21 @@ class SearchEngine:
         self.live_cap = max(0, int(live_cap))
         self.budget_s = budget_s
         self.use_cache = use_cache
+        # Same scorer, same blend weights, separate corpus: the conversation
+        # index is in memory and per request, so it cannot share the store.
+        self.conversation = ConversationSearch(
+            self.scorer,
+            shortlist=self.shortlist,
+            prefilter=max(60, min(self.prefilter, 200)),
+            weights=self.weights,
+            gate_margin=self.gate_margin,
+        )
+        # A chat can be longer than the transcript contract; the default window
+        # is the last 200 turns, and the outcome reports that it was windowed.
+        self.chat_window = 200
+        # Folded into every cache key: a tuned constant must not keep answering
+        # from payloads produced under the old one.
+        self.pipeline_key = _pipeline_digest(self)
         self._matrix: MatrixIndex | None = None
         self._matrix_error: str | None = None
         self._matrix_absent = False
@@ -236,17 +287,85 @@ class SearchEngine:
         return self._matrix
 
     # -- search ------------------------------------------------------------
-    def search(self, query: str, *, limit: int = 10, use_live: bool | None = None) -> SearchOutcome:
+    def search(
+        self,
+        query: str,
+        *,
+        limit: int = 10,
+        use_live: bool | None = None,
+        messages: Sequence[object] | None = None,
+        scope: str = "sources",
+        chat_window: int | None = None,
+    ) -> SearchOutcome:
+        """Rank catalogue sources and, when a transcript is sent, its passages.
+
+        ``scope`` is one of ``sources`` (default), ``chat`` or ``both``. Sending
+        messages switches the default to ``both``; a transcript with
+        ``scope="sources"`` is a caller bug that would silently drop half the
+        answer, so it is promoted instead of ignored.
+        """
         query = " ".join(str(query).split())
         if not query:
             raise TrickError("query is empty")
+        scope = str(scope or "sources").lower()
+        if scope not in ("sources", "chat", "both"):
+            raise ContractViolation(f"unknown scope {scope!r}; use sources, chat or both")
+
+        window = self.chat_window if chat_window is None else max(0, int(chat_window))
+        raw = list(messages or [])
+        dropped_turns = 0
+        if window and len(raw) > window:
+            dropped_turns = len(raw) - window
+            raw = raw[-window:]
+        transcript = normalise_messages(raw) if raw else []
+        if transcript and scope == "sources":
+            scope = "both"
+        if not transcript and scope in ("chat", "both"):
+            scope = "sources"
 
         degraded: list[str] = []
         timings: dict[str, float] = {}
         started = time.monotonic()
 
+        chat_rows: list[ChatRow] = []
+        chat_report: dict = {}
+        if transcript:
+            stage = time.monotonic()
+            try:
+                chat_rows, chat_report = self.conversation.search(
+                    query, transcript, limit=max(1, min(int(limit), 8))
+                )
+            except TrickError as exc:
+                degraded.append(exc.s_code)
+                chat_report = {"reason": f"{exc.s_code}: {exc}"}
+            timings["chat_ms"] = (time.monotonic() - stage) * 1000.0
+            if dropped_turns:
+                chat_report["dropped_turns"] = dropped_turns
+            if scope == "chat":
+                return SearchOutcome(
+                    query=query,
+                    rows=[],
+                    degraded=sorted(set(degraded)),
+                    report={
+                        "cached": False,
+                        "elapsed_ms": round((time.monotonic() - started) * 1000.0, 1),
+                        "timings": {k: round(v, 1) for k, v in timings.items()},
+                        "scorer": getattr(self.scorer, "name", "unknown"),
+                    },
+                    chat=chat_rows,
+                    chat_report=chat_report,
+                    scope="chat",
+                )
+
+        # The cache key carries the transcript fingerprint: two different
+        # conversations must never share a cached answer. It also carries the
+        # pipeline version, because a cached payload written by an older release
+        # would replay old ranking behaviour (and old field names) after an
+        # upgrade - a stale answer that looks exactly like a fresh one.
+        cache_extra = f"{self.pipeline_key}:{fingerprint(transcript) if transcript else ''}"
+
         if self.use_cache:
-            cached = self.store.cache_get(query, self.scorer.name)
+            cached = self.store.cache_get(query, self.scorer.name, extra=cache_extra)
             if cached and isinstance(cached.get("rows"), list):
                 rows = [_row_from_cache(i + 1, item) for i, item in enumerate(cached["rows"][:limit])]
                 return SearchOutcome(
@@ -254,6 +373,13 @@ class SearchEngine:
                     rows=rows,
                     degraded=list(cached.get("degraded") or []),
                     report={"cached": True, "elapsed_ms": 0.0},
+                    chat=[
+                        ChatRow.from_dict(i + 1, item)
+                        for i, item in enumerate(cached.get("chat") or [])
+                        if isinstance(item, dict)
+                    ],
+                    chat_report=dict(cached.get("chat_report") or chat_report),
+                    scope=scope,
                 )
 
         # Stage 1: live sources.
@@ -302,6 +428,9 @@ class SearchEngine:
                     "sources": report.as_dict(),
                     "reason": "no candidates",
                 },
+                chat=chat_rows,
+                chat_report=chat_report,
+                scope=scope,
             )
 
         # Stage 4: rescore the union with BM25 restricted to those ids, then cut.
@@ -334,12 +463,23 @@ class SearchEngine:
 
         # Stage 6: blend and order.
         rows = self._blend(ordered_ids, docs, text_scores, cut_scores, probabilities, scored, limit)
+        cache_written = None
         if self.use_cache and rows:
-            self.store.cache_put(
+            cache_written = self.store.cache_put(
                 query,
                 self.scorer.name,
-                {"rows": [row.as_dict() for row in rows], "degraded": sorted(set(degraded))},
+                {
+                    "rows": [row.as_dict() for row in rows],
+                    "degraded": sorted(set(degraded)),
+                    "chat": [row.as_dict() for row in chat_rows],
+                    "chat_report": chat_report,
+                },
+                extra=cache_extra,
             )
+        if cache_written is False:
+            # The ranking is valid; only the memo of it was lost. Say so instead
+            # of failing the request or hiding it (S6/S7).
+            degraded.append("S6")
 
         return SearchOutcome(
             query=query,
@@ -357,6 +497,9 @@ class SearchEngine:
                 "scorer": getattr(self.scorer, "name", "unknown"),
                 "stats": _stats(self.scorer),
             },
+            chat=chat_rows,
+            chat_report=chat_report,
+            scope=scope,
         )
 
     def _shortlist(
@@ -710,6 +853,34 @@ def build_engine(
         local_floor=local_floor,
         live_cap=live_cap,
     )
+
+
+def _pipeline_digest(engine: SearchEngine) -> str:
+    """Short id of everything that changes what a cached payload means.
+
+    Tuning a weight or a threshold and then reading a cached answer produced
+    under the old value is the quietest kind of wrong result: the numbers look
+    freshly computed. Folding the live values into the cache key makes that
+    impossible without anyone remembering to bump a constant.
+    """
+    from . import transcript as _transcript
+
+    parts = (
+        f"cache{CACHE_VERSION}",
+        f"w{engine.weights[0]:.4f}/{engine.weights[1]:.4f}",
+        f"p{engine.prior_weight:.4f}",
+        f"g{engine.gate_margin:.4f}",
+        engine.blend_mode,
+        engine.fusion,
+        f"s{engine.shortlist}",
+        f"lf{engine.local_floor}lc{engine.live_cap}",
+        f"cw{engine.chat_window}",
+        f"nd{_transcript.NEAR_DUP_COSINE}",
+        f"ch{_transcript.MIN_CHARS}-{_transcript.MAX_CHARS}",
+        f"tw{_transcript.DEFAULT_WEIGHTS}",
+        f"tg{_transcript.DEFAULT_GATE}",
+    )
+    return "k" + hashlib.blake2s("|".join(parts).encode("utf-8"), digest_size=8).hexdigest()
 
 
 __all__ = [

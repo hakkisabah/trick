@@ -29,12 +29,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
 
-from .errors import ContractViolation, StorageIO
+from .errors import Contention, ContractViolation, StorageIO
 
 SCHEMA_VERSION = 1
 DEFAULT_CACHE_TTL_S = 7 * 24 * 3600
 MAX_DOCS_TITLE = 400
 MAX_DOCS_SUMMARY = 4000
+# How long a statement waits for the write lock before giving up. The store is
+# shared: the service may be ranking a query while a second process ingests or
+# the terminal UI writes a cache entry. WAL lets readers run regardless; this
+# timeout is what a second *writer* waits instead of failing instantly.
+BUSY_TIMEOUT_MS = 5000
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -144,25 +149,91 @@ class DocumentStore:
         if str(self.path) != ":memory:":
             self.path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            conn = sqlite3.connect(str(self.path), timeout=10.0)
+            conn = sqlite3.connect(str(self.path), timeout=BUSY_TIMEOUT_MS / 1000.0)
             conn.row_factory = sqlite3.Row
-            conn.executescript(SCHEMA)
+            conn.execute(f"PRAGMA busy_timeout={int(BUSY_TIMEOUT_MS)}")
         except sqlite3.DatabaseError as exc:
             raise StorageIO(f"cannot open {self.path}: {exc}") from exc
         self._conn = conn
-        self._set_meta("schema_version", str(SCHEMA_VERSION))
+        # A search must never need the write lock. Only a store that is new (or
+        # written by an older schema) is created or migrated here; an existing
+        # store is opened read-only in practice, which is what lets the CLI and
+        # the service point at the same file at the same time. Before this
+        # check, every open wrote ``schema_version`` and the second process died
+        # with "database is locked" while the first one was ranking.
+        version = self._schema_version()
+        if version is None:
+            self._bootstrap()
+        elif version != SCHEMA_VERSION:
+            conn.close()
+            self._conn = None
+            raise StorageIO(
+                f"store schema {version} is not usable by this build (expected {SCHEMA_VERSION}): "
+                f"remove {self.path} and re-run ingest"
+            )
+        else:
+            self._check_tables()
         if not self._probe_fts():
             # Minimal mode: no FTS5 in this SQLite build. Search still works via
             # LIKE, only slower; the caller is told through ``fts5``.
             self.fts5 = False
-            self._conn.execute("DROP TABLE IF EXISTS docs_fts")
+            if self._writable():
+                self._conn.execute("DROP TABLE IF EXISTS docs_fts")
 
-    def _probe_fts(self) -> bool:
+    def _schema_version(self) -> int | None:
+        """Recorded schema version, or ``None`` when the store has no schema yet."""
         assert self._conn is not None
         try:
-            self._conn.execute(
-                "INSERT INTO docs_fts (docs_fts) VALUES ('integrity-check')"
-            ).fetchall()
+            row = self._conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+        except sqlite3.DatabaseError:
+            return None
+        if row is None:
+            return None
+        try:
+            return int(row["value"])
+        except (TypeError, ValueError):
+            return None
+
+    def _check_tables(self) -> None:
+        """Cheap integrity gate on an existing store: the tables must be there."""
+        assert self._conn is not None
+        try:
+            for table in ("meta", "docs", "decisions"):
+                self._conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchall()
+        except sqlite3.DatabaseError as exc:
+            raise StorageIO(f"{self.path} is not a usable store: {exc}") from exc
+
+    def _writable(self) -> bool:
+        """True when this connection can take the write lock right now."""
+        assert self._conn is not None
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError:
+            return False
+        self._conn.rollback()
+        return True
+
+    def _bootstrap(self) -> None:
+        assert self._conn is not None
+        try:
+            self._conn.executescript(SCHEMA)
+        except sqlite3.DatabaseError as exc:
+            raise StorageIO(f"cannot create {self.path}: {exc}") from exc
+        self._set_meta("schema_version", str(SCHEMA_VERSION))
+
+    def _probe_fts(self) -> bool:
+        """Can this build query the FTS5 table? Read-only on purpose.
+
+        The obvious probe is ``INSERT INTO docs_fts(docs_fts) VALUES
+        ('integrity-check')``, which is a *write*: it takes the write lock, and
+        when another process holds it the probe fails and the store silently
+        downgrades to LIKE matching - a correct answer at many times the cost,
+        with no error to explain it. Counting rows proves the module is there
+        without touching the lock.
+        """
+        assert self._conn is not None
+        try:
+            self._conn.execute("SELECT count(*) FROM docs_fts").fetchall()
         except sqlite3.DatabaseError:
             return False
         return True
@@ -189,11 +260,29 @@ class DocumentStore:
         return self._conn
 
     def _set_meta(self, key: str, value: str) -> None:
-        self.conn.execute(
-            "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (key, value),
-        )
-        self.conn.commit()
+        """Write one meta row, but only when it actually changes.
+
+        Reading first means opening an existing store takes no write lock, which
+        is what allows several processes to share ``trick.db``. A concurrent
+        writer is reported as contention (S7) instead of leaking ``sqlite3``.
+        """
+        row = self.conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        if row is not None and str(row["value"]) == str(value):
+            return
+        try:
+            self.conn.execute(
+                "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, value),
+            )
+            self.conn.commit()
+        except sqlite3.OperationalError as exc:
+            self.conn.rollback()
+            if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+                raise Contention(f"another writer holds {self.path}: {exc}") from exc
+            raise StorageIO(f"cannot write {self.path}: {exc}") from exc
+        except sqlite3.DatabaseError as exc:
+            self.conn.rollback()
+            raise StorageIO(f"cannot write {self.path}: {exc}") from exc
 
     # -- documents ---------------------------------------------------------
     def upsert_many(self, docs: Iterable[dict], *, now: int | None = None) -> int:
@@ -406,7 +495,13 @@ class DocumentStore:
             return None
         return payload if isinstance(payload, dict) else None
 
-    def cache_put(self, query: str, scorer: str, payload: dict, *, extra: str = "", now: int | None = None) -> None:
+    def cache_put(self, query: str, scorer: str, payload: dict, *, extra: str = "", now: int | None = None) -> bool:
+        """Store one decision. Returns False when the cache could not be written.
+
+        The cache is an optimisation: a busy writer or a full disk must not turn
+        a successful ranking into a failed request. The caller records the
+        failure in the report instead.
+        """
         stamp = int(time.time()) if now is None else int(now)
         try:
             with self.conn:
@@ -420,8 +515,9 @@ class DocumentStore:
                         json.dumps(payload, ensure_ascii=False),
                     ),
                 )
-        except sqlite3.DatabaseError as exc:
-            raise StorageIO(f"cannot write decision cache: {exc}") from exc
+        except sqlite3.DatabaseError:
+            return False
+        return True
 
     def prune(self, *, now: int | None = None, keep_days: int = 30) -> int:
         """Drop expired decisions and stale documents; returns rows removed."""

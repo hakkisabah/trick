@@ -68,6 +68,15 @@ def cosine_from_dot(dot: int, qscale: float = QSCALE) -> float:
     return 1.0 if c > 1.0 else (-1.0 if c < -1.0 else c)
 
 
+def sig_cosine(a: bytes, b: bytes) -> float:
+    """Cosine between two stored signatures, as a float in [-1, 1]."""
+    if len(a) != len(b):
+        from .errors import ContractViolation
+
+        raise ContractViolation(f"signatures differ in length: {len(a)} vs {len(b)}")
+    return cosine_from_dot(dot_int8(a, b))
+
+
 def encode_score(value: float) -> int:
     """Encode a 0..1 score as an unsigned 16 bit integer."""
     if value != value:  # NaN

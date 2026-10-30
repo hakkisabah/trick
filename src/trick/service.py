@@ -8,7 +8,7 @@ copied into every plugin. So the core runs once and everything else talks to it:
 
 The unix socket is the transport of record: no port to collide with, no token to
 leak, and the kernel enforces the file permission. The HTTP bridge exists because
-some hosts (Open WebUI, a Gemini extension, anything running in a container) can
+some hosts (Open WebUI, an MCP client, anything running in a container) can
 only speak HTTP. It is not a second implementation - it forwards to the same
 socket - so there is exactly one ranking path in the product.
 
@@ -39,12 +39,20 @@ import stat
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Mapping, Protocol
+from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from .errors import ConfigError, Contention, ContractViolation, StorageIO, TrickError
 from .search import SearchEngine, SearchOutcome
 
-MAX_LINE_BYTES = 64 * 1024
+MAX_LINE_BYTES = 1024 * 1024
+# 1 MiB, not 64 KiB: a request may now carry a window of a long conversation,
+# and a 200-turn transcript of ordinary chat is ~150 KiB. The cap still exists
+# so one client cannot make the service buffer an unbounded line; it is checked
+# before the buffer grows, and the sender is refused with S8 rather than cut.
+MAX_TRANSCRIPT_CHARS = 200_000
+# Characters, not bytes: at worst 4 bytes each in UTF-8, so 200k characters can
+# never overflow the 1 MiB frame above. The pipe budgets 150k, which leaves room
+# for JSON overhead.
 DEFAULT_MAX_CLIENTS = 8
 DEFAULT_CONCURRENCY = 4
 SOCKET_NAME = "trick.sock"
@@ -73,7 +81,15 @@ def error_payload(exc: BaseException) -> dict[str, Any]:
 class Backend(Protocol):
     """What the transports need; the socket client implements this too."""
 
-    def search(self, query: str, *, limit: int = 8, live: bool | None = None) -> SearchOutcome: ...
+    def search(
+        self,
+        query: str,
+        *,
+        limit: int = 8,
+        live: bool | None = None,
+        messages: Sequence[object] | None = None,
+        scope: str = "sources",
+    ) -> SearchOutcome: ...
 
     def health(self) -> dict[str, Any]: ...
 
@@ -159,7 +175,15 @@ class Service:
                 pass
 
     # -- methods -----------------------------------------------------------
-    def search(self, query: str, *, limit: int = 8, live: bool | None = None) -> SearchOutcome:
+    def search(
+        self,
+        query: str,
+        *,
+        limit: int = 8,
+        live: bool | None = None,
+        messages: Sequence[object] | None = None,
+        scope: str = "sources",
+    ) -> SearchOutcome:
         text = " ".join(str(query or "").split())
         if not text:
             raise ContractViolation("query is empty")
@@ -168,9 +192,19 @@ class Service:
         size = int(limit)
         if not 1 <= size <= 26:
             raise ContractViolation(f"limit must be between 1 and 26, got {size}")
+        scope = str(scope or "sources").strip().lower()
+        if scope not in ("sources", "chat", "both"):
+            raise ContractViolation(f"unknown scope {scope!r}; use sources, chat or both")
+        transcript = validate_messages_param(messages)
 
         def job() -> SearchOutcome:
-            return self.engine().search(text, limit=size, use_live=live)
+            return self.engine().search(
+                text,
+                limit=size,
+                use_live=live,
+                messages=transcript,
+                scope=scope,
+            )
 
         return self._submit(job)
 
@@ -194,6 +228,8 @@ class Service:
                 params.get("query", ""),
                 limit=int(params.get("limit", 8)),
                 live=_tri_state(params.get("live")),
+                messages=params.get("messages"),
+                scope=str(params.get("scope") or "sources"),
             )
             return outcome.as_dict()
         if method == "health":
@@ -209,6 +245,48 @@ def _tri_state(value: Any) -> bool | None:
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() not in ("0", "false", "no", "off")
+
+
+def validate_messages_param(value: Any) -> list[dict] | None:
+    """Normalise the ``messages`` argument of a transport call.
+
+    A transcript arriving over a socket or HTTP is untrusted input: it is a list
+    of objects or it is nothing. Returning ``None`` for "absent" and raising for
+    "malformed" keeps the two apart, because an empty result caused by a
+    rejected transcript would read to the user as "your chat does not mention
+    it".
+    """
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)):
+        raise ContractViolation("messages must be a list of {role, content} objects")
+    out: list[dict] = []
+    for position, item in enumerate(value):
+        if isinstance(item, str):
+            out.append({"role": "user", "content": item})
+            continue
+        if not isinstance(item, dict):
+            raise ContractViolation(f"message {position} is not an object")
+        role = item.get("role")
+        content = item.get("content")
+        if role is None and content is None:
+            raise ContractViolation(f"message {position} has neither role nor content")
+        if content is not None and not isinstance(content, (str, list)):
+            raise ContractViolation(f"message {position} has unsupported content type")
+        out.append({"role": str(role or "user"), "content": content if content is not None else ""})
+    total = 0
+    for item in out:
+        content = item["content"]
+        if isinstance(content, list):
+            total += sum(len(part) if isinstance(part, str) else 0 for part in content)
+        else:
+            total += len(content)
+    if total > MAX_TRANSCRIPT_CHARS:
+        raise ContractViolation(
+            f"messages carry {total} characters, limit is {MAX_TRANSCRIPT_CHARS}; "
+            "send the tail of the conversation"
+        )
+    return out
 
 
 def handle_request(service: Service, raw: bytes) -> bytes | None:
@@ -515,8 +593,23 @@ class ServiceClient:
         return dict(message.get("result") or {})
 
     # -- Backend-ish convenience ------------------------------------------
-    def search(self, query: str, *, limit: int = 8, live: bool | None = None) -> SearchOutcome:
-        payload = self.call("search", {"query": query, "limit": limit, "live": live})
+    def search(
+        self,
+        query: str,
+        *,
+        limit: int = 8,
+        live: bool | None = None,
+        messages: Sequence[object] | None = None,
+        scope: str = "sources",
+    ) -> SearchOutcome:
+        params: dict[str, Any] = {"query": query, "limit": limit, "live": live}
+        if messages:
+            if isinstance(messages, (str, bytes)) or not isinstance(messages, (list, tuple)):
+                raise ContractViolation("messages must be a list of {role, content} objects")
+            params["messages"] = list(messages)
+        if scope and scope != "sources":
+            params["scope"] = scope
+        payload = self.call("search", params)
         return SearchOutcome.from_dict(payload)
 
     def health(self) -> dict[str, Any]:

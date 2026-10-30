@@ -433,7 +433,9 @@ def test_bridge_rejects_bad_json_and_big_body(bridge) -> None:
     _instance, port, token, _service = bridge
     status, payload = _post(port, {}, token, raw=b"{oops")
     assert status == 400 and payload["error"]["s_code"] == "S8"
-    status, payload = _post(port, {}, token, raw=b'{"query":"' + b"a" * 40000 + b'"}')
+    # The body cap is 1 MiB now that a request may carry a transcript window;
+    # one byte over it must still be refused before it is read.
+    status, payload = _post(port, {}, token, raw=b'{"query":"' + b"a" * (1024 * 1024) + b'"}')
     assert status == 413
 
 

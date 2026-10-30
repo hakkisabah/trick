@@ -1,9 +1,25 @@
 # Installing and running Trick
 
-This is the only installation path. Every runtime artifact the project creates is
-listed here together with the command that creates it, the command that proves it
-worked, and the command that removes it. Nothing starts on its own: only the
-steps marked `[starts a service]` put a process on the machine.
+This is the only installation path. Every artifact the project creates is listed
+here with the command that creates it, the command that proves it works, and the
+command that removes it. Nothing starts by itself: only steps marked
+`[starts a process]` put something on the machine, and none of them is required
+for the terminal tool to work.
+
+## What Trick answers
+
+Two questions, one pipeline:
+
+* **Where in this long conversation did we say that?** Send the chat (Open WebUI
+  does it automatically; the terminal takes `--transcript FILE`; MCP hosts pass
+  `messages`). You get back the matching passages with their turn number, role and
+  character offsets.
+* **Which package or paper solves this?** You get ranked sources from CRAN,
+  Bioconductor, arXiv, OpenAlex and Crossref.
+
+Both are scored the same way: lexical retrieval narrows the candidates, laya's
+typed decision scoring breaks the ties, and every row says which of the two
+produced its score (`*` = scored by laya, `-` = retrieval only).
 
 ## Paths
 
@@ -20,25 +36,26 @@ steps marked `[starts a service]` put a process on the machine.
 | laya credentials | `$HOME/.config/hermes-secrets/laya.credentials` (mode `0600`) |
 | systemd user unit | `$HOME/.config/systemd/user/trick-bridge.service` |
 
-The package declares no `[project.scripts]` entry point. The only supported
-invocation is `<repo>/.venv/bin/python -m trick <command>`. Invoking the package
-name as a program (`trick` with a subcommand, no `-m`) fails with
-`command not found` on a clean machine; this document never uses that form, and
-`scripts/check.sh` fails the build if a document starts using it again.
+The package declares no `[project.scripts]` entry point, so the only supported
+invocation is `<repo>/.venv/bin/python -m trick <command>`. Writing `trick
+<command>` fails with `command not found` on a clean machine; this document never
+uses that form, and `scripts/check.sh` fails the build if a document starts using
+it again.
 
 ## 0. Prerequisites
 
-Required: Python 3.10 or newer, SQLite with FTS5 (checked by step 2), and a laya
-endpoint with an API key. Optional: `numpy` for the accelerator (`pip install -e
-'.[accel]'`); without it the pure-Python scan gives the same ordering, only
-slower.
+Required: Python 3.10 or newer, and SQLite with FTS5 (step 2 proves it). Required
+for model scoring: a laya endpoint with an API key (step 3). Without one Trick
+runs the offline scorer and labels those results synthetic.
 
-Docker is needed only for the Open WebUI step, and Open WebUI is needed only if
-you want that surface.
+Optional: `numpy` for the matrix accelerator (`pip install -e '.[accel]'`).
+Without it the pure-Python scan returns the same order, only slower.
+
+Docker is needed only for the Open WebUI step. Nothing else needs a container.
 
 ## 1. Create the environment
 
-Not a service; safe to re-run.
+Not a process; safe to re-run.
 
 ```sh
 cd "$HOME/evrim_otonom/trick"
@@ -62,36 +79,35 @@ Remove: `rm -rf .venv`.
 .venv/bin/python -m trick doctor
 ```
 
-Prints one JSON object: store path and document count, FTS5 availability, active
-scorer, shortlist size, blend weights, source quota, matrix state, and credential
-origin. `"key_present": true` means a key was found; the key itself is never
-printed.
-
-Red flags in that output:
+One JSON object: store path and document count, FTS5 availability, active scorer,
+shortlist, blend weights, source quota, matrix state, and where credentials were
+found. The key itself is never printed, only `"key_present": true`.
 
 | Field | Meaning | Fix |
 | --- | --- | --- |
 | `"fts5": false` | this Python's SQLite has no FTS5 | use another interpreter, step 1 |
 | `"scorer": "mock"` | no credentials resolved, results are not laya-scored | step 3 |
-| `"credentials": null` | no credential file and no environment | step 3 |
+| `"credentials": {"error": ...}` | no credential file and no environment | step 3 |
 | `"matrix": null` | optional score matrix absent | nothing; Trick runs without it |
 
 ## 3. Configure the laya endpoint
 
-The client reads credentials from the first source that exists:
+Credentials are read from the first source that exists:
 
 1. environment: `LAYA_BASE_URL`, `LAYA_API_KEY`, optional `LAYA_TIMEOUT_MS`,
    `LAYA_SCORE_PATH`, `LAYA_CHOICE_PATH`
 2. file: `$HOME/.config/hermes-secrets/laya.credentials`, same `KEY=value` lines
 
-The file is preferred on a workstation because it is not in shell history.
+The file is preferred on a workstation because it stays out of shell history. It
+must be mode `600`: a group-readable key file is refused instead of warned about,
+because that file grants spending on a paid endpoint.
 
 ```sh
 install -d -m 700 "$HOME/.config/hermes-secrets"
 install -m 600 /dev/null "$HOME/.config/hermes-secrets/laya.credentials"
 ```
 
-Then write these lines into it, real values, no placeholder left behind:
+Write these lines into it, real values, no placeholder left behind:
 
 ```
 LAYA_BASE_URL=https://your-endpoint
@@ -99,25 +115,33 @@ LAYA_API_KEY=your-key
 LAYA_TIMEOUT_MS=20000
 ```
 
-Verify with one real call (costs one request, prints the score):
+Add `LAYA_SCORE_PATH` and `LAYA_CHOICE_PATH` if your endpoint answers on
+non-default paths; both default to `/v1/systemone`.
+
+Verify with one real call (costs one request):
 
 ```sh
 .venv/bin/python -m trick probe "mixed effects model does not converge"
 ```
 
-Expected: a JSON object with `"ok": true` and a numeric score. `401` means the
-key was rejected; `S1` in the output means the transport failed.
+Expected: `probe: ok in ... ms, usage={...}` followed by three candidate lines
+with probabilities. `401` means the key was rejected; `S5` means the endpoint was
+unreachable.
 
-Remove: delete the file, or `unset LAYA_API_KEY LAYA_BASE_URL`.
+Remove: delete that file, or `unset LAYA_API_KEY LAYA_BASE_URL`.
 
 ## 4. Fill the local catalogue
 
 First run only, or when you want fresher catalogue data. Downloads bulk metadata
-(CRAN ~2 MB, Bioconductor ~6 MB) into the store. Takes about a minute.
+(CRAN ~2 MB, Bioconductor ~6 MB) plus the ranking priors. Takes about three
+minutes, mostly CRAN download counts fetched 120 package names per request.
 
 ```sh
 .venv/bin/python -m trick ingest --source cran,bioc
 ```
+
+Expected last lines: `cran: 25595 documents indexed`, `bioc: 2341 documents
+indexed`, `store now holds ... upserted rows`.
 
 Verify:
 
@@ -125,42 +149,65 @@ Verify:
 .venv/bin/python -m trick doctor
 ```
 
-Expected: `"docs"` is above 25000.
+Expected: `"docs"` above 25000.
 
-Remove: `rm -f "$HOME/.local/share/trick/trick.db"` (also deletes the FTS index;
-re-run this step to rebuild).
+Remove: `rm -f "$HOME/.local/share/trick/trick.db"` (also deletes the FTS index and
+the decision cache; re-run this step to rebuild).
 
 ## 5. Terminal surface
 
-No service, no socket, runs in the foreground:
+No process to start, no socket, runs in the foreground.
 
 ```sh
 .venv/bin/python -m trick tui
 ```
 
-Type a question, press Enter. `/help` lists commands, `/quit` exits, Up/Down walk
-the history file. It uses the core service when one is running and builds the
+Type a question, press Enter. `/help` lists the commands, `/quit` exits, Up/Down
+walk the history file. It uses the core service when one is running and builds the
 engine in-process otherwise, so both paths return the same order.
 
-One-shot, scriptable:
+One shot, scriptable:
 
 ```sh
 .venv/bin/python -m trick query "single cell normalization" --limit 5 --json
 ```
 
+Search inside a saved conversation instead of the catalogues:
+
+```sh
+.venv/bin/python -m trick tui --transcript "$HOME/chat.json"
+.venv/bin/python -m trick query "spatial join" --transcript "$HOME/chat.json"
+```
+
+`chat.json` is any JSON array of `{"role": ..., "content": ...}` objects, oldest
+first; a `{"messages": [...]}` wrapper is accepted too. The answer is a
+`conversation:` block above the source list, one line per passage with its turn
+number, and the header states how many turns were searched and how many the window
+dropped (default: the last 200).
+
+Remove: `rm -f "$HOME/.local/share/trick/history"` (the history file only; the
+binary and the store are untouched).
+
 ## 6. MCP surface
 
-`[starts a service]` once per client session; stdio only, no port, no token.
+`[starts a process]` once per client session; stdio only, no port, no token.
 
 ```sh
 .venv/bin/python -m trick mcp
 ```
 
-It speaks JSON-RPC 2.0 on stdout and writes nothing else there. Tools:
-`trick_search` (required `query`; optional `limit` 1-26, `live` boolean) and
-`trick_health`.
+It speaks JSON-RPC 2.0 on stdout and writes nothing else there; every diagnostic
+goes to stderr.
 
-JSON-RPC probe without a client:
+| Tool | Arguments |
+| --- | --- |
+| `trick_search` | `query` (required), `messages` (the conversation), `scope` (`sources`, `chat`, `both`), `limit` 1-26, `live`, `verbose` |
+| `trick_health` | none |
+
+A tool failure is a result (`isError: true` plus the `S<n>` code), never a dead
+session.
+
+Probe without a client (two JSON lines back, nothing else):
 
 ```sh
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
@@ -168,10 +215,8 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
   | .venv/bin/python -m trick mcp
 ```
 
-Expected: exactly two JSON lines, the second with a `result` object.
-
-Client configuration (Claude Desktop, Codex, any MCP host) — absolute paths,
-because hosts spawn servers with a sanitised `PATH`:
+Client configuration for any MCP host. Absolute paths, because hosts spawn servers
+with a sanitised `PATH`, and a relative command fails with `ENOENT`:
 
 ```json
 {
@@ -185,46 +230,63 @@ because hosts spawn servers with a sanitised `PATH`:
 }
 ```
 
+Remove: delete that block from the host's configuration; nothing was written to
+disk.
+
 ## 7. HTTP bridge
 
-Needed by Open WebUI only. The terminal, MCP and one-shot surfaces do not use it.
+Needed by Open WebUI, which runs in a container and cannot open a unix socket. The
+terminal, one-shot and MCP surfaces do not use it.
 
-`[starts a service]` foreground:
+`[starts a process]` foreground:
 
 ```sh
 .venv/bin/python -m trick serve
 ```
 
-Defaults: unix socket `~/.local/share/trick/run/trick.sock` (0600) plus an HTTP
-listener on `127.0.0.1:8765`, bearer token read from
-`~/.local/share/trick/bridge.token` (created on first start, 0600, 32+ hex).
+Defaults: unix socket `$HOME/.local/share/trick/run/trick.sock` (0600) plus HTTP on
+`127.0.0.1:8765`, bearer token read from
+`$HOME/.local/share/trick/bridge.token` (created on first start, 0600, 64 hex
+characters).
 
-The bind policy is enforced in code, not by convention:
+Bind policy, enforced in code rather than by convention:
 
 * loopback (`127.0.0.1`, `::1`) — allowed, default
-* a single non-loopback address — only with `--expose-network`
-* `0.0.0.0` or `::` — always refused, even with the flag, because the service has
-  no accounts and a wildcard bind plus a leaked token lets anyone spend your laya
+* one specific non-loopback local address — only with `--expose-network`
+* `0.0.0.0` or `::` — always refused, even with the flag: the service has no
+  accounts, so a wildcard bind plus a leaked token lets anyone spend your laya
   credits
 
-Verify:
+Request bodies are capped at 1 MiB and refused before parsing, so one POST cannot
+exhaust the host while a window of a long conversation still fits.
+
+The store is shared safely: the bridge, the terminal surface and a one-shot query
+can point at the same `trick.db` at the same time. Reading never waits for the
+write lock, a writer waits up to 5 s and then reports `S7` instead of failing with
+a bare `database is locked`, and a decision-cache write that cannot happen costs
+the memo, not the ranking.
+
+Verify (this reads your own token file; nothing secret is printed back):
 
 ```sh
 TOKEN=$(cat "$HOME/.local/share/trick/bridge.token")
 curl -s -X POST http://127.0.0.1:8765/v1/search \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-  -d '{"query":"differential expression","limit":3}' | head -c 400
+  -d '{"query":"differential expression","limit":3}'
 ```
 
-Expected: JSON with `"ok": true` and a `results` array. `401` means the token is
-wrong; `000` means nothing is listening.
+Expected: `{"ok": true, "result": {"query": "differential expression", "rows": [...]}}`.
+`401` means the token is wrong; an empty reply means nothing is listening.
+
+Add `"messages": [{"role": "user", "content": "..."}]` and `"scope": "both"` to the
+same body to search a conversation through the bridge.
 
 Stop: Ctrl-C, or `pkill -f 'trick serve'`.
 
 ### 7b. Run the bridge as a systemd user service (optional)
 
-Use this when you want the bridge up after login without a terminal window. It is
-an explicit opt-in; installing the unit does not start anything.
+Use this only if you want the bridge up after login without a terminal window.
+Installing the unit starts nothing.
 
 ```sh
 cd "$HOME/evrim_otonom/trick"
@@ -232,22 +294,18 @@ sh deploy/install-service.sh            # writes the unit, reloads systemd, does
 sh deploy/install-service.sh --start    # writes it, enables it, starts it now
 ```
 
-The script derives `ExecStart` from the repository location, picks the HTTP bind
-address from `docker0` (falls back to loopback when Docker is absent), writes
-`~/.config/systemd/user/trick-bridge.service`, and runs `systemctl --user
-daemon-reload`.
+The script derives `ExecStart` from the repository location, picks the bind address
+from `docker0` when Docker is present (loopback otherwise), writes
+`$HOME/.config/systemd/user/trick-bridge.service` and runs `systemctl --user
+daemon-reload`. It refuses to run without the venv from step 1.
 
 Verify:
 
 ```sh
 systemctl --user status trick-bridge.service --no-pager
-TOKEN=$(cat "$HOME/.local/share/trick/bridge.token")
-curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:8765/v1/search \
-  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-  -d '{"query":"x","limit":1}'
 ```
 
-Expected: `active (running)` and `200`.
+Expected: `active (running)`.
 
 Logs: `journalctl --user -u trick-bridge.service -n 50 --no-pager`.
 
@@ -267,36 +325,33 @@ systemctl --user daemon-reload
 
 ## 8. Open WebUI
 
-Two things must be true first: the bridge is running and reachable from the
-container, and you have an admin session in the Open WebUI web UI. Both routes
-below require that session; there is no way to install a function anonymously,
-and this repository never asks for your Open WebUI password.
+Three things must be true: the bridge is running and reachable from the container,
+you have an **admin** Open WebUI session, and that session has produced an API key.
+Installing a function is admin-only; a key from a normal account gets `401` even
+when the key is valid. This repository never asks for your Open WebUI password.
 
-The UI is at `http://localhost:3000` (the container listens on 8080 internally;
-8080 is not published on the host, so `http://localhost:8080` fails by design).
+The UI listens on `http://localhost:3000`; the container's own port 8080 is not
+published on the host, so `http://localhost:8080` fails by design.
 
 ### 8.1 Bridge address
 
-A container cannot reach the host's `127.0.0.1`. Bind the bridge to the docker
-bridge address instead — reachable from containers, not from the LAN:
+A container cannot reach the host's `127.0.0.1`. Bind the docker bridge address
+instead — reachable from containers, not from the LAN:
 
 ```sh
-ip -4 -o addr show docker0 | awk '{print $4}'   # e.g. 172.17.0.1/16
+ip -4 -o addr show docker0 | awk '{print $4}'    # e.g. 172.17.0.1/16
 .venv/bin/python -m trick serve --http-host 172.17.0.1 --expose-network --http-port 8765
 ```
 
-Inside a container started by the shipped compose file, `host.docker.internal`
-resolves to that same address (`172.17.0.1 host.docker.internal` in `/etc/hosts`),
-so the Pipe can use the hostname and survive an address change.
-
-If Open WebUI runs natively, skip this step and keep the default loopback bind.
+Inside a container that maps `host.docker.internal` to the host, the Pipe can use
+that hostname instead and survive an address change. If Open WebUI runs natively,
+skip this and keep the loopback default.
 
 ### 8.2 Install the function (canonical route)
 
-1. Open `http://localhost:3000` and sign in **as an admin**. The functions API is
-   admin-only; a key from a normal account gets `401` even when the key is valid.
-2. Avatar, bottom left → `Settings` → `Account` → `API Keys` → `Create`.
-   Copy the key once; the UI will not show it again.
+1. Open `http://localhost:3000` and sign in as an admin.
+2. Avatar, bottom left → `Settings` → `Account` → `API Keys` → `Create`. Copy the
+   key; the UI shows it once.
 3. Run the installer in a shell **on the host**, not inside the container:
 
 ```sh
@@ -305,12 +360,7 @@ TRICK_OPENWEBUI_API_KEY=paste-the-key-here \
   .venv/bin/python integrations/openwebui/install.py
 ```
 
-Dry run first if you want to see the target without changing anything:
-
-```sh
-TRICK_OPENWEBUI_API_KEY=paste-the-key-here \
-  .venv/bin/python integrations/openwebui/install.py --dry-run
-```
+Add `--dry-run` to see what would be written without writing it.
 
 The installer creates or updates the function, reads it back, and compares the
 stored byte count with the file, so "it printed OK" is not the only evidence.
@@ -318,19 +368,18 @@ Expected last lines:
 
 ```
 installed and verified: 12345 bytes, enabled=True
-next: paste the contents of /home/YOU/.local/share/trick/bridge.token into the Pipe's TRICK_TOKEN valve
+next: paste the contents of $HOME/.local/share/trick/bridge.token into the Pipe's TRICK_TOKEN valve
 ```
 
-`401` → the key is not from an admin account, repeat step 2 signed in as admin.
-`the stored content differs` → the Open WebUI instance truncated or rewrote the
-content; do not use the Pipe until this matches, reinstall and re-check.
+`401` → the key is not from an admin account. `stored content differs` → the
+instance truncated or rewrote the content; do not use the Pipe until this matches.
 
 ### 8.3 Fallback route (only if the installer cannot be used)
 
-Admin panel → `Admin Settings` → `Functions` → `+` → paste the whole content of
-`integrations/openwebui/trick_pipe.py` → `Save`. This route has no read-back, so
-a truncated paste is indistinguishable from a working install until you chat with
-it; that is why it is second choice.
+`Admin Settings` → `Functions` → `+` → paste the whole content of
+`integrations/openwebui/trick_pipe.py` → `Save`. This route has no read-back, so a
+truncated paste is indistinguishable from a working install until you use it; that
+is why it comes second.
 
 ### 8.4 Valves
 
@@ -339,77 +388,81 @@ it; that is why it is second choice.
 | Valve | Value | Note |
 | --- | --- | --- |
 | `TRICK_URL` | `http://host.docker.internal:8765/v1/search` | Docker default; native Open WebUI uses `http://127.0.0.1:8765/v1/search` |
-| `TRICK_TOKEN` | contents of `~/.local/share/trick/bridge.token` | 32+ hex chars, no quotes |
+| `TRICK_TOKEN` | contents of `$HOME/.local/share/trick/bridge.token` | no quotes |
 | `LIMIT` | `8` | 1-26 |
 | `LIVE` | `true` | `false` = local catalogue only |
-| `TIMEOUT_S` | `25` | raise only for slow networks |
-| `SHOW_SCORES` | `true` | per-row blended score |
+| `TIMEOUT_S` | `25` | raise only on a slow network |
+| `SHOW_SCORES` | `true` | blended score per row |
+| `SEARCH_CHAT` | `true` | also search inside the conversation |
+| `CHAT_TURNS` | `200` | how many recent turns are searched |
+| `CHAT_MAX_CHARS` | `150000` | transcript budget sent to the service |
+| `CHAT_RESULTS` | `3` | how many passages are shown |
 
 Verify end to end: new chat → model `Trick - scored scientific sources` → ask
-`differential expression for RNA-seq counts` → Enter. Expected: a numbered list
-of R/Bioconductor packages, each row `source`/`key`, a blended score, and `*` for
-laya-scored rows, `-` for retrieval-only rows. Answer arrives in about 1-2 s with
-live sources enabled.
+`differential expression for RNA-seq counts` → Enter. Expected: a
+`conversation match` block first when the chat already mentions the subject, then a
+numbered list of R/Bioconductor packages with `source`/`key`, a blended score, `*`
+for laya-scored rows and `-` for retrieval-only rows. Answer arrives in about 1-2 s
+with live sources enabled.
 
 Failure text is intentional and names the fix:
 
 | You see | Cause | Fix |
 | --- | --- | --- |
-| `set TRICK_TOKEN` | empty valve | paste the token |
+| `TRICK_TOKEN` in the message | empty valve | paste the token |
 | `cannot reach ...` / `transport error` | bridge down or wrong URL | start the bridge, check `TRICK_URL` |
 | `401` from the bridge | valve token differs from the file | re-copy the file contents |
-| empty list with `S4`/`S5` | sources answered nothing | check network, `LIVE` |
+| `Nothing matched` with `S4`/`S5` | sources or scorer did not answer | check the network, `LIVE` |
 
-Remove: `Admin Settings` → `Functions` → `Trick` → trash icon. Nothing else on
-the host changes.
+Remove: `Admin Settings` → `Functions` → `Trick` → trash icon. Nothing on the host
+changes.
 
-## 9. Gemini CLI extension
-
-Requires Gemini CLI 0.66 or newer. The extension registers the same MCP server as
-`step 6` and adds `/trick:search` and `/trick:health`.
-
-```sh
-cd "$HOME/evrim_otonom/trick/integrations/gemini-extension"
-gemini extensions link . --consent
-```
-
-Restart Gemini CLI, then:
-
-```
-/trick:search negative binomial differential expression
-```
-
-The manifest deliberately does not use `"command": "trick"`: Gemini CLI spawns MCP
-servers with a sanitised environment, so a `PATH`-dependent command fails with
-`spawn trick ENOENT` (measured on 0.66.0). `trick-mcp.sh` resolves the interpreter
-itself in this order: `$TRICK_PYTHON`, `<repo>/.venv/bin/python`, `python3`,
-`/usr/bin/python3`.
-
-Verify:
-
-```sh
-gemini extensions list
-```
-
-Expected: `trick` listed with two MCP tools. If the server does not start, set the
-extension setting `Trick Python` to an absolute interpreter path.
-
-Remove: `gemini extensions uninstall trick`.
-
-## 10. Everything this project creates, in one table
+## 9. Everything this project creates
 
 | Artifact | Created by | Removed by |
 | --- | --- | --- |
 | `<repo>/.venv` | step 1 | `rm -rf .venv` |
-| `~/.local/share/trick/trick.db` (+`-wal`, `-shm`) | steps 4, usage | `rm -f trick.db*` |
-| `~/.local/share/trick/bridge.token` | step 7 first start | `rm -f bridge.token` |
-| `~/.local/share/trick/run/` socket | step 7 | stop the service, `rm -rf run/` |
-| `~/.local/share/trick/history` | step 5 | `rm -f history` |
-| `~/.local/share/trick/scores.trk` | optional, when a matrix is written | `rm -f scores.trk` |
-| `~/.config/systemd/user/trick-bridge.service` | step 7b | step 7b remove block |
+| `$HOME/.local/share/trick/trick.db` (+`-wal`, `-shm`) | step 4, usage | `rm -f trick.db*` |
+| `$HOME/.local/share/trick/bridge.token` | first `serve` (step 7) | `rm -f bridge.token` |
+| `$HOME/.local/share/trick/run/trick.sock` | step 7 | stop the process, `rm -rf run/` |
+| `$HOME/.local/share/trick/history` | step 5 | `rm -f history` |
+| `$HOME/.local/share/trick/scores.trk` | optional, when a matrix is written | `rm -f scores.trk` |
+| `$HOME/.config/systemd/user/trick-bridge.service` | step 7b | step 7b remove block |
 | Open WebUI function `trick` | step 8 | step 8 remove |
-| Gemini extension `trick` | step 9 | step 9 remove |
 | laya credentials file | step 3 | `rm -f` that file |
 
 No process survives a reboot except the systemd unit from step 7b, and that one
-only exists if you ran it.
+exists only if you installed it.
+
+## 10. When something is degraded
+
+Trick never hides a failure behind a plausible answer. Every degradation has a
+code, and it is the same code on every surface:
+
+| Code | Meaning | What the result looks like |
+| --- | --- | --- |
+| `S1` | score matrix not built yet | signatures skipped, text ranking only |
+| `S2` | score matrix corrupt | emergency catalogue in use, rows flagged synthetic |
+| `S3` | not enough memory for the index | text-only mode |
+| `S4` | one live source did not answer | remaining sources, noted in the output |
+| `S5` | laya did not answer | rows are `-` (retrieval only), never faked |
+| `S6` | storage problem | if the store cannot be read the request fails with the path and reason; if only the decision cache cannot be written the ranking is returned and `S6` is listed as degraded |
+| `S7` | another writer holds the lock | the write waits up to 5 s, then reports `S7`; reads never wait |
+| `S8` | input rejected (bad transcript, oversized body) | the request fails with a reason |
+| `S9` | configuration problem | the request fails with the setting to fix |
+
+Run the repository gate before trusting a checkout:
+
+```sh
+sh scripts/check.sh
+```
+
+Fourteen checks: tests, byte-compile, on-disk layout, ranking constants, no network
+in tests, MCP and bridge surfaces, socket and token permissions, English-only
+repository, no credentials in tracked files, stdout purity, integration surfaces,
+integration secrets, documentation truth (every documented command and path must
+exist), and conversation-search quality against planted needles.
+
+The last one is a floor, not a target: it fails the gate if `recall@3` drops below
+0.9, `MRR@10` below 0.8 or a decoy becomes the top hit more than 20% of the time,
+so a ranking change cannot silently make the tool worse at its primary job.

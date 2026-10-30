@@ -75,8 +75,12 @@ def render_outcome(
     for code in outcome.degraded:
         lines.append(f"degraded {code}: {explain(code)}")
 
+    chat = list(getattr(outcome, "chat", None) or [])
+    if chat:
+        lines.extend(_chat_block(outcome, chat, width=width, verbose=verbose))
+
     if not outcome.rows:
-        lines.append("no results")
+        lines.append("no sources" if chat else "no results")
         return "\n".join(lines)
 
     for row in outcome.rows:
@@ -103,17 +107,62 @@ def render_json(outcome: SearchOutcome) -> str:
     return json.dumps(outcome.as_dict(), indent=2, ensure_ascii=False)
 
 
+def _chat_block(outcome: SearchOutcome, chat: list, *, width: int, verbose: bool) -> list[str]:
+    """Conversation passages, printed above the catalogue rows.
+
+    Kept a separate block on purpose: the two lists come from different corpora,
+    so numbering them as one list would claim a comparison that was never made.
+    """
+    report = getattr(outcome, "chat_report", None) or {}
+    parts = [f"conversation: {len(chat)} passage{'s' if len(chat) != 1 else ''}"]
+    chunks = report.get("chunk_count")
+    turns = report.get("turn_count")
+    if chunks:
+        parts.append(f"of {chunks} chunks")
+    if turns:
+        parts.append(f"{turns} turns")
+    if report.get("dropped_turns"):
+        parts.append(f"windowed: oldest {report['dropped_turns']} turns not searched")
+    lines = ["  ".join(str(p) for p in parts)]
+    for row in chat:
+        marker = "*" if row.scored_by_laya else "-"
+        role = (row.role or "user")[:9]
+        text = row.text if len(row.text) <= width else row.text[: width - 1].rstrip() + "\u2026"
+        lines.append(f"c{row.rank}{marker} {row.final_score:5.3f}  turn {row.turn:<4d}{role:10s} {text}")
+        if verbose:
+            lines.append(
+                "        components"
+                f" retrieval={row.retrieval_score:.4f}"
+                f" laya={'n/a' if row.laya_probability is None else format(row.laya_probability, '.4f')}"
+                f" chars={row.char_start}-{row.char_end}"
+            )
+    return lines
+
+
 def render_compact(outcome: SearchOutcome, *, limit: int = 5) -> str:
     """Few-line form for a UI that has little space, such as a chat message."""
+    chat = list(getattr(outcome, "chat", None) or [])
+    lines: list[str] = []
+    if chat:
+        lines.append(f"{len(chat)} conversation matches for {outcome.query!r}:")
+        for row in chat[:limit]:
+            marker = "*" if row.scored_by_laya else "-"
+            lines.append(f"{row.rank}{marker} turn {row.turn} {row.role}: {row.text}")
     if not outcome.rows:
-        detail = ", ".join(outcome.degraded) if outcome.degraded else "no candidates"
-        return f"No result for {outcome.query!r} ({detail})."
-    lines = [f"{len(outcome.rows)} results for {outcome.query!r}:"]
-    for row in outcome.rows[:limit]:
-        marker = "*" if row.scored_by_laya else "-"
-        lines.append(f"{row.rank}{marker} [{row.source}] {row.title}")
-        if row.url:
-            lines.append(f"   {row.url}")
+        if chat:
+            lines.append(f"no catalogue source matched {outcome.query!r}.")
+        else:
+            detail = ", ".join(outcome.degraded) if outcome.degraded else "no candidates"
+            return f"No result for {outcome.query!r} ({detail})."
+    else:
+        if chat:
+            lines.append("")
+        lines.append(f"{len(outcome.rows)} sources for {outcome.query!r}:")
+        for row in outcome.rows[:limit]:
+            marker = "*" if row.scored_by_laya else "-"
+            lines.append(f"{row.rank}{marker} [{row.source}] {row.title}")
+            if row.url:
+                lines.append(f"   {row.url}")
     if outcome.degraded:
         lines.append("degraded: " + ", ".join(f"{c} ({explain(c)})" for c in outcome.degraded))
     return "\n".join(lines)
