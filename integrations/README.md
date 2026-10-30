@@ -5,7 +5,7 @@ is duplicated, so the terminal, Open WebUI and any MCP host cannot disagree abou
 the same query.
 
 ```
-Open WebUI Pipe   --HTTP bridge-->  core service  -->  retrieval + laya + matrix
+Open WebUI Action --HTTP bridge-->  core service  -->  retrieval + laya + matrix
 MCP host (stdio)  --stdio MCP----->  core service  -->  same engine, same path
 MCP host (stdio)  --stdio MCP----->  in-process engine (when the service is down)
 ```
@@ -16,18 +16,32 @@ contract; this one only explains why the integration looks the way it does.
 
 ## Open WebUI
 
-A Pipe is a model in Open WebUI, which is the right shape here: pick `Trick`, type
-a question, press Enter, get the matching passages of the conversation plus ranked
-sources instead of prose.
+Trick is an Action: a button in the message toolbar. Press it, an input dialog
+opens, type what you are looking for, press Enter, and the result arrives as a card
+under the message. It is deliberately *not* a Pipe. A Pipe is a model, and this tool
+does not answer a turn - it finds a passage. Putting it in the model selector made
+it look like a chat partner and made the query arrive as a chat message instead of
+a search box.
 
-Open WebUI hands `pipe()` the whole chat as a `messages` list. The Pipe windows it
-(the last `CHAT_TURNS` turns, at most `CHAT_MAX_CHARS` characters), sends it as
-`messages` with `scope: "both"`, and prints the conversation block above the source
-list. Dropped turns are counted and shown - "oldest 7 turns not searched" - because
-a silent window looks like "it is not in the chat".
+The card renders through Open WebUI's rich UI embedding: the action returns an
+`HTMLResponse` with `Content-Disposition: inline`, and the host turns that into an
+iframe in the chat. Content is escaped before it is embedded, so a chat message
+containing markup cannot inject anything into the card.
 
-Three facts make this integration what it is, all measured:
+Open WebUI hands `action()` the whole chat as a `messages` list inside `body`. The
+Action windows it (the last `CHAT_TURNS` turns, at most `CHAT_MAX_CHARS`
+characters), sends it as `messages` with `scope: "both"`, and prints the
+conversation block above the source list. Dropped turns are counted and shown -
+"oldest 7 turns not searched" - because a silent window looks like "it is not in
+the chat".
 
+Four facts make this integration what it is, all measured:
+
+- Open WebUI 0.12.4 dispatches an action as `action(**params)`, where `params` is
+  `{"body": ...}` plus only those reserved arguments whose exact names appear in
+  the signature. A signature that also requires `user_message`/`messages` raises
+  `TypeError` before the first line of our code runs. That is why `body` is the
+  only required parameter, and why the gate asserts it.
 - A container cannot reach the host's `127.0.0.1`. The bridge refuses a wildcard
   bind on purpose, so the documented bind is the docker bridge address instead:
   reachable from containers, not from the LAN.
@@ -35,13 +49,15 @@ Three facts make this integration what it is, all measured:
   even when the key itself is valid, which is why the installer checks the listing
   endpoint before it posts anything.
 - The function runs inside the container's Python, which may be a different version
-  than the host's. `tests/test_openwebui_pipe.py` loads the Pipe with only a
+  than the host's. `tests/test_openwebui_transport.py` loads the Action with only a
   two-line `pydantic` stub, so anything the file needs beyond the standard library
   fails in the test before it fails in the container.
 
-The Pipe never returns a blank answer. A wrong tag mentions the valve to fix, a
+The Action never returns a blank answer. A wrong tag mentions the valve to fix, a
 dead service names `TRICK_URL`, and an empty result shows the `S4`/`S5` reasons so
-"no results" cannot be mistaken for "no matches".
+"no results" cannot be mistaken for "no matches". A cancelled dialog searches
+nothing; a dialog that could not open at all (an API call, a closed tab) falls back
+to the last user message rather than failing.
 
 ## MCP
 

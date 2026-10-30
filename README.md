@@ -13,12 +13,17 @@ nowhere except the sources and the scorer you configured.
 ## Status
 
 Phase 5 of 7 is complete. Phase 1-2: storage, catalogues, ranking. Phase 3: the
-core service, the terminal UI, MCP. Phase 4: the per-source quota and the Open
-WebUI Pipe. Phase 5: **conversation scope** - the whole chat is chunked,
-indexed in memory and searched alongside the catalogues, so "where did we say
-that" is answerable from every surface, not just from the catalogue side.
+core service, the terminal UI, MCP. Phase 4: the per-source quota. Phase 5:
+**conversation scope** - the whole chat is chunked, indexed in memory and
+searched alongside the catalogues, so "where did we say that" is answerable from
+every surface, not just from the catalogue side.
 
-322 tests pass and `scripts/check.sh` runs 13 repository checks.
+Phase 6 fixed the Open WebUI surface. It was a Pipe, which Open WebUI lists as a
+model, so the tool looked like a chat partner and its query arrived as a chat
+message. It is now an **Action**: a button in the message toolbar that opens an
+input dialog and returns the hits as a card. The search box is the point.
+
+344 tests pass and `scripts/check.sh` runs 14 repository checks.
 
 Measured on 22 gold queries with the live model and live sources, no re-ranking
 shortcuts (see `scripts/eval_ranking.py`):
@@ -46,7 +51,7 @@ one ranking path:
 .venv/bin/python -m trick serve                   # core service: unix socket + loopback HTTP bridge
 .venv/bin/python -m trick mcp                     # MCP server on stdio, for any MCP host
 .venv/bin/python -m trick query "..." --json      # one shot, scriptable
-integrations/openwebui                            # Open WebUI Pipe (a model that answers with rows)
+integrations/openwebui                            # Open WebUI Action (a button that opens a search box)
 ```
 
 There is no `trick` console script: the package declares no entry point, so the
@@ -55,10 +60,10 @@ and the documentation gate fails the build if a document forgets it. Full
 installation, verification and removal steps for every artifact (venv, store,
 bridge token, systemd unit, Open WebUI function) live in `docs/INSTALL.md`.
 
-The Open WebUI Pipe is a client of the same bridge, not a second implementation.
+The Open WebUI Action is a client of the same bridge, not a second implementation.
 See `integrations/README.md` for the two steps that actually bite: the bridge must
 bind the docker bridge address (a container cannot reach the host's `127.0.0.1`),
-and the Pipe loads inside the container, so its URL valve must name the host.
+and the function runs inside the container, so its URL valve must name the host.
 
 The core service exists so a plugin does not need its own SQLite connection and
 its own copy of the ranking code:
@@ -310,15 +315,15 @@ src/trick/bridge.py       loopback HTTP bridge with bearer auth
 src/trick/mcp.py          MCP server on stdio (JSON-RPC 2.0)
 src/trick/tui.py          terminal session: Enter submits, history, commands
 src/trick/cli.py          query / tui / serve / mcp / ingest / doctor / probe
-tests/                    322 tests: layout, corruption, contention, budget,
+tests/                    344 tests: layout, corruption, contention, budget,
                           adapters, client, pipeline, credentials, protocol,
                           permissions, concurrency, session behaviour, chunks,
-                          transcript ranking, transports, Open WebUI Pipe
+                          transcript ranking, transports, Open WebUI action, action dispatch
 scripts/bench.py          produced numbers (not estimates) for this host
 scripts/eval_ranking.py   22-query ranking harness, three orderings per query
 scripts/eval_quota.py     quota harness over one retrieval per query
 scripts/laya_probe.py     one real call, prints the response shape only
-scripts/check.sh          repository gate (13 checks)
+scripts/check.sh          repository gate (14 checks)
 ```
 
 ## Install and verify

@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
-"""Install or update the Trick Pipe in a running Open WebUI.
+"""Install or update the Trick Action in a running Open WebUI.
 
 Needs an Open WebUI API key with admin rights (Settings -> Account -> API Keys).
 The key is read from the environment, never from an argument, so it does not end
 up in the shell history or in ``ps`` output.
 
     TRICK_OPENWEBUI_API_KEY=... python3 integrations/openwebui/install.py
-    TRICK_OPENWEBUI_API_KEY=... TRICK_OPENWEBUI_URL=http://localhost:3000 \
-        python3 integrations/openwebui/install.py --token-file ~/.local/share/trick/bridge.token
+    TRICK_OPENWEBUI_API_KEY=... python3 integrations/openwebui/install.py --dry-run
 
-The bridge token is only *reported*: the Pipe stores it in its own valve inside
-Open WebUI, and writing it there from here would mean sending a secret through a
-second service for no reason.
+What it does, in order: create or update the function, check that Open WebUI
+stored the exact bytes and derived the right type (an Action, not a Pipe),
+make it global so the button shows on every model, and write the bridge token
+into the function's TRICK_TOKEN valve when the token file exists.
+
+The token is never printed: only its length is reported.
 """
 
 from __future__ import annotations
@@ -25,17 +27,19 @@ import urllib.request
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-PIPE_FILE = HERE / "trick_pipe.py"
+ACTION_FILE = HERE / "trick_action.py"
 FUNCTION_ID = "trick"
 FUNCTION_NAME = "Trick"
+EXPECTED_TYPE = "action"
 
 
-def request(url: str, key: str, payload: dict | None = None) -> tuple[int, dict | str]:
+def request(url: str, key: str, payload: dict | None = None, method: str | None = None) -> tuple[int, dict | str]:
     data = None if payload is None else json.dumps(payload).encode("utf-8")
+    verb = method or ("GET" if payload is None else "POST")
     req = urllib.request.Request(
         url,
         data=data,
-        method="GET" if payload is None else "POST",
+        method=verb,
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
     )
     try:
@@ -61,6 +65,11 @@ def main() -> int:
     parser.add_argument("--url", default=os.environ.get("TRICK_OPENWEBUI_URL", "http://localhost:3000"))
     parser.add_argument("--token-file", default=str(Path.home() / ".local" / "share" / "trick" / "bridge.token"))
     parser.add_argument("--dry-run", action="store_true", help="print what would be sent, change nothing")
+    parser.add_argument(
+        "--no-token",
+        action="store_true",
+        help="do not write the bridge token into the TRICK_TOKEN valve",
+    )
     args = parser.parse_args()
 
     key = os.environ.get("TRICK_OPENWEBUI_API_KEY", "").strip()
@@ -68,13 +77,13 @@ def main() -> int:
         print("set TRICK_OPENWEBUI_API_KEY to an Open WebUI admin API key", file=sys.stderr)
         return 2
 
-    content = PIPE_FILE.read_text(encoding="utf-8")
+    content = ACTION_FILE.read_text(encoding="utf-8")
     payload = {
         "id": FUNCTION_ID,
         "name": FUNCTION_NAME,
         "content": content,
         "meta": {
-            "description": "Scored retrieval over scientific catalogues, ranked by laya.",
+            "description": "Find a passage in a long conversation, and scored sources beside it.",
             "manifest": {},
         },
     }
@@ -82,26 +91,35 @@ def main() -> int:
     base = args.url.rstrip("/")
     status, body = request(f"{base}/api/v1/functions/", key)
     if status == 401:
-        print("the API key was rejected (401); create one under Settings -> Account -> API Keys", file=sys.stderr)
+        print(
+            "the API key was rejected (401); create one under Settings -> Account -> API Keys "
+            "while signed in as an admin",
+            file=sys.stderr,
+        )
         return 1
     if status != 200:
         print(f"listing functions failed: {status} {body}", file=sys.stderr)
         return 1
-    existing = {item.get("id") for item in body} if isinstance(body, list) else set()
-    action = "update" if FUNCTION_ID in existing else "create"
-    print(f"function '{FUNCTION_ID}' {'exists, updating' if action == 'update' else 'is missing, creating'}")
+    listed = body if isinstance(body, list) else []
+    existing = next((item for item in listed if item.get("id") == FUNCTION_ID), None)
+    verb = "update" if existing else "create"
+    if existing:
+        print(f"function '{FUNCTION_ID}' exists as type={existing.get('type')}, updating to {EXPECTED_TYPE}")
+    else:
+        print(f"function '{FUNCTION_ID}' is missing, creating it as type={EXPECTED_TYPE}")
 
     if args.dry_run:
-        print(f"would POST {base}/api/v1/functions/{'id/' + FUNCTION_ID + '/update' if action == 'update' else 'create'}")
+        endpoint = f"/api/v1/functions/id/{FUNCTION_ID}/update" if existing else "/api/v1/functions/create"
+        print(f"would POST {base}{endpoint}")
         print(f"content: {len(content)} bytes")
         return 0
 
-    if action == "update":
+    if existing:
         status, body = request(f"{base}/api/v1/functions/id/{FUNCTION_ID}/update", key, payload)
     else:
         status, body = request(f"{base}/api/v1/functions/create", key, payload)
     if status not in (200, 201):
-        print(f"{action} failed: {status} {body}", file=sys.stderr)
+        print(f"{verb} failed: {status} {body}", file=sys.stderr)
         return 1
 
     status, stored = request(f"{base}/api/v1/functions/id/{FUNCTION_ID}", key)
@@ -111,18 +129,53 @@ def main() -> int:
     stored_content = stored.get("content") or ""
     if len(stored_content) != len(content):
         print(
-            f"installed, but the stored content differs ({len(stored_content)} vs {len(content)} bytes)",
+            f"installed, but the stored content differs ({len(stored_content)} vs {len(content)} bytes); "
+            "re-run the installer before using the button",
+            file=sys.stderr,
+        )
+        return 1
+    if stored.get("type") != EXPECTED_TYPE:
+        print(
+            f"installed, but Open WebUI stored type={stored.get('type')!r} instead of {EXPECTED_TYPE!r}. "
+            f"Delete it under Admin -> Functions and re-run this script.",
             file=sys.stderr,
         )
         return 1
 
+    if not stored.get("is_global"):
+        status, body = request(f"{base}/api/v1/functions/id/{FUNCTION_ID}/toggle/global", key, {})
+        if status not in (200, 201):
+            print(f"could not make the action global: {status} {body}", file=sys.stderr)
+            return 1
+        status, stored = request(f"{base}/api/v1/functions/id/{FUNCTION_ID}", key)
+        if status != 200 or not isinstance(stored, dict) or not stored.get("is_global"):
+            print("the action is installed but not global; enable it in Admin -> Functions", file=sys.stderr)
+
+    print(f"installed and verified: {len(content)} bytes, type={stored.get('type')}, "
+          f"is_global={stored.get('is_global')}, is_active={stored.get('is_active')}")
+
     token_path = Path(args.token_file)
-    print(f"installed and verified: {len(content)} bytes, enabled={stored.get('is_active', 'unknown')}")
-    if token_path.exists():
-        print(f"next: paste the contents of {token_path} into the Pipe's TRICK_TOKEN valve")
+    if not args.no_token and token_path.exists():
+        token = token_path.read_text(encoding="utf-8").strip()
+        if not token:
+            print(f"{token_path} is empty; start 'trick serve' once to create the token", file=sys.stderr)
+            return 1
+        status, body = request(
+            f"{base}/api/v1/functions/id/{FUNCTION_ID}/valves/update", key, {"TRICK_TOKEN": token}
+        )
+        if status not in (200, 201):
+            print(f"could not write the TRICK_TOKEN valve: {status} {body}", file=sys.stderr)
+            return 1
+        status, valves = request(f"{base}/api/v1/functions/id/{FUNCTION_ID}/valves", key)
+        got = (valves or {}).get("TRICK_TOKEN") if isinstance(valves, dict) else None
+        if got != token:
+            print("the TRICK_TOKEN valve did not store the token; paste it by hand", file=sys.stderr)
+            return 1
+        print(f"TRICK_TOKEN valve set from {token_path} ({len(token)} characters, not printed)")
     else:
-        print(f"next: start 'trick serve' once, then paste {token_path} into the TRICK_TOKEN valve")
-    print("the model list should now show 'Trick - scored scientific sources'")
+        print(f"next: paste the contents of {token_path} into the action's TRICK_TOKEN valve")
+
+    print("done: open a chat, press the Trick button under any answer, type what you are looking for")
     return 0
 
 

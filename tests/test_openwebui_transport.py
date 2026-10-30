@@ -1,31 +1,33 @@
-"""The Open WebUI Pipe, tested against a real HTTP server.
+"""The Open WebUI Action against a real HTTP server.
 
-The Pipe runs inside Open WebUI's container, so this test has to fake two things
-and must not fake the third:
+The action runs inside Open WebUI's container, so this test fakes two things and
+must not fake the third:
 
-* ``pydantic`` - the host venv does not have it, and the Pipe only uses it for
+* ``pydantic`` - the host venv does not have it, and the file only uses it for
   ``BaseModel``/``Field``. A two-line stub is honest; a real pydantic would not
   test anything the container does not already guarantee.
-* Open WebUI itself - ``pipe()`` is a plain method with a fixed signature, so
-  calling it directly is the same call the host makes.
+* Open WebUI itself - ``action()`` is called here the way Open WebUI calls it,
+  with ``body`` plus the reserved arguments it names.
 
 What is *not* faked is the transport: a real ``http.server`` on a real port
 answers, and refuses a wrong token like the bridge does. A test with a mocked
-``urlopen`` would pass while the Pipe sent the token in the wrong header.
+``urlopen`` would pass while the action sent the token in the wrong header.
 """
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import json
 import sys
+import threading
 import types
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
 
-PIPE_PATH = Path(__file__).resolve().parents[1] / "integrations" / "openwebui" / "trick_pipe.py"
+ACTION_PATH = Path(__file__).resolve().parents[1] / "integrations" / "openwebui" / "trick_action.py"
 TOKEN = "x" * 40
 
 
@@ -46,9 +48,9 @@ def _install_pydantic_stub() -> None:
 
 
 @pytest.fixture()
-def pipe_module():
+def action_module():
     _install_pydantic_stub()
-    spec = importlib.util.spec_from_file_location("trick_pipe_under_test", PIPE_PATH)
+    spec = importlib.util.spec_from_file_location("trick_action_under_test", ACTION_PATH)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
@@ -120,8 +122,6 @@ class _Server:
 
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.port = self.httpd.server_address[1]
-        import threading
-
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         self.thread.start()
 
@@ -134,83 +134,103 @@ class _Server:
         self.httpd.server_close()
 
 
-def _pipe(module, url: str, token: str = TOKEN, limit: int = 2):
-    pipe = module.Pipe()
-    pipe.valves.TRICK_URL = url
-    pipe.valves.TRICK_TOKEN = token
-    pipe.valves.LIMIT = limit
-    return pipe
+class Dialog:
+    """Stands in for Open WebUI's ``__event_call__`` input dialog."""
+
+    def __init__(self, answer) -> None:
+        self.answer = answer
+        self.calls: list[dict] = []
+
+    async def __call__(self, payload):
+        self.calls.append(payload)
+        return self.answer
 
 
-def test_manifest_fields_open_webui_reads(pipe_module):
-    pipe = pipe_module.Pipe()
-    assert pipe.type == "manifold"
-    assert pipe.id == "trick"
-    assert pipe.name.endswith(": ")
-    assert pipe.pipes()[0]["id"] == "trick-search"
+def _action(module, url: str, token: str = TOKEN, limit: int = 2):
+    action = module.Action()
+    action.valves.TRICK_URL = url
+    action.valves.TRICK_TOKEN = token
+    action.valves.LIMIT = limit
+    return action
 
 
-def test_successful_search_renders_links_ranks_and_labels(pipe_module):
+def _run(action, query, messages=()):
+    body = {"id": "m1", "model": "gpt", "messages": list(messages)}
+    response = asyncio.run(action.action(body, __event_call__=Dialog(query)))
+    html = response.body.decode("utf-8") if isinstance(response.body, bytes) else str(response.body)
+    return html, response
+
+
+def test_manifest_fields_open_webui_reads(action_module):
+    action = action_module.Action()
+    doc = action_module.__doc__ or ""
+    assert "title: Trick" in doc
+    assert "required_open_webui_version:" in doc
+    assert action.icon
+    assert action.valves.priority < 0, "the button should not be buried on the right"
+
+
+def test_successful_search_renders_links_ranks_and_labels(action_module):
     server = _Server(_search_payload())
     try:
-        text = _pipe(pipe_module, server.url).pipe("negative binomial", "trick-search", [], {})
+        html, response = _run(_action(action_module, server.url), "negative binomial")
     finally:
         server.close()
-    assert "Package 0" in text
-    assert "(https://example.test/pkg0)" in text
-    assert "1. " in text
-    assert "CRAN" in text and "Bioconductor" in text
-    assert "0.750" in text
+    assert "Package 0" in html
+    assert "https://example.test/pkg0" in html
+    assert "CRAN" in html and "Bioconductor" in html
+    assert "0.750" in html
+    assert response.headers.get("Content-Disposition") == "inline"
     assert server.seen[0]["auth"] == f"Bearer {TOKEN}"
     assert server.seen[0]["body"] == {"query": "negative binomial", "limit": 2, "live": True}
 
 
-def test_long_summary_is_truncated_not_dumped(pipe_module):
+def test_long_summary_is_truncated_not_dumped(action_module):
     server = _Server(_search_payload(rows=1))
     try:
-        text = _pipe(pipe_module, server.url).pipe("q", "trick-search", [], {})
+        html, _ = _run(_action(action_module, server.url), "q")
     finally:
         server.close()
-    assert "..." in text
-    assert len(text) < 2000
+    assert html.count("A description that is long enough") < 8
+    assert "..." in html
 
 
-def test_wrong_token_tells_the_user_which_valve_to_paste(pipe_module):
+def test_wrong_token_tells_the_user_which_valve_to_paste(action_module):
     server = _Server(_search_payload())
     try:
-        text = _pipe(pipe_module, server.url, token="y" * 40).pipe("q", "trick-search", [], {})
+        html, _ = _run(_action(action_module, server.url, token="y" * 40), "q")
     finally:
         server.close()
-    assert "TRICK_TOKEN" in text
-    assert "bridge.token" in text
+    assert "TRICK_TOKEN" in html
+    assert "bridge.token" in html
 
 
-def test_unreachable_service_explains_the_url_valve(pipe_module):
-    text = _pipe(pipe_module, "http://127.0.0.1:9/v1/search").pipe("q", "trick-search", [], {})
-    assert "Trick could not search" in text
-    assert "TRICK_URL" in text
+def test_unreachable_service_explains_the_url_valve(action_module):
+    html, _ = _run(_action(action_module, "http://127.0.0.1:9/v1/search"), "q")
+    assert "Trick could not search" in html
+    assert "TRICK_URL" in html
 
 
-def test_empty_result_is_an_answer_not_an_error(pipe_module):
-    payload = _search_payload(rows=0, degraded=["S4"])
-    server = _Server(payload)
+def test_empty_result_is_an_answer_not_an_error(action_module):
+    server = _Server(_search_payload(rows=0, degraded=["S4"]))
     try:
-        text = _pipe(pipe_module, server.url).pipe("nothing matches", "trick-search", [], {})
+        html, _ = _run(_action(action_module, server.url), "nothing matches")
     finally:
         server.close()
-    assert "Nothing matched" in text
-    assert "text for S4" in text
+    assert "Nothing matched" in html
+    assert "text for S4" in html
 
 
-def test_empty_message_does_not_call_the_service(pipe_module):
-    pipe = _pipe(pipe_module, "http://127.0.0.1:9/v1/search")
-    assert "needs a question" in pipe.pipe("   ", "trick-search", [], {})
+def test_empty_message_does_not_call_the_service(action_module):
+    action = _action(action_module, "http://127.0.0.1:9/v1/search")
+    html, _ = _run(action, "   ")
+    assert "No question was entered" in html
 
 
-def test_limit_is_clamped_to_the_service_contract(pipe_module):
+def test_limit_is_clamped_to_the_service_contract(action_module):
     server = _Server(_search_payload())
     try:
-        _pipe(pipe_module, server.url, limit=999).pipe("q", "trick-search", [], {})
+        _run(_action(action_module, server.url, limit=999), "q")
     finally:
         server.close()
     assert server.seen[0]["body"]["limit"] == 26
@@ -240,14 +260,14 @@ def _chat_payload(chat: int = 2, rows: int = 1) -> dict:
     return payload
 
 
-def test_the_chat_is_sent_with_the_messages_it_was_given(pipe_module):
+def test_the_chat_is_sent_with_the_messages_it_was_given(action_module):
     server = _Server(_chat_payload())
     messages = [
         {"role": "user", "content": "where did we discuss the spatial join?"},
         {"role": "assistant", "content": [{"type": "text", "text": "turn about the polygon layer"}]},
     ]
     try:
-        text = _pipe(pipe_module, server.url).pipe("spatial join", "trick-search", messages, {})
+        html, _ = _run(_action(action_module, server.url), "spatial join", messages)
     finally:
         server.close()
     body = server.seen[0]["body"]
@@ -258,62 +278,62 @@ def test_the_chat_is_sent_with_the_messages_it_was_given(pipe_module):
     }
     # List-shaped content is flattened, not dropped.
     assert body["messages"][1]["content"] == "turn about the polygon layer"
-    assert "conversation match" in text
-    assert "turn 7" in text
+    assert "Conversation" in html and "2 matches" in html
+    assert "turn 7" in html
 
 
-def test_the_oldest_turns_are_dropped_and_the_reader_is_told(pipe_module):
+def test_the_oldest_turns_are_dropped_and_the_reader_is_told(action_module):
     server = _Server(_chat_payload(chat=1))
-    pipe = _pipe(pipe_module, server.url)
-    pipe.valves.CHAT_TURNS = 3
+    action = _action(action_module, server.url)
+    action.valves.CHAT_TURNS = 3
     messages = [{"role": "user", "content": f"turn {index}"} for index in range(10)]
     try:
-        text = pipe.pipe("q", "trick-search", messages, {})
+        html, _ = _run(action, "q", messages)
     finally:
         server.close()
-    kept, dropped = pipe._transcript(messages)
+    kept, dropped = action._transcript(messages)
     assert [message["content"] for message in kept] == ["turn 7", "turn 8", "turn 9"]
     assert dropped == 7
     assert server.seen[0]["body"]["messages"] == kept
-    assert "1 conversation match" in text
-    assert "oldest 7 turns not searched" in text
+    assert "1 match" in html
+    assert "oldest 7 turns not searched" in html
 
 
-def test_the_character_budget_stops_at_the_newest_turns(pipe_module):
-    pipe = pipe_module.Pipe()
-    pipe.valves.CHAT_MAX_CHARS = 1000
+def test_the_character_budget_stops_at_the_newest_turns(action_module):
+    action = action_module.Action()
+    action.valves.CHAT_MAX_CHARS = 1000
     messages = [{"role": "user", "content": "x" * 400} for _ in range(10)]
-    kept, dropped = pipe._transcript(messages)
+    kept, dropped = action._transcript(messages)
     assert kept and sum(len(item["content"]) for item in kept) <= 1000
     assert dropped == 10 - len(kept)
 
 
-def test_search_chat_off_sends_no_transcript(pipe_module):
+def test_search_chat_off_sends_no_transcript(action_module):
     server = _Server(_chat_payload(chat=0, rows=1))
-    pipe = _pipe(pipe_module, server.url)
-    pipe.valves.SEARCH_CHAT = False
+    action = _action(action_module, server.url)
+    action.valves.SEARCH_CHAT = False
     try:
-        pipe.pipe("q", "trick-search", [{"role": "user", "content": "hello"}], {})
+        _run(action, "q", [{"role": "user", "content": "hello"}])
     finally:
         server.close()
     assert "messages" not in server.seen[0]["body"]
     assert "scope" not in server.seen[0]["body"]
 
 
-def test_a_chat_only_answer_does_not_claim_a_catalogue_miss(pipe_module):
+def test_a_chat_only_answer_does_not_claim_a_catalogue_miss(action_module):
     server = _Server(_chat_payload(chat=1, rows=0))
     try:
-        text = _pipe(pipe_module, server.url).pipe("spatial join", "trick-search", [{"role": "user", "content": "x"}], {})
+        html, _ = _run(_action(action_module, server.url), "spatial join", [{"role": "user", "content": "x"}])
     finally:
         server.close()
-    assert "conversation match" in text
-    assert "No catalogue source matched" in text
+    assert "Conversation" in html
+    assert "Sources (" not in html
 
 
-def test_an_empty_conversation_list_sends_nothing(pipe_module):
+def test_an_empty_conversation_list_sends_nothing(action_module):
     server = _Server(_search_payload(rows=1))
     try:
-        _pipe(pipe_module, server.url).pipe("q", "trick-search", [{"role": "user", "content": "  "}], {})
+        _run(_action(action_module, server.url), "q", [{"role": "user", "content": "  "}])
     finally:
         server.close()
     assert "messages" not in server.seen[0]["body"]

@@ -176,23 +176,56 @@ PYCODE
 
 echo "== 11/$TOTAL integration surfaces"
 "$PY" - <<'PYCODE'
-import json
+import inspect
+import sys
 from pathlib import Path
 
 root = Path(".")
-pipe = (root / "integrations/openwebui/trick_pipe.py").read_text(encoding="utf-8")
+action_file = (root / "integrations/openwebui/trick_action.py").read_text(encoding="utf-8")
 # Open WebUI reads these from the docstring block; a missing one is a silent
 # install failure (the function loads with no title and cannot be found).
 for field in ("title: Trick", "version:", "required_open_webui_version:"):
-    assert field in pipe, f"pipe metadata missing {field!r}"
-assert "class Pipe" in pipe and "def pipes(" in pipe and "def pipe(" in pipe
-assert "0.0.0.0" not in pipe, "the pipe must not point at a wildcard address"
+    assert field in action_file, f"action metadata missing {field!r}"
+assert "class Action" in action_file and "def action(" in action_file
+assert "class Pipe" not in action_file, "an Action must not also be a model"
+assert "0.0.0.0" not in action_file, "the action must not point at a wildcard address"
+
+# The failure that reached a real user: Open WebUI 0.12.4 calls
+# action(**{"body": ...}) plus only the reserved arguments named in the
+# signature, so any other required parameter raises before our code runs.
+import types
+
+try:  # the host venv has no pydantic; the file only uses BaseModel and Field
+    import pydantic  # noqa: F401
+except ImportError:
+    _stub = types.ModuleType("pydantic")
+
+    class _BaseModel:
+        pass
+
+    def _Field(default=None, description="", **_kwargs):
+        return default
+
+    _stub.BaseModel = _BaseModel
+    _stub.Field = _Field
+    sys.modules["pydantic"] = _stub
+
+sys.path.insert(0, "integrations/openwebui")
+import trick_action  # noqa: E402
+
+sig = inspect.signature(trick_action.Action.action)
+required = [
+    name
+    for name, param in sig.parameters.items()
+    if name != "self" and param.default is inspect.Parameter.empty
+]
+assert required == ["body"], f"action requires more than body: {required}"
+assert "return _HTMLResponse" in action_file, "the result must render as a rich UI card"
 
 # The conversation scope is the product's first requirement, and it travels as
 # one argument through four surfaces. A surface that forgets it does not fail:
 # it silently answers with catalogue rows, which reads as "your chat does not
 # mention it". So every hop is asserted here.
-import sys
 sys.path.insert(0, "src")
 from trick.mcp import TOOLS
 from trick.service import MAX_LINE_BYTES, MAX_TRANSCRIPT_CHARS, validate_messages_param
@@ -217,15 +250,18 @@ for bad in ("a string", 42, {"role": "user"}):
     else:
         raise AssertionError(f"messages accepted {bad!r}")
 
-assert 'payload["scope"] = "both"' in pipe, "the pipe must ask for both scopes when it sends a chat"
-assert "_chat_lines" in pipe and "CHAT_TURNS" in pipe, "the pipe must render and window the chat"
-assert "conversation match" in pipe, "the pipe must show where in the chat it matched"
+assert 'payload["scope"] = "both"' in action_file, "the action must ask for both scopes when it sends a chat"
+assert "_chat_block" in action_file and "CHAT_TURNS" in action_file, "the card must render and window the chat"
+assert "Conversation" in action_file, "the card must show where in the chat it matched"
 
-# The installer must never accept the key as an argument (shell history, ps).
+# The installer must never accept the key as an argument (shell history, ps),
+# and it must refuse an install that Open WebUI stored as the wrong type.
 installer = (root / "integrations/openwebui/install.py").read_text(encoding="utf-8")
 assert "TRICK_OPENWEBUI_API_KEY" in installer
 assert "--api-key" not in installer, "the API key belongs in the environment, not in argv"
-print("integrations ok: pipe metadata, MCP schema, transcript contract, installer")
+assert 'EXPECTED_TYPE = "action"' in installer, "the installer must verify the derived type"
+assert "toggle/global" in installer, "an action that is not global never shows a button"
+print("integrations ok: action metadata, body-only signature, MCP schema, installer")
 PYCODE
 
 echo "== 12/$TOTAL no secrets in the integration files"

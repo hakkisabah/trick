@@ -325,6 +325,11 @@ systemctl --user daemon-reload
 
 ## 8. Open WebUI
 
+Trick is an **Action**: a button in the message toolbar. Press it, an input dialog
+opens, type what you are looking for, press Enter, the passage appears as a card
+under the message. It is not a model, so it never appears in the model selector
+and never answers a chat turn.
+
 Three things must be true: the bridge is running and reachable from the container,
 you have an **admin** Open WebUI session, and that session has produced an API key.
 Installing a function is admin-only; a key from a normal account gets `401` even
@@ -343,7 +348,7 @@ ip -4 -o addr show docker0 | awk '{print $4}'    # e.g. 172.17.0.1/16
 .venv/bin/python -m trick serve --http-host 172.17.0.1 --expose-network --http-port 8765
 ```
 
-Inside a container that maps `host.docker.internal` to the host, the Pipe can use
+Inside a container that maps `host.docker.internal` to the host, the Action can use
 that hostname instead and survive an address change. If Open WebUI runs natively,
 skip this and keep the loopback default.
 
@@ -362,24 +367,30 @@ TRICK_OPENWEBUI_API_KEY=paste-the-key-here \
 
 Add `--dry-run` to see what would be written without writing it.
 
-The installer creates or updates the function, reads it back, and compares the
-stored byte count with the file, so "it printed OK" is not the only evidence.
-Expected last lines:
+The installer does five things and checks each one: creates or updates the
+function, reads it back and compares the stored byte count with the file, asserts
+Open WebUI derived `type=action` (a Pipe would show up as a model), switches the
+global toggle on so the button appears on every model, and writes the bridge token
+into the `TRICK_TOKEN` valve. The token is never printed. Expected last lines:
 
 ```
-installed and verified: 12345 bytes, enabled=True
-next: paste the contents of $HOME/.local/share/trick/bridge.token into the Pipe's TRICK_TOKEN valve
+installed and verified: 16384 bytes, type=action, is_global=True, is_active=True
+TRICK_TOKEN valve set from $HOME/.local/share/trick/bridge.token (43 characters, not printed)
+done: open a chat, press the Trick button under any answer, type what you are looking for
 ```
 
 `401` → the key is not from an admin account. `stored content differs` → the
-instance truncated or rewrote the content; do not use the Pipe until this matches.
+instance truncated or rewrote the content; do not use the button until this
+matches. `stored type='pipe'` → an old install is still in the database; delete it
+under `Admin Settings` → `Functions` and re-run the installer.
 
 ### 8.3 Fallback route (only if the installer cannot be used)
 
 `Admin Settings` → `Functions` → `+` → paste the whole content of
-`integrations/openwebui/trick_pipe.py` → `Save`. This route has no read-back, so a
-truncated paste is indistinguishable from a working install until you use it; that
-is why it comes second.
+`integrations/openwebui/trick_action.py` → `Save`, then enable the global toggle
+and paste the token into the `TRICK_TOKEN` valve by hand. This route has no
+read-back, so a truncated paste is indistinguishable from a working install until
+you press the button; that is why it comes second.
 
 ### 8.4 Valves
 
@@ -388,7 +399,7 @@ is why it comes second.
 | Valve | Value | Note |
 | --- | --- | --- |
 | `TRICK_URL` | `http://host.docker.internal:8765/v1/search` | Docker default; native Open WebUI uses `http://127.0.0.1:8765/v1/search` |
-| `TRICK_TOKEN` | contents of `$HOME/.local/share/trick/bridge.token` | no quotes |
+| `TRICK_TOKEN` | contents of `$HOME/.local/share/trick/bridge.token` | written by the installer; no quotes |
 | `LIMIT` | `8` | 1-26 |
 | `LIVE` | `true` | `false` = local catalogue only |
 | `TIMEOUT_S` | `25` | raise only on a slow network |
@@ -397,22 +408,25 @@ is why it comes second.
 | `CHAT_TURNS` | `200` | how many recent turns are searched |
 | `CHAT_MAX_CHARS` | `150000` | transcript budget sent to the service |
 | `CHAT_RESULTS` | `3` | how many passages are shown |
+| `priority` | `-5` | button order in the toolbar; lower is further left |
 
-Verify end to end: new chat → model `Trick - scored scientific sources` → ask
-`differential expression for RNA-seq counts` → Enter. Expected: a
-`conversation match` block first when the chat already mentions the subject, then a
-numbered list of R/Bioconductor packages with `source`/`key`, a blended score, `*`
-for laya-scored rows and `-` for retrieval-only rows. Answer arrives in about 1-2 s
-with live sources enabled.
+Verify end to end: open a chat that has a few turns, press the Trick button (the
+magnifier) under any answer, type `differential expression for RNA-seq counts`,
+press Enter. Expected: a card in about 1-2 s with a `Conversation` block (turn
+number, role, quoted passage) when the chat mentions the subject, then a `Sources`
+block with R/Bioconductor packages, `source`/`key`, a blended score, `*` for
+laya-scored rows and `-` for retrieval-only rows. Closing the dialog without typing
+searches nothing.
 
 Failure text is intentional and names the fix:
 
 | You see | Cause | Fix |
 | --- | --- | --- |
-| `TRICK_TOKEN` in the message | empty valve | paste the token |
+| `TRICK_TOKEN` in the card | empty or stale valve | re-run the installer |
 | `cannot reach ...` / `transport error` | bridge down or wrong URL | start the bridge, check `TRICK_URL` |
-| `401` from the bridge | valve token differs from the file | re-copy the file contents |
+| `401` from the bridge | valve token differs from the file | re-run the installer |
 | `Nothing matched` with `S4`/`S5` | sources or scorer did not answer | check the network, `LIVE` |
+| no button in the toolbar | function not global, or not active | `Admin Settings` → `Functions` → global toggle |
 
 Remove: `Admin Settings` → `Functions` → `Trick` → trash icon. Nothing on the host
 changes.
