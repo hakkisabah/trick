@@ -416,19 +416,23 @@ magnifier) under any answer, type `differential expression for RNA-seq counts`,
 press Enter. Expected: a card in about 1-2 s with a `Conversation` block (turn
 number, role, quoted passage). Clicking a passage scrolls the chat to the message
 it came from and flashes it; if the browser blocks that (a hardened iframe
-sandbox), the same click opens the full passage inside the card instead, and the
-row says which of the two happened. Pressing Enter or Space on a focused row does
-the same as clicking. With the default `SOURCES=never` the catalogues stay out of
-the way and the card only says in one line that `N catalogue sources matched
-outside this conversation and are hidden`; set the valve to `auto` to list them
-when the chat had no match, or `always` to list them beside every hit. When the
-conversation has no match, the card says so. Listed sources carry `source`/`key`,
-a blended score, `*` for laya-scored rows and `-` for retrieval-only rows. The
-footnote states the blend the score came from (the weights are shipped with the
-answer, so the text cannot drift), and that the number orders this list only - it
-is not a confidence and not comparable between queries. The card closes from the
-`x` in its header or on Escape, and reopens from the same line - it needs no
-script to do that. Closing the input dialog without typing searches nothing.
+sandbox), or the message is not currently rendered because the chat is very long,
+the same click opens the full passage inside the card instead, and the row says
+which of the two happened. The card looks for `message-<thread>-<id>`, then
+`message-<id>`, then any `message-*` element whose id ends with the message id -
+Open WebUI uses both forms depending on the view. Pressing Enter or Space on a
+focused row does the same as clicking. With the default `SOURCES=never` the
+catalogues stay out of the way and the card only says in one line that `N
+catalogue sources matched outside this conversation and are hidden`; set the
+valve to `auto` to list them when the chat had no match, or `always` to list them
+beside every hit. When the conversation has no match, the card says so. Listed
+sources carry `source`/`key`, a blended score, `*` for laya-scored rows and `-`
+for retrieval-only rows. The footnote states the blend the score came from (the
+weights are shipped with the answer, so the text cannot drift), and that the
+number orders this list only - it is not a confidence and not comparable between
+queries. The card closes from the `x` in its header or on Escape, and reopens
+from the same line - it needs no script to do that. Closing the input dialog
+without typing searches nothing.
 
 The catalogue itself is not gone: `python -m trick query` and the MCP
 `trick_search` tool still search CRAN, Bioconductor, arXiv and the live sources,
