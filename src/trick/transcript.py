@@ -105,6 +105,11 @@ class ChatRow:
     scored_by_laya: bool
     from_cache: bool = False
     mid: str = ""
+    # Which query terms actually occur in this passage. A find result that does
+    # not say why it matched reads like a wrong answer ("I asked where the
+    # problem was and got a turn that only mentions i5"), so every row carries
+    # the terms it shares with the query.
+    matched: tuple[str, ...] = ()
 
     @property
     def score_label(self) -> str:
@@ -125,6 +130,7 @@ class ChatRow:
             "scored_by_laya": self.scored_by_laya,
             "from_cache": self.from_cache,
             "message_id": self.mid,
+            "matched": list(self.matched),
         }
 
     @classmethod
@@ -142,6 +148,7 @@ class ChatRow:
             scored_by_laya=bool(item.get("scored_by_laya")),
             from_cache=bool(item.get("from_cache")),
             mid=str(item.get("message_id") or ""),
+            matched=tuple(str(term) for term in (item.get("matched") or ())),
         )
 
 
@@ -546,6 +553,7 @@ class ConversationSearch:
         laya_ms = (time.monotonic() - stage) * 1000.0
 
         model_weight, retrieval_weight = self.weights
+        terms = _terms(query)
         rows: list[ChatRow] = []
         blended: list[tuple[float, ChatRow, Chunk]] = []
         for cid in ordered:
@@ -570,6 +578,7 @@ class ConversationSearch:
                         final_score=final,
                         scored_by_laya=scored,
                         mid=chunk.mid,
+                        matched=tuple(term for term in terms if term in chunk.text.lower())[:6],
                     ),
                     chunk,
                 )
@@ -616,6 +625,7 @@ class ConversationSearch:
                     final_score=row.final_score,
                     scored_by_laya=row.scored_by_laya,
                     mid=row.mid,
+                    matched=row.matched,
                 )
             )
             if len(rows) >= max(1, int(limit)):

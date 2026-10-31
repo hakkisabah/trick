@@ -57,7 +57,7 @@ DEFAULT_SHORTLIST = 12
 # folded into the key automatically (see ``_pipeline_digest``), so tuning one of
 # them already invalidates the cache; this number is for algorithm changes that
 # keep the constants identical.
-CACHE_VERSION = 6
+CACHE_VERSION = 7
 DEFAULT_PREFILTER = 200
 # Model vs retrieval weight. Was 0.3/0.7 in phase 2; a sweep with the live model
 # over both gold sets moved it to 0.2/0.8 (canonical nDCG@10 0.797 -> 0.803,

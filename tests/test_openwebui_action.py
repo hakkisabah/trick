@@ -64,6 +64,7 @@ RESULT = {
                 "text": "we settled on 0.15",
                 "scored_by_laya": False,
                 "message_id": "a-2",
+                "matched": ["settled", "0.15"],
             }
         ],
         "degraded": [],
@@ -488,3 +489,79 @@ def test_card_offers_a_way_to_close_itself(monkeypatch):
     assert "<summary>" in card and "aria-label='Close'" in card
     assert "event.key === 'Escape'" in card
     assert card.index("<summary>") < card.index("id='trick-body'")
+
+
+def test_the_action_installs_the_scroll_listener_in_the_page(monkeypatch):
+    """The card lives in an iframe without allow-same-origin (the 0.12.4
+    default), so it cannot scroll the chat itself. The only code that can is one
+    the action installs in the page through event_call type 'execute'; without
+    it a click did nothing at all, which is what a reader reported."""
+    module = load_module()
+    monkeypatch.setattr(module.Action, "_post", lambda self, p: RESULT)
+    recorder = Recorder("the taper")
+
+    async def scenario():
+        response = await dispatch_like_open_webui(
+            module, {"id": "m1", "chat_id": "c0ffee"}, __event_call__=recorder
+        )
+        # The installation is fire-and-forget; give its task one turn of the loop.
+        for _ in range(3):
+            await asyncio.sleep(0)
+        return response
+
+    asyncio.run(scenario())
+
+    kinds = [call.get("type") for call in recorder.calls]
+    assert kinds[:2] == ["input", "execute"], kinds
+    code = recorder.calls[1]["data"]["code"]
+    # The listener owns the lookup and answers every request, including a miss.
+    assert "trick-card" in code and "trick-host" in code
+    assert "scrollIntoView" in code
+    assert "message-" in code
+    assert "__trickJumpInstalled" in code
+
+
+def test_a_silent_page_does_not_hold_up_the_result(monkeypatch):
+    """A client that never acknowledges 'execute' must not delay the card: the
+    installation is bounded and its answer is discarded."""
+    module = load_module()
+    monkeypatch.setattr(module.Action, "_post", lambda self, p: RESULT)
+
+    class Silent(Recorder):
+        async def __call__(self, payload):
+            self.calls.append(payload)
+            if payload.get("type") == "execute":
+                await asyncio.sleep(30)
+            return self.answer
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        await dispatch_like_open_webui(module, {"id": "m1"}, __event_call__=Silent("q"))
+        return loop.time() - started
+
+    assert asyncio.run(scenario()) < 3.0
+
+
+def test_the_card_no_longer_assumes_a_shared_origin(monkeypatch):
+    """The old comment claimed the sandbox keeps the page origin. It does not,
+    so the direct path must be an optimisation, never the only path."""
+    module = load_module()
+    monkeypatch.setattr(module.Action, "_post", lambda self, p: RESULT)
+    body = {
+        "id": "m1",
+        "chat_id": "c0ffee",
+        "messages": [
+            {"id": "u-1", "role": "user", "content": "differential expression"},
+            {"id": "a-2", "role": "assistant", "content": "we settled on 0.15"},
+        ],
+    }
+
+    card = html_of(asyncio.run(dispatch_like_open_webui(module, body)))
+
+    assert "jump-status" in card
+    assert "data-mid='a-2'" in card
+    assert "postMessage" in card
+    assert "is on by default" not in card
+    # A row says why it is in the list.
+    assert "matched: settled, 0.15" in card

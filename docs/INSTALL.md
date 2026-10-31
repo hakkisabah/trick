@@ -414,14 +414,32 @@ you press the button; that is why it comes second.
 Verify end to end: open a chat that has a few turns, press the Trick button (the
 magnifier) under any answer, type `differential expression for RNA-seq counts`,
 press Enter. Expected: a card in about 1-2 s with a `Conversation` block (turn
-number, role, quoted passage). Clicking a passage scrolls the chat to the message
-it came from and flashes it; if the browser blocks that (a hardened iframe
-sandbox), or the message is not currently rendered because the chat is very long,
-the same click opens the full passage inside the card instead, and the row says
-which of the two happened. The card looks for `message-<thread>-<id>`, then
-`message-<id>`, then any `message-*` element whose id ends with the message id -
-Open WebUI uses both forms depending on the view. Pressing Enter or Space on a
-focused row does the same as clicking. With the default `SOURCES=never` the
+number, role, quoted passage, and `matched: ...` naming the query words that
+passage actually contains - a hit that shares only one rare word with the
+question says so instead of looking random). Clicking a passage scrolls the chat
+to the message it came from and flashes it.
+
+How the jump works, because it decides what you can expect: Open WebUI renders
+this card in an iframe whose sandbox is `allow-scripts allow-downloads`. The
+sandbox flag `iframeSandboxAllowSameOrigin` defaults to **false** in 0.12.4, so
+the card cannot read the chat document - `window.parent.document` throws - and
+code written against a shared origin does nothing when a row is clicked. The
+card therefore asks the page: it posts `{source:'trick-card', mid, cid}` to its
+parent, and a listener that the action puts into the page through
+`__event_call__` type `execute` finds `message-<thread>-<id>` (then
+`message-<id>`, then any `message-*` id ending with the message id), scrolls,
+flashes, and replies. **No user or admin setting has to be changed for this.**
+If the message is not rendered at all (a long chat renders only nearby turns) or
+nothing answers within about a second, the click opens the full passage inside
+the card instead, and the row says which of the two happened - so a click never
+does nothing.
+
+That listener is installed once per browser tab and reused by later cards; it
+only reacts to messages whose `source` is `trick-card`, and its only effect is a
+scroll plus a highlight. If you run a hardened instance that refuses `execute`
+calls, the jump degrades to "open the passage in the card", which is the
+behaviour of every row by default. Pressing Enter or Space on a focused row does
+the same as clicking. With the default `SOURCES=never` the
 catalogues stay out of the way and the card only says in one line that `N
 catalogue sources matched outside this conversation and are hidden`; set the
 valve to `auto` to list them when the chat had no match, or `always` to list them

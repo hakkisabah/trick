@@ -546,3 +546,46 @@ def test_a_hash_only_candidate_is_not_a_match(monkeypatch) -> None:
     # The same forced signature, with one real term, still contributes.
     hits = index.candidates("dispersion")
     assert hits, "lexical hits must survive the gate"
+
+
+def test_every_row_says_which_query_terms_it_contains() -> None:
+    """A hit that shares one rare word with the question read as random, so a
+    row now carries the terms it actually contains. The list is meant to explain
+    a weak match, not to flatter it: one shared term is reported as one."""
+    search = ConversationSearch(ScriptedScorer(), gate_margin=0.0)
+    rows, _report = search.search("spatial join reproject layers", long_chat(), limit=5)
+    assert rows
+    whole_chat = " ".join(str(item.content).lower() for item in long_chat())
+    for row in rows:
+        assert row.matched, "a row without matched terms cannot explain itself"
+        for term in row.matched:
+            assert term in whole_chat, term
+    # The reported terms are a subset of what the query asked for.
+    assert set(rows[0].matched) <= {"spatial", "join", "reproject", "layers"}
+
+
+def test_matched_terms_survive_the_wire_format() -> None:
+    """The action renders what the bridge sent, so the field has to round-trip
+    through as_dict/from_dict; a field added to the dataclass alone is invisible
+    over HTTP and was the shape of an earlier bug."""
+    row = ChatRow(
+        rank=1,
+        turn=3,
+        role="assistant",
+        text="the threshold was 0.15",
+        char_start=0,
+        char_end=25,
+        retrieval_score=1.0,
+        laya_probability=None,
+        final_score=1.0,
+        scored_by_laya=False,
+        mid="a-2",
+        matched=("threshold", "0.15"),
+    )
+    payload = row.as_dict()
+    assert payload["matched"] == ["threshold", "0.15"]
+    restored = ChatRow.from_dict(1, payload)
+    assert restored.matched == ("threshold", "0.15")
+    # An answer from an older bridge has no such field and must not break.
+    payload.pop("matched")
+    assert ChatRow.from_dict(1, payload).matched == ()

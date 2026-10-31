@@ -1,15 +1,23 @@
-"""Prove the card's jump script against a stub DOM, without a browser.
+"""Prove the card's jump against two stub windows, without a browser.
 
-The card is rendered by Open WebUI inside a sandboxed iframe, so the click path
-cannot be exercised with the tools available here (no browser on this host).
-What can be checked is the script's own logic: given an element with the id the
-chat uses, does it scroll that element; and when the parent document is
-unreachable, does it fall back to opening the passage instead of doing nothing.
+The card is rendered by Open WebUI inside an iframe that does not share the
+page's origin (``iframeSandboxAllowSameOrigin`` defaults to false in 0.12.4), so
+``window.parent.document`` throws there. The jump therefore crosses a
+postMessage bridge: the card asks, a listener installed in the chat page (through
+``__event_call__`` type 'execute') scrolls and answers.
+
+This harness runs both scripts in separate contexts and wires the two windows
+together, which is the part a unit test of either script alone cannot see:
+a request with no reply, a reply for the wrong message id, and a reply that
+arrives after the card already fell back.
+
+Skipped when node is absent (the gate reports the skip instead of passing).
 """
 
 import json
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
 
@@ -18,12 +26,23 @@ ACTION = pathlib.Path(__file__).resolve().parents[1] / "integrations" / "openweb
 HARNESS = r"""
 const vm = require('vm');
 
+function clone(value) { return JSON.parse(JSON.stringify(value)); }
+
+function makeEmitter() {
+  const map = {};
+  return {
+    addEventListener: function (name, fn) { (map[name] = map[name] || []).push(fn); },
+    removeEventListener: function (name, fn) { map[name] = (map[name] || []).filter(function (f) { return f !== fn; }); },
+    dispatch: function (name, event) { (map[name] || []).slice().forEach(function (f) { f(event); }); },
+    count: function (name) { return (map[name] || []).length; }
+  };
+}
+
 function makeEl(tag, attrs) {
   const element = {
     tagName: tag,
     id: (attrs && attrs.id) || '',
     listeners: {},
-    children: [],
     scrolled: false,
     scrolledBlock: null,
     animated: false,
@@ -35,8 +54,8 @@ function makeEl(tag, attrs) {
     animate: function () { this.animated = true; },
     closest: function () { return null; },
     querySelector: function (selector) {
-      if (selector === '.jump-status') { return this.status; }
-      if (selector === 'details.full') { return this.full; }
+      if (selector === '.jump-status') { return this.status || null; }
+      if (selector === 'details.full') { return this.full || null; }
       return null;
     }
   };
@@ -44,90 +63,143 @@ function makeEl(tag, attrs) {
 }
 
 function run(scenario) {
+  const timers = [];
   const card = makeEl('details', { id: 'trick-card' });
   card.open = true;
-
   const status = makeEl('div', {});
   const full = makeEl('details', {});
   const row = makeEl('li', { class: 'hit', 'data-mid': scenario.mid, 'data-cid': scenario.cid });
   row.status = status;
   row.full = full;
 
-  const chatMessage = makeEl('div', { id: scenario.domId });
+  const message = makeEl('div', { id: scenario.domId || 'message-none' });
 
-  const listeners = {};
-  const document = {
+  // --- chat page side ---------------------------------------------------
+  const hostEvents = makeEmitter();
+  const hostDocument = {
+    getElementById: function (id) { return id === message.id ? message : null; },
+    querySelectorAll: function (selector) { return selector === '[id^="message-"]' ? [message] : []; }
+  };
+  const hostWindow = {
+    addEventListener: hostEvents.addEventListener,
+    removeEventListener: hostEvents.removeEventListener,
+    dispatch: hostEvents.dispatch
+  };
+  const hostSandbox = { window: hostWindow, document: hostDocument, console: console };
+  hostSandbox.globalThis = hostSandbox;
+  vm.createContext(hostSandbox);
+  const hostResult = vm.runInContext(scenario.host, hostSandbox);
+
+  // --- card side --------------------------------------------------------
+  const cardEvents = makeEmitter();
+  const cardDocument = {
     getElementById: function (id) { return id === 'trick-card' ? card : null; },
-    querySelectorAll: function (selector) {
-      if (selector === 'li.hit') { return [row]; }
-      if (selector === '[id^="message-"]') { return []; }
-      return [];
-    },
-    addEventListener: function (name, fn) { (listeners[name] = listeners[name] || []).push(fn); },
+    querySelectorAll: function (selector) { return selector === 'li.hit' ? [row] : []; },
+    addEventListener: function () {},
     body: { scrollHeight: 100 }
   };
-
-  const parentDocument = {
-    getElementById: function (id) { return id === scenario.domId ? chatMessage : null; },
-    querySelectorAll: function () { return []; }
+  const cardWindow = {
+    addEventListener: cardEvents.addEventListener,
+    removeEventListener: cardEvents.removeEventListener,
+    dispatch: cardEvents.dispatch
   };
-
-  const parentObject = scenario.blocked
-    ? { get document() { throw new Error('cross-origin frame'); } }
-    : { document: parentDocument };
-
-  const window = {
-    addEventListener: function () {},
-    parent: parentObject
+  const parent = {
+    postMessage: function (data) {
+      if (scenario.noListener) { return; }
+      hostEvents.dispatch('message', { data: clone(data), source: cardWindow });
+    }
   };
-  window.parent.postMessage = function () {};
-
-  const sandbox = { document: document, window: window, parent: parentObject, console: console };
-  sandbox.globalThis = sandbox;
-  vm.createContext(sandbox);
-  vm.runInContext(scenario.script, sandbox);
+  if (scenario.direct) {
+    parent.document = hostDocument;
+  } else if (scenario.blocked) {
+    Object.defineProperty(parent, 'document', {
+      get: function () { throw new Error('SecurityError: cross-origin frame'); }
+    });
+  }
+  cardWindow.parent = parent;
+  cardWindow.postMessage = function (data) {
+    cardEvents.dispatch('message', { data: data, source: hostWindow });
+  };
+  const cardSandbox = {
+    window: cardWindow,
+    document: cardDocument,
+    parent: parent,
+    setTimeout: function (fn) { timers.push(fn); return timers.length; },
+    console: console
+  };
+  cardSandbox.globalThis = cardSandbox;
+  vm.createContext(cardSandbox);
+  vm.runInContext(scenario.script, cardSandbox);
 
   const handlers = row.listeners['click'] || [];
   if (handlers.length !== 1) { throw new Error('row got no click handler'); }
   handlers[0].call(row, { target: row, preventDefault: function () {} });
 
+  const statusAfterClick = status.textContent;
+  timers.splice(0).forEach(function (fn) { fn(); });
+
   return {
-    scrolled: chatMessage.scrolled,
-    block: chatMessage.scrolledBlock,
-    animated: chatMessage.animated,
+    hostInstalled: hostResult === true,
+    hostListeners: hostEvents.count('message'),
+    scrolled: message.scrolled,
+    block: message.scrolledBlock,
+    animated: message.animated,
     detailsOpen: full.open,
-    status: status.textContent
+    statusAfterClick: statusAfterClick,
+    statusAfterTimers: status.textContent
   };
 }
 
 const payload = JSON.parse(process.argv[2]);
 const results = {};
 for (const name of Object.keys(payload.scenarios)) {
-  results[name] = run({ script: payload.script, ...payload.scenarios[name] });
+  results[name] = run({ script: payload.script, host: payload.host, ...payload.scenarios[name] });
 }
 process.stdout.write(JSON.stringify(results));
 """
 
 
-def extract_script() -> str:
+def extract(name: str) -> str:
     text = ACTION.read_text(encoding="utf-8")
-    match = re.search(r'SCRIPT = """(.*?)"""', text, re.S)
-    assert match, "the card script is missing from the action module"
-    script = re.sub(r"^<script>|</script>$", "", match.group(1).strip())
-    assert "scrollIntoView" in script
-    return script
+    match = re.search(name + r' = """(.*?)"""', text, re.S)
+    assert match, f"{name} is missing from the action module"
+    value = match.group(1).strip()
+    if name == "SCRIPT":
+        value = re.sub(r"^<script>|</script>$", "", value).strip()
+    return value
 
 
 def main() -> int:
-    script = extract_script()
+    if shutil.which("node") is None:
+        print("skip: node is not installed, so the two-window jump harness cannot run")
+        return 0
+
+    script = extract("SCRIPT")
+    host = extract("HOST_JS")
+    assert "postMessage" in script and "trick-card" in script
+    assert "scrollIntoView" in host and "trick-host" in host
+
     payload = {
         "script": script,
+        "host": host,
         "scenarios": {
-            "resolvable": {"cid": "chat-9", "mid": "a-2", "domId": "message-chat-9-a-2", "blocked": False},
-            "blocked_parent": {"cid": "chat-9", "mid": "a-2", "domId": "message-chat-9-a-2", "blocked": True},
-            "missing_target": {"cid": "chat-9", "mid": "a-2", "domId": "message-other", "blocked": False},
+            # The listener finds the message: the page scrolls, the card does not
+            # open its fallback, and the row says so.
+            "host_finds": {"cid": "chat-9", "mid": "a-2", "domId": "message-chat-9-a-2", "blocked": True},
+            # The message is not in the DOM (virtualised long chat): the listener
+            # answers "no", and the card opens the passage instead of nothing.
+            "host_misses": {"cid": "chat-9", "mid": "a-2", "domId": "message-chat-9-b-7", "blocked": True},
+            # No listener at all (an older bridge, a client without execute):
+            # the wait runs out and the fallback still happens.
+            "no_host": {"cid": "chat-9", "mid": "a-2", "domId": "message-chat-9-a-2", "blocked": True, "noListener": True},
+            # A result without a message id cannot be jumped to at all.
+            "no_mid": {"cid": "chat-9", "mid": "", "domId": "message-chat-9-a-2", "blocked": True},
+            # Same-origin frame (standalone use, or an admin enabled the flag):
+            # the direct path is used and no bridge round trip happens.
+            "same_origin": {"cid": "chat-9", "mid": "a-2", "domId": "message-chat-9-a-2", "direct": True},
         },
     }
+
     harness = pathlib.Path("/tmp/trick-jump-harness.js")
     harness.write_text(HARNESS, encoding="utf-8")
     proc = subprocess.run(
@@ -142,35 +214,56 @@ def main() -> int:
     results = json.loads(proc.stdout)
 
     failures = []
-    ok = results["resolvable"]
-    if not ok["scrolled"]:
-        failures.append("a resolvable row did not scroll the chat")
-    if ok["block"] != "center":
-        failures.append(f"scroll block was {ok['block']!r}, expected 'center'")
-    if not ok["animated"]:
+    found = results["host_finds"]
+    if not found["hostInstalled"]:
+        failures.append("the host listener did not install")
+    if not found["scrolled"]:
+        failures.append("a message the page can reach was not scrolled")
+    if found["block"] != "center":
+        failures.append(f"scroll block was {found['block']!r}, expected 'center'")
+    if not found["animated"]:
         failures.append("the scrolled message was not flashed")
-    if ok["detailsOpen"]:
+    if found["detailsOpen"]:
         failures.append("the fallback opened even though the jump worked")
+    if "jumped" not in found["statusAfterClick"]:
+        failures.append(f"the row said {found['statusAfterClick']!r} after a successful jump")
 
-    blocked = results["blocked_parent"]
-    if blocked["scrolled"]:
-        failures.append("a blocked parent document scrolled anyway")
-    if not blocked["detailsOpen"]:
-        failures.append("a blocked parent did not open the full passage")
-    if "could not scroll" not in blocked["status"]:
-        failures.append(f"blocked status was {blocked['status']!r}")
+    missed = results["host_misses"]
+    if missed["scrolled"]:
+        failures.append("a missing message scrolled something else")
+    if not missed["detailsOpen"]:
+        failures.append("a missing message did not open the passage")
+    if "not on screen" not in missed["statusAfterTimers"]:
+        failures.append(f"a miss said {missed['statusAfterTimers']!r}")
 
-    missing = results["missing_target"]
-    if missing["scrolled"]:
-        failures.append("a missing target scrolled something else")
-    if not missing["detailsOpen"]:
-        failures.append("a missing target did not open the full passage")
+    orphan = results["no_host"]
+    if orphan["scrolled"]:
+        failures.append("a card with no host scrolled something")
+    if not orphan["detailsOpen"]:
+        failures.append("a card with no host did not fall back after the wait")
+
+    nameless = results["no_mid"]
+    if nameless["scrolled"]:
+        failures.append("a row without a message id scrolled something")
+    if not nameless["detailsOpen"]:
+        failures.append("a row without a message id did not open the passage")
+    if "no message id" not in nameless["statusAfterClick"]:
+        failures.append(f"a row without an id said {nameless['statusAfterClick']!r}")
+
+    direct = results["same_origin"]
+    if not direct["scrolled"]:
+        failures.append("a same-origin frame did not scroll directly")
+    if direct["detailsOpen"]:
+        failures.append("a same-origin jump also opened the fallback")
 
     for failure in failures:
         print(f"FAIL {failure}")
     if failures:
         return 1
-    print("jump script ok: scrolls when resolvable, opens the passage when not (2 fallbacks)")
+    print(
+        "jump bridge ok: host scrolls and replies, a miss and a missing host both "
+        "open the passage (4 paths)"
+    )
     return 0
 
 

@@ -3,7 +3,7 @@ title: Trick
 author: hakkisabah
 author_url: https://github.com/hakkisabah/trick
 funding_url: https://github.com/hakkisabah/trick
-version: 0.7.0
+version: 0.8.0
 required_open_webui_version: 0.5.0
 description: Find a passage in a long conversation, and scored sources beside it.
 """
@@ -100,18 +100,28 @@ li.hit .jump-status { font-size: 11px; opacity: .65; margin-top: 4px; }
 li.hit .jump-status:empty { display: none; }
 """
 
-# Closing the card. Open WebUI renders an HTMLResponse embed in a sandboxed
-# iframe, so this document cannot remove its own frame from the parent page.
-# Two mechanisms are used because only one of them is guaranteed: the card is a
-# native ``<details>`` element, so the summary line collapses it with no script
-# at all, and the script only adds Escape and the parent height report. A panel
-# that could only be closed by script stayed open, which is what a reader
-# reported.
+# The card, and the jump it performs.
+#
+# Open WebUI renders an HTMLResponse embed in an iframe whose sandbox is
+# "allow-scripts allow-downloads": ``iframeSandboxAllowSameOrigin`` defaults to
+# false in 0.12.4 (checked in the built frontend), so this document has an
+# opaque origin and ``window.parent.document`` throws. Reaching into the chat
+# from here is therefore impossible, and a card that tried it looked inert when
+# a row was clicked.
+#
+# The jump goes through the host instead. This document posts
+# {source: 'trick-card', mid, cid} to its parent; the action installs a listener
+# in the page through ``__event_call__`` type 'execute' (the frontend runs that
+# code in the chat document), the listener scrolls to the message and replies
+# with {source: 'trick-host', mid, ok}. No page setting has to be weakened, and
+# the same code works if an admin did turn same-origin on: that case is only a
+# fast path here.
 SCRIPT = """
 <script>
 (function () {
   var card = document.getElementById('trick-card');
   if (!card) { return; }
+  var REPLY_WAIT_MS = 900;
   function report() {
     try {
       parent.postMessage({ type: 'iframe:height', height: document.body.scrollHeight }, '*');
@@ -124,13 +134,6 @@ SCRIPT = """
   window.addEventListener('load', report);
   report();
 
-  // A result row jumps to the message it came from. Open WebUI renders this
-  // card in an iframe that keeps the page's origin (sandbox="allow-same-origin"
-  // is on by default), so the chat document is reachable and its own "jump to
-  // message" code can be reused verbatim: id "message-<chat>-<message>", then
-  // scrollIntoView plus a short highlight. When the origin is not shared (an
-  // admin turned the sandbox flag off, or the card is opened standalone) the
-  // row opens the full passage instead of doing nothing.
   function messageElement(doc, chatId, messageId) {
     if (!messageId) { return null; }
     var candidates = [];
@@ -147,37 +150,64 @@ SCRIPT = """
     }
     return null;
   }
+  function flash(target) {
+    try {
+      target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      if (target.animate) {
+        target.animate(
+          [{ backgroundColor: 'rgba(165,165,197,.28)' }, { backgroundColor: 'rgba(165,165,197,0)' }],
+          { duration: 1600 }
+        );
+      }
+      return true;
+    } catch (error) { return false; }
+  }
+  function fail(row, status, messageId) {
+    var full = row.querySelector('details.full');
+    if (full) { full.open = true; }
+    if (status) {
+      status.textContent = messageId
+        ? 'that message is not on screen (a long chat renders only nearby turns); the full passage is open below'
+        : 'this result carries no message id; the passage is shown in full below';
+    }
+    report();
+  }
   function jump(row) {
     var messageId = row.getAttribute('data-mid') || '';
     var chatId = row.getAttribute('data-cid') || '';
     var status = row.querySelector('.jump-status');
-    var full = row.querySelector('details.full');
-    var target = null;
+    if (!messageId) { fail(row, status, messageId); return; }
+
+    // Fast path: when the frame does share the page's origin (standalone use,
+    // or an admin enabled the sandbox flag) the chat document is reachable.
     var doc = null;
     try { doc = window.parent.document; } catch (error) { doc = null; }
     if (doc) {
-      try { target = messageElement(doc, chatId, messageId); } catch (error) { target = null; }
-    }
-    if (target) {
-      try {
-        target.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        if (target.animate) {
-          target.animate(
-            [{ backgroundColor: 'rgba(165,165,197,.28)' }, { backgroundColor: 'rgba(165,165,197,0)' }],
-            { duration: 1600 }
-          );
-        }
+      var direct = null;
+      try { direct = messageElement(doc, chatId, messageId); } catch (error) { direct = null; }
+      if (direct && flash(direct)) {
         if (status) { status.textContent = 'jumped to the message in the chat'; }
         return;
-      } catch (error) { target = null; }
+      }
     }
-    if (full) { full.open = true; }
-    if (status) {
-      status.textContent = messageId
-        ? 'could not scroll the chat; the full passage is open below'
-        : 'this result has no message id; the passage is shown in full below';
+
+    var settled = false;
+    function settle(text) {
+      settled = true;
+      window.removeEventListener('message', onReply);
+      if (status) { status.textContent = text; }
     }
-    report();
+    function onReply(event) {
+      var data = event && event.data;
+      if (!data || data.source !== 'trick-host' || String(data.mid || '') !== messageId) { return; }
+      if (data.ok) { settle('jumped to the message in the chat'); }
+      else { fail(row, status, messageId); }
+    }
+    window.addEventListener('message', onReply);
+    try {
+      window.parent.postMessage({ source: 'trick-card', mid: messageId, cid: chatId }, '*');
+    } catch (error) { fail(row, status, messageId); return; }
+    setTimeout(function () { if (!settled) { fail(row, status, messageId); } }, REPLY_WAIT_MS);
   }
   var rows = document.querySelectorAll('li.hit');
   for (var r = 0; r < rows.length; r++) {
@@ -192,6 +222,63 @@ SCRIPT = """
 })();
 </script>
 """
+
+# Installed in the chat document itself, through __event_call__ type 'execute'.
+# It is the only code that can scroll the page, so it also owns the lookup: the
+# message element id is "message-<chat>-<message>", with "message-<message>" and
+# a suffix match as fallbacks, because virtualised chats and renamed branches
+# have both been seen. The listener is installed once per tab; a second card
+# reuses it. It replies to every request, including a miss, so the card can stop
+# waiting and open the passage instead of staying silent.
+HOST_JS = """
+(function () {
+  try {
+    if (window.__trickJumpInstalled) { return true; }
+    window.__trickJumpInstalled = true;
+    function findMessage(mid, cid) {
+      var el = null;
+      if (cid) { el = document.getElementById('message-' + cid + '-' + mid); }
+      if (!el) { el = document.getElementById('message-' + mid); }
+      if (el) { return el; }
+      var nodes = document.querySelectorAll('[id^="message-"]');
+      for (var i = 0; i < nodes.length; i++) {
+        var id = nodes[i].id || '';
+        if (id === mid || id.slice(-(mid.length + 1)) === '-' + mid) { return nodes[i]; }
+      }
+      return null;
+    }
+    window.addEventListener('message', function (event) {
+      var data = event && event.data;
+      if (!data || data.source !== 'trick-card' || !data.mid) { return; }
+      var mid = String(data.mid);
+      var cid = data.cid ? String(data.cid) : '';
+      var el = null;
+      try { el = findMessage(mid, cid); } catch (error) { el = null; }
+      var ok = false;
+      if (el) {
+        try {
+          el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          if (el.animate) {
+            el.animate(
+              [{ backgroundColor: 'rgba(165,165,197,.30)' }, { backgroundColor: 'rgba(165,165,197,0)' }],
+              { duration: 1600 }
+            );
+          }
+          ok = true;
+        } catch (error) { ok = false; }
+      }
+      try {
+        if (event.source) { event.source.postMessage({ source: 'trick-host', mid: mid, ok: ok }, '*'); }
+      } catch (error) { /* a closed frame needs no reply */ }
+    }, false);
+    return true;
+  } catch (error) { return false; }
+})()
+"""
+
+# asyncio keeps only a weak reference to a task, so an unreferenced installation
+# task can be collected mid-flight. The set holds them until they finish.
+_JUMP_JOBS: set = set()
 
 
 class Action:
@@ -293,6 +380,12 @@ class Action:
             return self._card("Trick", [("<p class='none'>No question was entered.</p>", "")])
 
         transcript, dropped = self._transcript(messages)
+
+        # Install the scroll listener in the page before searching, so the card
+        # is usable the moment it renders. This is a second event call, which is
+        # why it starts after the dialog returned: one call in flight at a time.
+        self._install_jump_listener(__event_call__)
+
         payload = {
             "query": query[:2000],
             "limit": max(1, min(int(self.valves.LIMIT), 26)),
@@ -350,6 +443,36 @@ class Action:
             with_rows=show_rows,
             blend_note=self._score_note(result.get("report") or {}),
         )
+
+    # -- host-side jump ----------------------------------------------------
+    @staticmethod
+    def _install_jump_listener(event_call) -> None:
+        """Put the scroll listener into the chat page. Never raises, never blocks.
+
+        ``__event_call__`` type 'execute' is the one route that runs code in the
+        chat document (the card's iframe has an opaque origin). The dialog above
+        already returned, so this is the only call in flight. A client that does
+        not answer leaves the card on its fallback, so the result must not wait
+        for it: the task is bounded and its result is discarded.
+        """
+        if event_call is None:
+            return
+
+        async def run() -> None:
+            try:
+                await asyncio.wait_for(
+                    event_call({"type": "execute", "data": {"code": HOST_JS}}),
+                    timeout=8.0,
+                )
+            except Exception:
+                pass
+
+        try:
+            task = asyncio.create_task(run())
+        except RuntimeError:
+            return
+        _JUMP_JOBS.add(task)
+        task.add_done_callback(_JUMP_JOBS.discard)
 
     # -- dialog ------------------------------------------------------------
     async def _ask(self, event_call) -> tuple[str | None, bool]:
@@ -479,6 +602,15 @@ class Action:
                     " aria-label='Show this passage in the chat'"
                 )
                 hint = "<span class='hint'>click to show in chat</span>"
+            # Why this row is here: the query terms it actually contains. Without
+            # it a hit that shares one rare word with the question looks random.
+            shared = [str(term) for term in (row.get("matched") or []) if term]
+            if shared:
+                hint += (
+                    "<span class='hint'>matched: "
+                    + html.escape(", ".join(shared[:6]))
+                    + "</span>"
+                )
             body = (
                 f"<span class='turn'>turn {html.escape(str(row.get('turn', '?')))} - "
                 f"{html.escape(role)} {marker}</span>{hint}"
