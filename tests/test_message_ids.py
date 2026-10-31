@@ -147,12 +147,12 @@ def test_the_action_sends_the_ids_and_renders_them_as_jump_targets():
     assert transcript[0]["id"] == "u-1"
     assert "id" not in transcript[2]
 
-    block = action._chat_block(
+    block = action._results_html(
+        "taper",
         [{"turn": 1, "role": "user", "text": "where did we put the taper", "message_id": "u-1"}],
-        0,
-        "chat-9",
+        [],
     )
 
-    assert "data-mid='u-1'" in block
-    assert "data-cid='chat-9'" in block
-    assert "class='hit'" in block
+    # The jump target is the "?message=" parameter Open WebUI's own search uses.
+    assert "href='?message=u-1'" in block
+    assert "click to show in chat" not in block

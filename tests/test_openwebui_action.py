@@ -103,6 +103,13 @@ class Recorder:
 
 
 def html_of(response) -> str:
+    """The block the action produced.
+
+    A browser call returns ``{"messages": [...]}`` (the results are written into
+    the message); an API call with no message id returns an embed instead.
+    """
+    if isinstance(response, dict):
+        return "".join(str(item.get("content") or "") for item in (response.get("messages") or []))
     body = getattr(response, "body", b"")
     if isinstance(body, bytes):
         return body.decode("utf-8")
@@ -152,11 +159,14 @@ def test_dispatches_with_body_only(monkeypatch):
     assert "turn 3" in card
     assert "DESeq2" not in card
     assert "hidden (SOURCES=never)" in card
-    assert response.headers.get("Content-Disposition") == "inline"
+    # The results are written into the pressed message, which is what lets the
+    # rows be ordinary links in the page instead of a sandboxed embed.
+    assert isinstance(response, dict)
+    assert response["messages"][0]["id"] == "m1"
 
 
 def test_chat_rows_are_clickable_and_jump_to_the_message(monkeypatch):
-    """Every conversation hit carries the ids the chat needs to scroll to it."""
+    """Every hit links to the query parameter Open WebUI itself scrolls on."""
     module = load_module()
     monkeypatch.setattr(module.Action, "_post", lambda self, payload: RESULT)
     body = {
@@ -170,15 +180,13 @@ def test_chat_rows_are_clickable_and_jump_to_the_message(monkeypatch):
 
     card = html_of(asyncio.run(dispatch_like_open_webui(module, body)))
 
-    assert "class='hit'" in card
-    assert "data-mid='a-2'" in card
-    assert "data-cid='c0ffee'" in card
-    assert "click to show in chat" in card
-    assert "message-' + chatId + '-' + messageId" in card
-    assert "scrollIntoView" in card
-    # The fallback must exist: without it a blocked cross-frame access would make
-    # the row do nothing at all.
-    assert "the full passage is open below" in card
+    # The jump is an anchor to "?message=<id>", the parameter Chat.svelte reads
+    # to call scrollToMessage. No script, no frame permission, no data-* hooks.
+    assert "href='?message=a-2'" in card
+    assert "turn 3 · assistant" in card
+    assert "data-mid=" not in card
+    assert "postMessage" not in card
+    assert "window.parent" not in card
 
 
 def test_chat_row_without_an_id_is_not_offered_as_clickable(monkeypatch):
@@ -186,13 +194,13 @@ def test_chat_row_without_an_id_is_not_offered_as_clickable(monkeypatch):
     module = load_module()
     no_id = {"ok": True, "result": {**RESULT["result"], "chat": [{**RESULT["result"]["chat"][0], "message_id": ""}]}}
     monkeypatch.setattr(module.Action, "_post", lambda self, payload: no_id)
-    body = {"id": "m1", "chat_id": "c0ffee", "messages": [{"role": "user", "content": "x"}]}
+    body = {"id": "m1", "chat_id": "c0ffee", "messages": [{"id": "m1", "role": "user", "content": "x"}]}
 
     card = html_of(asyncio.run(dispatch_like_open_webui(module, body)))
 
     assert "we settled on 0.15" in card
-    assert "class='hit'" not in card
-    assert "data-mid=" not in card
+    assert "?message=" not in card
+    assert "turn 3 · assistant" in card
 
 
 def test_auto_quiet_mode_hides_sources_once_the_chat_answered(monkeypatch):
@@ -232,14 +240,6 @@ def test_never_hides_sources_but_says_they_matched(monkeypatch):
 
     assert "DESeq2" not in card
     assert "1 catalogue source matched outside this conversation" in card
-
-
-def test_score_note_omits_numbers_when_the_answer_has_no_weights():
-    """An older bridge must not make the card print an invented formula."""
-    module = load_module()
-    note = module.Action._score_note({})
-    assert "0.20" not in note
-    assert "not a confidence" in note
 
 
 def test_rows_are_listed_when_the_valve_asks_for_them(monkeypatch):
@@ -346,9 +346,8 @@ def test_chat_text_is_escaped(monkeypatch):
 
     card = html_of(asyncio.run(dispatch_like_open_webui(module, body)))
 
-    # The only script in the card is the fixed one in SCRIPT; reader text and
-    # result text must arrive escaped, never as markup.
-    assert card.count("<script>") == module.SCRIPT.count("<script>") == 1
+    # Result text must arrive escaped, never as markup: the block is rendered
+    # by the chat itself now, so an unescaped payload would be live HTML.
     assert "<script>alert(1)" not in card
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in card
 
@@ -419,7 +418,7 @@ def test_chat_id_without_messages_reads_the_stored_chat(monkeypatch):
 
     assert posted[0]["scope"] == "both"
     assert [m["content"] for m in posted[0]["messages"]][-1].startswith("the biggest mistake")
-    assert "Conversation (1 match" in card
+    assert "1 passage match" in card
 
 
 def test_unread_chat_is_stated_not_silently_skipped(monkeypatch):
@@ -473,79 +472,60 @@ def test_no_passage_note_when_the_chat_has_no_hit(monkeypatch):
     assert "1 catalogue source matched outside this conversation" in card
 
 
-def test_card_offers_a_way_to_close_itself(monkeypatch):
-    """The embed iframe cannot be removed by the document it holds, so the card
-    collapses to one line: natively, through <details>, and on Escape."""
+def test_the_block_collapses_without_any_script(monkeypatch):
+    """The results live in the message, so <details> is all the closing needs."""
     module = load_module()
     monkeypatch.setattr(module.Action, "_post", lambda self, p: RESULT)
 
-    card = html_of(asyncio.run(dispatch_like_open_webui(module, {"id": "m1"})))
+    card = html_of(
+        asyncio.run(
+            dispatch_like_open_webui(module, {"id": "m1"}, __event_call__=Recorder("threshold"))
+        )
+    )
 
-    # A <details>/<summary> pair closes without a single line of script, which
-    # is what a sandboxed embed can be relied on to run.
-    assert "<details id='trick-card' open>" in card
+    assert "<details open>" in card
     assert "<summary>" in card
-    assert "id='trick-body'" in card
-    assert "<summary>" in card and "aria-label='Close'" in card
-    assert "event.key === 'Escape'" in card
-    assert card.index("<summary>") < card.index("id='trick-body'")
+    assert card.index("<summary>") < card.index("<li>")
+    # No script at all: nothing to be blocked by a sandbox, nothing to break.
+    assert "<script" not in card
+    assert "onclick" not in card
 
 
-def test_the_action_installs_the_scroll_listener_in_the_page(monkeypatch):
-    """The card lives in an iframe without allow-same-origin (the 0.12.4
-    default), so it cannot scroll the chat itself. The only code that can is one
-    the action installs in the page through event_call type 'execute'; without
-    it a click did nothing at all, which is what a reader reported."""
+def test_the_action_makes_no_second_event_call(monkeypatch):
+    """The old design installed a listener through event_call type 'execute'.
+
+    Open WebUI 0.12.4 has no such type (Chat.svelte handles only input,
+    confirmation and the request:* family), so that call could never install
+    anything - it only cost a timeout. The dialog must be the only call.
+    """
     module = load_module()
     monkeypatch.setattr(module.Action, "_post", lambda self, p: RESULT)
     recorder = Recorder("the taper")
 
-    async def scenario():
-        response = await dispatch_like_open_webui(
-            module, {"id": "m1", "chat_id": "c0ffee"}, __event_call__=recorder
-        )
-        # The installation is fire-and-forget; give its task one turn of the loop.
-        for _ in range(3):
-            await asyncio.sleep(0)
-        return response
-
-    asyncio.run(scenario())
+    asyncio.run(
+        dispatch_like_open_webui(module, {"id": "m1", "chat_id": "c0ffee"}, __event_call__=recorder)
+    )
 
     kinds = [call.get("type") for call in recorder.calls]
-    assert kinds[:2] == ["input", "execute"], kinds
-    code = recorder.calls[1]["data"]["code"]
-    # The listener owns the lookup and answers every request, including a miss.
-    assert "trick-card" in code and "trick-host" in code
-    assert "scrollIntoView" in code
-    assert "message-" in code
-    assert "__trickJumpInstalled" in code
+    assert kinds == ["input"], kinds
 
 
-def test_a_silent_page_does_not_hold_up_the_result(monkeypatch):
-    """A client that never acknowledges 'execute' must not delay the card: the
-    installation is bounded and its answer is discarded."""
+def test_a_slow_dialog_client_cannot_hold_up_a_search_that_needs_no_answer(monkeypatch):
+    """With the dialog answered, the result depends on one HTTP call only."""
     module = load_module()
     monkeypatch.setattr(module.Action, "_post", lambda self, p: RESULT)
-
-    class Silent(Recorder):
-        async def __call__(self, payload):
-            self.calls.append(payload)
-            if payload.get("type") == "execute":
-                await asyncio.sleep(30)
-            return self.answer
 
     async def scenario():
         loop = asyncio.get_running_loop()
         started = loop.time()
-        await dispatch_like_open_webui(module, {"id": "m1"}, __event_call__=Silent("q"))
+        await dispatch_like_open_webui(module, {"id": "m1"}, __event_call__=Recorder("q"))
         return loop.time() - started
 
     assert asyncio.run(scenario()) < 3.0
 
 
-def test_the_card_no_longer_assumes_a_shared_origin(monkeypatch):
-    """The old comment claimed the sandbox keeps the page origin. It does not,
-    so the direct path must be an optimisation, never the only path."""
+def test_every_row_says_why_it_matched(monkeypatch):
+    """A hit that does not name the shared terms reads like a wrong answer."""
     module = load_module()
     monkeypatch.setattr(module.Action, "_post", lambda self, p: RESULT)
     body = {
@@ -559,9 +539,25 @@ def test_the_card_no_longer_assumes_a_shared_origin(monkeypatch):
 
     card = html_of(asyncio.run(dispatch_like_open_webui(module, body)))
 
-    assert "jump-status" in card
-    assert "data-mid='a-2'" in card
-    assert "postMessage" in card
-    assert "is on by default" not in card
-    # A row says why it is in the list.
     assert "matched: settled, 0.15" in card
+    assert "href='?message=a-2'" in card
+
+
+def test_weak_matches_are_labelled_not_hidden(monkeypatch):
+    """Turkish questions are mostly function words; the block must say so."""
+    module = load_module()
+    weak = json.loads(json.dumps(RESULT))
+    weak["result"]["report"]["weak"] = True
+    monkeypatch.setattr(module.Action, "_post", lambda self, p: weak)
+    body = {
+        "id": "m1",
+        "messages": [
+            {"id": "u-1", "role": "user", "content": "x"},
+            {"id": "a-2", "role": "assistant", "content": "we settled on 0.15"},
+        ],
+    }
+
+    card = html_of(asyncio.run(dispatch_like_open_webui(module, body)))
+
+    assert "Weak match" in card
+    assert "matched:" in card

@@ -16,7 +16,7 @@
 #     12. integ. secrets no literal credentials under integrations/
 #     13. docs         every documented command and path actually exists
 #     14. chat quality conversation search still finds the planted passages
-#     15. jump         the result-row script scrolls the chat or falls back
+#     15. jump         every result row links to the turn it came from
 set -eu
 
 TOTAL=15
@@ -252,8 +252,9 @@ for bad in ("a string", 42, {"role": "user"}):
         raise AssertionError(f"messages accepted {bad!r}")
 
 assert 'payload["scope"] = "both"' in action_file, "the action must ask for both scopes when it sends a chat"
-assert "_chat_block" in action_file and "CHAT_TURNS" in action_file, "the card must render and window the chat"
-assert "Conversation" in action_file, "the card must show where in the chat it matched"
+assert "_results_html" in action_file and "CHAT_TURNS" in action_file, "the block must render and window the chat"
+assert "?message=" in action_file, "a row must link to the turn it came from"
+assert "iframeSandboxAllowSameOrigin" in action_file, "the card's sandbox limit must stay documented"
 
 # The installer must never accept the key as an argument (shell history, ps),
 # and it must refuse an install that Open WebUI stored as the wrong type.
@@ -311,10 +312,6 @@ print(
 PYCODE
 
 echo "== 15/$TOTAL result rows jump to their message"
-if command -v node >/dev/null 2>&1; then
 "$PY" scripts/jump_check.py
-else
-echo "jump check skipped: node is not installed"
-fi
 
 echo "gate: all checks passed"

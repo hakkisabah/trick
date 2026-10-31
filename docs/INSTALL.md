@@ -326,9 +326,10 @@ systemctl --user daemon-reload
 ## 8. Open WebUI
 
 Trick is an **Action**: a button in the message toolbar. Press it, an input dialog
-opens, type what you are looking for, press Enter, the passage appears as a card
-under the message. It is not a model, so it never appears in the model selector
-and never answers a chat turn.
+opens, type what you are looking for, press Enter, and a collapsible results block
+is appended under that message - every hit is a link to the turn it came from. It
+is not a model, so it never appears in the model selector and never answers a
+chat turn.
 
 Three things must be true: the bridge is running and reachable from the container,
 you have an **admin** Open WebUI session, and that session has produced an API key.
@@ -413,44 +414,46 @@ you press the button; that is why it comes second.
 
 Verify end to end: open a chat that has a few turns, press the Trick button (the
 magnifier) under any answer, type `differential expression for RNA-seq counts`,
-press Enter. Expected: a card in about 1-2 s with a `Conversation` block (turn
-number, role, quoted passage, and `matched: ...` naming the query words that
-passage actually contains - a hit that shares only one rare word with the
-question says so instead of looking random). Clicking a passage scrolls the chat
-to the message it came from and flashes it.
+press Enter. Expected in about 1-2 s: a collapsible `Trick` block appended under
+that answer, with `<n> passages match, showing the closest <k>`, then one row per
+hit: `turn <n> · <role>` as a **link**, the query words that passage actually
+contains (`matched: ...`, plus `(partial)` when the passage carries less than
+half of the question's distinctive weight), and the passage. Clicking a row
+scrolls the chat to that turn.
 
-How the jump works, because it decides what you can expect: Open WebUI renders
-this card in an iframe whose sandbox is `allow-scripts allow-downloads`. The
-sandbox flag `iframeSandboxAllowSameOrigin` defaults to **false** in 0.12.4, so
-the card cannot read the chat document - `window.parent.document` throws - and
-code written against a shared origin does nothing when a row is clicked. The
-card therefore asks the page: it posts `{source:'trick-card', mid, cid}` to its
-parent, and a listener that the action puts into the page through
-`__event_call__` type `execute` finds `message-<thread>-<id>` (then
-`message-<id>`, then any `message-*` id ending with the message id), scrolls,
-flashes, and replies. **No user or admin setting has to be changed for this.**
-If the message is not rendered at all (a long chat renders only nearby turns) or
-nothing answers within about a second, the click opens the full passage inside
-the card instead, and the row says which of the two happened - so a click never
-does nothing.
+How the jump works, because it decides what to expect. Open WebUI renders an
+`HTMLResponse` embed in an iframe whose sandbox is `allow-scripts allow-popups
+allow-downloads`, and `iframeSandboxAllowSameOrigin` defaults to **false** in
+0.12.4. Such a frame has an opaque origin: it cannot read the chat document, it
+cannot be granted top-level navigation, and the page accepts only three message
+types from it (`input:prompt`, `input:prompt:submit`, `action:submit`). There is
+no supported way for a card inside that frame to scroll the chat, so this action
+does not use a frame at all: it returns the pressed message back with the block
+appended (Open WebUI applies `res.messages` and saves it), and the block is
+rendered by the chat page itself.
 
-That listener is installed once per browser tab and reused by later cards; it
-only reacts to messages whose `source` is `trick-card`, and its only effect is a
-scroll plus a highlight. If you run a hardened instance that refuses `execute`
-calls, the jump degrades to "open the passage in the card", which is the
-behaviour of every row by default. Pressing Enter or Space on a focused row does
-the same as clicking. With the default `SOURCES=never` the
-catalogues stay out of the way and the card only says in one line that `N
-catalogue sources matched outside this conversation and are hidden`; set the
-valve to `auto` to list them when the chat had no match, or `always` to list them
-beside every hit. When the conversation has no match, the card says so. Listed
-sources carry `source`/`key`, a blended score, `*` for laya-scored rows and `-`
-for retrieval-only rows. The footnote states the blend the score came from (the
-weights are shipped with the answer, so the text cannot drift), and that the
-number orders this list only - it is not a confidence and not comparable between
-queries. The card closes from the `x` in its header or on Escape, and reopens
-from the same line - it needs no script to do that. Closing the input dialog
-without typing searches nothing.
+That makes every row an ordinary link to `?message=<id>` - the same parameter
+Open WebUI's own search uses to reveal a hit (`Chat.svelte` reads it and calls
+`scrollToMessage`). No script, no sandbox flag, no admin setting. The trade-off
+is that the results live in the message: they persist with the chat, and a
+second search on the same message replaces the block instead of stacking
+another one. Below `<!-- trick:results -->` is the only part the action ever
+rewrites; the text above it is never touched.
+
+`<details>` gives the block its collapse: click the header to fold it. With the
+default `SOURCES=never` the catalogues stay out of the way, and the block says
+in one line that `N catalogue sources matched outside this conversation and are
+hidden`; set the valve to `auto` to list them only when the conversation had no
+match, or `always` to list them beside every hit (each with `source/key`, a
+blended score and a short summary). Closing the input dialog without typing
+searches nothing.
+
+The block states its own confidence. A row lists the query words it contains
+(`matched: ...`); when no passage contains the distinctive words of the
+question - normal for Turkish, where "en", "cok", "ne" carry no signal - the
+block says `Weak match` and shows the closest turns instead of presenting them
+as answers. Function words are dropped from the query before scoring, for both
+Turkish and English.
 
 The catalogue itself is not gone: `python -m trick query` and the MCP
 `trick_search` tool still search CRAN, Bioconductor, arXiv and the live sources,

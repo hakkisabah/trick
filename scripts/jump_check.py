@@ -1,271 +1,173 @@
-"""Prove the card's jump against two stub windows, without a browser.
+"""Prove that a result row can jump to the turn it came from, without a browser.
 
-The card is rendered by Open WebUI inside an iframe that does not share the
-page's origin (``iframeSandboxAllowSameOrigin`` defaults to false in 0.12.4), so
-``window.parent.document`` throws there. The jump therefore crosses a
-postMessage bridge: the card asks, a listener installed in the chat page (through
-``__event_call__`` type 'execute') scrolls and answers.
+Open WebUI 0.12.4 renders an action's HTML embed inside an iframe whose sandbox
+is "allow-scripts allow-popups allow-downloads", with
+``iframeSandboxAllowSameOrigin`` defaulting to false. That frame has an opaque
+origin: it cannot read the chat document, and the page accepts only three
+message types from it ("input:prompt", "input:prompt:submit", "action:submit").
+An earlier design tried to scroll the chat from inside the card; the click did
+nothing while the code looked alive.
 
-This harness runs both scripts in separate contexts and wires the two windows
-together, which is the part a unit test of either script alone cannot see:
-a request with no reply, a reply for the wrong message id, and a reply that
-arrives after the card already fell back.
+The mechanism that does work is the one Open WebUI uses for its own search hits:
+a link to ``?message=<id>`` on the chat route. Chat.svelte reads that query
+parameter, checks ``$chat.messages[id]`` exists, sets the current id and calls
+``scrollToMessage(id)``. Message content is rendered as markdown in the page,
+not in a frame, so those anchors are ordinary links and need no script - which
+is why the results are written into the message instead of a card.
 
-Skipped when node is absent (the gate reports the skip instead of passing).
+This script asserts what makes that work, against the real Action class:
+
+1. every row that carries a message id is an anchor to ``?message=<id>``;
+2. a row without an id is plain text, never a dead link;
+3. the id survives URL quoting and parses back unchanged;
+4. pressing the button twice replaces the block instead of stacking it, and the
+   text the user wrote above the marker is never touched.
 """
 
-import json
-import pathlib
+from __future__ import annotations
+
+import html
 import re
-import shutil
 import subprocess
 import sys
+import types
+import urllib.parse
+from pathlib import Path
 
-ACTION = pathlib.Path(__file__).resolve().parents[1] / "integrations" / "openwebui" / "trick_action.py"
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT / "integrations" / "openwebui"))
 
-HARNESS = r"""
-const vm = require('vm');
+ANCHOR = re.compile(r"<a href='([^']+)'>(.*?)</a>", re.S)
 
-function clone(value) { return JSON.parse(JSON.stringify(value)); }
 
-function makeEmitter() {
-  const map = {};
-  return {
-    addEventListener: function (name, fn) { (map[name] = map[name] || []).push(fn); },
-    removeEventListener: function (name, fn) { map[name] = (map[name] || []).filter(function (f) { return f !== fn; }); },
-    dispatch: function (name, event) { (map[name] || []).slice().forEach(function (f) { f(event); }); },
-    count: function (name) { return (map[name] || []).length; }
-  };
-}
+def _module():
+    """Import the action the way Open WebUI does: the host may have no pydantic."""
+    try:
+        import pydantic  # noqa: F401
+    except ImportError:
+        stub = types.ModuleType("pydantic")
 
-function makeEl(tag, attrs) {
-  const element = {
-    tagName: tag,
-    id: (attrs && attrs.id) || '',
-    listeners: {},
-    scrolled: false,
-    scrolledBlock: null,
-    animated: false,
-    open: false,
-    textContent: '',
-    addEventListener: function (name, fn) { (this.listeners[name] = this.listeners[name] || []).push(fn); },
-    getAttribute: function (name) { return (attrs && attrs[name] !== undefined) ? attrs[name] : null; },
-    scrollIntoView: function (options) { this.scrolled = true; this.scrolledBlock = options && options.block; },
-    animate: function () { this.animated = true; },
-    closest: function () { return null; },
-    querySelector: function (selector) {
-      if (selector === '.jump-status') { return this.status || null; }
-      if (selector === 'details.full') { return this.full || null; }
-      return null;
+        class _BaseModel:
+            pass
+
+        def _Field(default=None, description="", **_kwargs):
+            return default
+
+        stub.BaseModel = _BaseModel
+        stub.Field = _Field
+        sys.modules["pydantic"] = stub
+    import trick_action
+
+    return trick_action
+
+
+def _row(mid: str, turn: int, role: str = "user") -> dict:
+    return {
+        "turn": turn,
+        "role": role,
+        "message_id": mid,
+        "text": f"passage from turn {turn}",
+        "final_score": 0.62,
+        "matched": ["i5", "memory"],
     }
-  };
-  return element;
-}
-
-function run(scenario) {
-  const timers = [];
-  const card = makeEl('details', { id: 'trick-card' });
-  card.open = true;
-  const status = makeEl('div', {});
-  const full = makeEl('details', {});
-  const row = makeEl('li', { class: 'hit', 'data-mid': scenario.mid, 'data-cid': scenario.cid });
-  row.status = status;
-  row.full = full;
-
-  const message = makeEl('div', { id: scenario.domId || 'message-none' });
-
-  // --- chat page side ---------------------------------------------------
-  const hostEvents = makeEmitter();
-  const hostDocument = {
-    getElementById: function (id) { return id === message.id ? message : null; },
-    querySelectorAll: function (selector) { return selector === '[id^="message-"]' ? [message] : []; }
-  };
-  const hostWindow = {
-    addEventListener: hostEvents.addEventListener,
-    removeEventListener: hostEvents.removeEventListener,
-    dispatch: hostEvents.dispatch
-  };
-  const hostSandbox = { window: hostWindow, document: hostDocument, console: console };
-  hostSandbox.globalThis = hostSandbox;
-  vm.createContext(hostSandbox);
-  const hostResult = vm.runInContext(scenario.host, hostSandbox);
-
-  // --- card side --------------------------------------------------------
-  const cardEvents = makeEmitter();
-  const cardDocument = {
-    getElementById: function (id) { return id === 'trick-card' ? card : null; },
-    querySelectorAll: function (selector) { return selector === 'li.hit' ? [row] : []; },
-    addEventListener: function () {},
-    body: { scrollHeight: 100 }
-  };
-  const cardWindow = {
-    addEventListener: cardEvents.addEventListener,
-    removeEventListener: cardEvents.removeEventListener,
-    dispatch: cardEvents.dispatch
-  };
-  const parent = {
-    postMessage: function (data) {
-      if (scenario.noListener) { return; }
-      hostEvents.dispatch('message', { data: clone(data), source: cardWindow });
-    }
-  };
-  if (scenario.direct) {
-    parent.document = hostDocument;
-  } else if (scenario.blocked) {
-    Object.defineProperty(parent, 'document', {
-      get: function () { throw new Error('SecurityError: cross-origin frame'); }
-    });
-  }
-  cardWindow.parent = parent;
-  cardWindow.postMessage = function (data) {
-    cardEvents.dispatch('message', { data: data, source: hostWindow });
-  };
-  const cardSandbox = {
-    window: cardWindow,
-    document: cardDocument,
-    parent: parent,
-    setTimeout: function (fn) { timers.push(fn); return timers.length; },
-    console: console
-  };
-  cardSandbox.globalThis = cardSandbox;
-  vm.createContext(cardSandbox);
-  vm.runInContext(scenario.script, cardSandbox);
-
-  const handlers = row.listeners['click'] || [];
-  if (handlers.length !== 1) { throw new Error('row got no click handler'); }
-  handlers[0].call(row, { target: row, preventDefault: function () {} });
-
-  const statusAfterClick = status.textContent;
-  timers.splice(0).forEach(function (fn) { fn(); });
-
-  return {
-    hostInstalled: hostResult === true,
-    hostListeners: hostEvents.count('message'),
-    scrolled: message.scrolled,
-    block: message.scrolledBlock,
-    animated: message.animated,
-    detailsOpen: full.open,
-    statusAfterClick: statusAfterClick,
-    statusAfterTimers: status.textContent
-  };
-}
-
-const payload = JSON.parse(process.argv[2]);
-const results = {};
-for (const name of Object.keys(payload.scenarios)) {
-  results[name] = run({ script: payload.script, host: payload.host, ...payload.scenarios[name] });
-}
-process.stdout.write(JSON.stringify(results));
-"""
-
-
-def extract(name: str) -> str:
-    text = ACTION.read_text(encoding="utf-8")
-    match = re.search(name + r' = """(.*?)"""', text, re.S)
-    assert match, f"{name} is missing from the action module"
-    value = match.group(1).strip()
-    if name == "SCRIPT":
-        value = re.sub(r"^<script>|</script>$", "", value).strip()
-    return value
 
 
 def main() -> int:
-    if shutil.which("node") is None:
-        print("skip: node is not installed, so the two-window jump harness cannot run")
-        return 0
+    module = _module()
+    action = module.Action()
+    problems: list[str] = []
 
-    script = extract("SCRIPT")
-    host = extract("HOST_JS")
-    assert "postMessage" in script and "trick-card" in script
-    assert "scrollIntoView" in host and "trick-host" in host
+    ids = ["3f2a-0001", "3f2a-0002"]
+    rows = [_row(ids[0], 1), _row(ids[1], 14, "assistant"), _row("", 26)]
+    block = action._results_html("i5 memory problem", rows, [], transcript=True)
 
-    payload = {
-        "script": script,
-        "host": host,
-        "scenarios": {
-            # The listener finds the message: the page scrolls, the card does not
-            # open its fallback, and the row says so.
-            "host_finds": {"cid": "chat-9", "mid": "a-2", "domId": "message-chat-9-a-2", "blocked": True},
-            # The message is not in the DOM (virtualised long chat): the listener
-            # answers "no", and the card opens the passage instead of nothing.
-            "host_misses": {"cid": "chat-9", "mid": "a-2", "domId": "message-chat-9-b-7", "blocked": True},
-            # No listener at all (an older bridge, a client without execute):
-            # the wait runs out and the fallback still happens.
-            "no_host": {"cid": "chat-9", "mid": "a-2", "domId": "message-chat-9-a-2", "blocked": True, "noListener": True},
-            # A result without a message id cannot be jumped to at all.
-            "no_mid": {"cid": "chat-9", "mid": "", "domId": "message-chat-9-a-2", "blocked": True},
-            # Same-origin frame (standalone use, or an admin enabled the flag):
-            # the direct path is used and no bridge round trip happens.
-            "same_origin": {"cid": "chat-9", "mid": "a-2", "domId": "message-chat-9-a-2", "direct": True},
-        },
-    }
+    # 1 and 3: every id-carrying row is an anchor whose id round-trips.
+    hrefs = [href for href, _ in ANCHOR.findall(block)]
+    if len(hrefs) != len(ids):
+        problems.append(f"expected {len(ids)} anchors, found {len(hrefs)}")
+    for href, mid in zip(hrefs, ids):
+        if not href.startswith("?message="):
+            problems.append(f"anchor is not a message link: {href!r}")
+            continue
+        carried = urllib.parse.unquote(href.split("=", 1)[1])
+        if carried != mid:
+            problems.append(f"anchor for {mid!r} round-trips to {carried!r}")
 
-    harness = pathlib.Path("/tmp/trick-jump-harness.js")
-    harness.write_text(HARNESS, encoding="utf-8")
-    proc = subprocess.run(
-        ["node", str(harness), json.dumps(payload)],
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    if proc.returncode != 0:
-        print(proc.stderr.strip() or proc.stdout.strip())
+    # 2: the row without an id must stay text. A dead link promises a jump that
+    # cannot happen, which is worse than no link at all.
+    if "?message=')" in block or "?message=" + "')" in block:
+        problems.append("a row without a message id produced an empty anchor")
+    if "turn 26" not in block:
+        problems.append("the row without an id disappeared instead of printing as text")
+
+    # The reader on the other side scrolls only a message it can find in the
+    # loaded chat, so the id in the anchor is the whole contract.
+    for mid in ids:
+        if f"?message={mid}" not in html.unescape(block):
+            problems.append(f"row {mid!r} has no reachable anchor target")
+
+    # 4: a second press replaces the block; the user's text is never rewritten.
+    body = {"id": ids[1], "messages": [{"id": ids[1], "content": "my own question"}]}
+    first = module.Action._attach(body, block)
+    if not first:
+        problems.append("_attach returned nothing for a message that has an id")
+    else:
+        content = first["messages"][0]["content"]
+        if not content.startswith("my own question"):
+            problems.append("_attach dropped the text the user wrote")
+        if content.count(module.MARKER) != 1:
+            problems.append("the marker does not appear exactly once")
+        again = module.Action._attach(
+            {"id": ids[1], "messages": [{"id": ids[1], "content": content}]}, block
+        )["messages"][0]["content"]
+        if again.count(module.MARKER) != 1:
+            problems.append("a second press stacked the block instead of replacing it")
+        if again.count("<details") > 1:
+            problems.append("a second press left two blocks in the message")
+
+    if module.Action._attach({"id": "", "messages": []}, block):
+        problems.append("_attach invented a target for a call with no message id")
+
+    if problems:
+        print("jump check failed:", file=sys.stderr)
+        for item in problems:
+            print("  " + item, file=sys.stderr)
         return 1
-    results = json.loads(proc.stdout)
 
-    failures = []
-    found = results["host_finds"]
-    if not found["hostInstalled"]:
-        failures.append("the host listener did not install")
-    if not found["scrolled"]:
-        failures.append("a message the page can reach was not scrolled")
-    if found["block"] != "center":
-        failures.append(f"scroll block was {found['block']!r}, expected 'center'")
-    if not found["animated"]:
-        failures.append("the scrolled message was not flashed")
-    if found["detailsOpen"]:
-        failures.append("the fallback opened even though the jump worked")
-    if "jumped" not in found["statusAfterClick"]:
-        failures.append(f"the row said {found['statusAfterClick']!r} after a successful jump")
-
-    missed = results["host_misses"]
-    if missed["scrolled"]:
-        failures.append("a missing message scrolled something else")
-    if not missed["detailsOpen"]:
-        failures.append("a missing message did not open the passage")
-    if "not on screen" not in missed["statusAfterTimers"]:
-        failures.append(f"a miss said {missed['statusAfterTimers']!r}")
-
-    orphan = results["no_host"]
-    if orphan["scrolled"]:
-        failures.append("a card with no host scrolled something")
-    if not orphan["detailsOpen"]:
-        failures.append("a card with no host did not fall back after the wait")
-
-    nameless = results["no_mid"]
-    if nameless["scrolled"]:
-        failures.append("a row without a message id scrolled something")
-    if not nameless["detailsOpen"]:
-        failures.append("a row without a message id did not open the passage")
-    if "no message id" not in nameless["statusAfterClick"]:
-        failures.append(f"a row without an id said {nameless['statusAfterClick']!r}")
-
-    direct = results["same_origin"]
-    if not direct["scrolled"]:
-        failures.append("a same-origin frame did not scroll directly")
-    if direct["detailsOpen"]:
-        failures.append("a same-origin jump also opened the fallback")
-
-    for failure in failures:
-        print(f"FAIL {failure}")
-    if failures:
-        return 1
+    # The mechanism was read out of the running frontend, not guessed: assert
+    # the reader still exists there when the container is reachable, and skip
+    # that half (with a note) when it is not.
+    note = _reader_note()
     print(
-        "jump bridge ok: host scrolls and replies, a miss and a missing host both "
-        "open the passage (4 paths)"
+        f"jump ok: {len(hrefs)} rows link to ?message=<id>, no dead links, "
+        f"block replaced on re-press{note}"
     )
     return 0
 
 
+def _reader_note() -> str:
+    """Confirm Open WebUI still reads the query parameter, if it is installed."""
+    try:
+        found = subprocess.run(
+            [
+                "docker",
+                "exec",
+                "open-webui",
+                "sh",
+                "-c",
+                'grep -rlo \'searchParams.get("message")\' /app/build/_app/immutable/chunks/*.js | head -1',
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return " (reader not checked: no container access here)"
+    if found.returncode != 0 or not found.stdout.strip():
+        return " (reader not checked: open-webui container not available)"
+    return " (chat page still reads ?message=<id>)"
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

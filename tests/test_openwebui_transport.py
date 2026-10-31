@@ -160,7 +160,10 @@ def _action(module, url: str, token: str = TOKEN, limit: int = 2):
 def _run(action, query, messages=()):
     body = {"id": "m1", "model": "gpt", "messages": list(messages)}
     response = asyncio.run(action.action(body, __event_call__=Dialog(query)))
-    html = response.body.decode("utf-8") if isinstance(response.body, bytes) else str(response.body)
+    if isinstance(response, dict):
+        html = "".join(str(item.get("content") or "") for item in (response.get("messages") or []))
+    else:
+        html = response.body.decode("utf-8") if isinstance(response.body, bytes) else str(response.body)
     return html, response
 
 
@@ -180,10 +183,10 @@ def test_successful_search_renders_links_ranks_and_labels(action_module):
     finally:
         server.close()
     assert "Package 0" in html
-    assert "https://example.test/pkg0" in html
-    assert "CRAN" in html and "Bioconductor" in html
-    assert "0.750" in html
-    assert response.headers.get("Content-Disposition") == "inline"
+    assert "cran/pkg0" in html
+    assert "cran" in html and "bioconductor" in html
+    assert "0.75" in html
+    assert isinstance(response, dict), "the results are written into the message"
     assert server.seen[0]["auth"] == f"Bearer {TOKEN}"
     assert server.seen[0]["body"] == {"query": "negative binomial", "limit": 2, "live": True}
 
@@ -281,7 +284,7 @@ def test_the_chat_is_sent_with_the_messages_it_was_given(action_module):
     }
     # List-shaped content is flattened, not dropped.
     assert body["messages"][1]["content"] == "turn about the polygon layer"
-    assert "Conversation" in html and "2 matches" in html
+    assert "2 passages match" in html
     assert "turn 7" in html
 
 
@@ -298,8 +301,8 @@ def test_the_oldest_turns_are_dropped_and_the_reader_is_told(action_module):
     assert [message["content"] for message in kept] == ["turn 7", "turn 8", "turn 9"]
     assert dropped == 7
     assert server.seen[0]["body"]["messages"] == kept
-    assert "1 match" in html
-    assert "oldest 7 turns not searched" in html
+    assert "1 passage match" in html
+    assert "oldest 7 turns were not searched" in html
 
 
 def test_the_character_budget_stops_at_the_newest_turns(action_module):
@@ -329,7 +332,7 @@ def test_a_chat_only_answer_does_not_claim_a_catalogue_miss(action_module):
         html, _ = _run(_action(action_module, server.url), "spatial join", [{"role": "user", "content": "x"}])
     finally:
         server.close()
-    assert "Conversation" in html
+    assert "passage match" in html
     assert "Sources (" not in html
 
 
@@ -340,3 +343,58 @@ def test_an_empty_conversation_list_sends_nothing(action_module):
     finally:
         server.close()
     assert "messages" not in server.seen[0]["body"]
+
+
+# ---------------------------------------------------------------------------
+# what the block claims about its own answer
+# ---------------------------------------------------------------------------
+def test_the_weak_flag_comes_from_the_conversation_report(action_module):
+    """It lived in chat_report; reading report hid the warning silently.
+
+    A user who asks "where did we hit the problem" and gets three turns that
+    merely mention the subsystem reads that as a wrong answer. The block is
+    supposed to say so, so the very same payload that produced the complaint is
+    asserted here.
+    """
+    payload = _chat_payload(chat=2)
+    payload["result"]["chat_report"] = {"weak": True, "best_coverage": 0.2}
+    server = _Server(payload)
+    try:
+        html, _ = _run(_action(action_module, server.url), "where did we hit the problem",
+                       [{"role": "user", "content": "x"}])
+    finally:
+        server.close()
+    assert "Weak match" in html
+    assert "best_coverage" not in html
+
+
+def test_a_row_below_the_strong_coverage_says_partial(action_module):
+    payload = _chat_payload(chat=2)
+    payload["result"]["chat"][0]["coverage"] = 0.18
+    payload["result"]["chat"][1]["coverage"] = 0.72
+    payload["result"]["chat"][0]["matched"] = ["the"]
+    payload["result"]["chat"][1]["matched"] = ["threshold", "dispersion"]
+    server = _Server(payload)
+    try:
+        html, _ = _run(_action(action_module, server.url), "threshold dispersion",
+                       [{"role": "user", "content": "x"}])
+    finally:
+        server.close()
+    rows = html.split("<ol>")[1].split("</ol>")[0].split("<li>")[1:]
+    assert len(rows) == 2, rows
+    assert "(partial)" in rows[0], rows[0]
+    assert "(partial)" not in rows[1], rows[1]
+
+
+def test_the_counter_says_how_many_rows_are_shown(action_module):
+    """Eight matches above three rows reads as a bug, not as a summary."""
+    payload = _chat_payload(chat=5)
+    server = _Server(payload)
+    action = _action(action_module, server.url)
+    action.valves.CHAT_RESULTS = 3
+    try:
+        html, _ = _run(action, "spatial join", [{"role": "user", "content": "x"}])
+    finally:
+        server.close()
+    assert "5 passages match, showing the closest 3" in html
+    assert len(html.split("<ol>")[1].split("</ol>")[0].split("<li>")[1:]) == 3

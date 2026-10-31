@@ -3,9 +3,9 @@ title: Trick
 author: hakkisabah
 author_url: https://github.com/hakkisabah/trick
 funding_url: https://github.com/hakkisabah/trick
-version: 0.8.0
+version: 0.9.1
 required_open_webui_version: 0.5.0
-description: Find a passage in a long conversation, and scored sources beside it.
+description: Find a passage in a long conversation; every hit links to its turn.
 """
 
 # Trick as an Open WebUI Action.
@@ -35,6 +35,7 @@ import asyncio
 import html
 import json
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from pydantic import BaseModel, Field
@@ -71,214 +72,28 @@ DEGRADED_TEXT = {
     "S9": "configuration problem",
 }
 
-STYLE = """
-:root { color-scheme: light dark; }
-body { font: 14px/1.45 system-ui, -apple-system, Segoe UI, sans-serif; margin: 0; padding: 10px 14px; }
-details#trick-card > summary { display: flex; align-items: baseline; gap: 8px; margin: 0 0 6px; cursor: pointer; list-style: none; }
-details#trick-card > summary::-webkit-details-marker { display: none; }
-details#trick-card > summary .title { flex: 1; font-size: 12px; opacity: .7; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-details#trick-card > summary .x { font-size: 15px; line-height: 1; padding: 2px 6px; opacity: .6; }
-details#trick-card > summary:hover .x { opacity: 1; }
-details#trick-card:not([open]) > summary .x { transform: rotate(45deg); }
-h3 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; opacity: .65; margin: 14px 0 6px; }
-h3:first-of-type { margin-top: 0; }
-ol, ul { margin: 0; padding-left: 18px; }
-li { margin: 0 0 10px; }
-.turn { font-variant-numeric: tabular-nums; opacity: .7; font-size: 12px; }
-.quote { border-left: 3px solid rgba(127,127,127,.4); padding-left: 8px; margin-top: 2px; }
-.meta { font-size: 12px; opacity: .7; }
-a { color: inherit; }
-.note { font-size: 12px; opacity: .75; margin-top: 10px; }
-.none { opacity: .7; }
-li.hit { cursor: pointer; border-radius: 6px; padding: 3px 6px; margin-left: -6px; outline: none; }
-li.hit:hover, li.hit:focus-visible { background: rgba(127,127,127,.15); }
-li.hit .hint { font-size: 11px; opacity: .55; margin-left: 6px; }
-li.hit details.full { margin-top: 4px; }
-li.hit details.full > summary { font-size: 11px; opacity: .65; cursor: pointer; }
-li.hit details.full .quote { margin-top: 4px; opacity: .9; }
-li.hit .jump-status { font-size: 11px; opacity: .65; margin-top: 4px; }
-li.hit .jump-status:empty { display: none; }
-"""
-
-# The card, and the jump it performs.
+# The results block, appended to the message the button was pressed on.
 #
 # Open WebUI renders an HTMLResponse embed in an iframe whose sandbox is
-# "allow-scripts allow-downloads": ``iframeSandboxAllowSameOrigin`` defaults to
-# false in 0.12.4 (checked in the built frontend), so this document has an
-# opaque origin and ``window.parent.document`` throws. Reaching into the chat
-# from here is therefore impossible, and a card that tried it looked inert when
-# a row was clicked.
+# "allow-scripts allow-popups allow-downloads" with
+# ``iframeSandboxAllowSameOrigin`` defaulting to false (read out of the built
+# frontend of 0.12.4). Such a frame has an opaque origin, so it cannot read the
+# chat document, cannot be granted top-level navigation, and the page accepts
+# only three message types from it ("input:prompt", "input:prompt:submit",
+# "action:submit" - Chat.svelte, onMessageHandler). There is therefore no way
+# for a card inside that frame to scroll the chat: any design that tries is
+# dead code that looks alive.
 #
-# The jump goes through the host instead. This document posts
-# {source: 'trick-card', mid, cid} to its parent; the action installs a listener
-# in the page through ``__event_call__`` type 'execute' (the frontend runs that
-# code in the chat document), the listener scrolls to the message and replies
-# with {source: 'trick-host', mid, ok}. No page setting has to be weakened, and
-# the same code works if an admin did turn same-origin on: that case is only a
-# fast path here.
-SCRIPT = """
-<script>
-(function () {
-  var card = document.getElementById('trick-card');
-  if (!card) { return; }
-  var REPLY_WAIT_MS = 900;
-  function report() {
-    try {
-      parent.postMessage({ type: 'iframe:height', height: document.body.scrollHeight }, '*');
-    } catch (error) { /* a host that does not listen is not an error */ }
-  }
-  card.addEventListener('toggle', report);
-  document.addEventListener('keydown', function (event) {
-    if (event.key === 'Escape') { card.open = false; }
-  });
-  window.addEventListener('load', report);
-  report();
-
-  function messageElement(doc, chatId, messageId) {
-    if (!messageId) { return null; }
-    var candidates = [];
-    if (chatId) { candidates.push('message-' + chatId + '-' + messageId); }
-    candidates.push('message-' + messageId);
-    for (var i = 0; i < candidates.length; i++) {
-      var found = doc.getElementById(candidates[i]);
-      if (found) { return found; }
-    }
-    var all = doc.querySelectorAll('[id^="message-"]');
-    for (var j = 0; j < all.length; j++) {
-      var id = all[j].id || '';
-      if (id.slice(-(messageId.length + 1)) === '-' + messageId) { return all[j]; }
-    }
-    return null;
-  }
-  function flash(target) {
-    try {
-      target.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      if (target.animate) {
-        target.animate(
-          [{ backgroundColor: 'rgba(165,165,197,.28)' }, { backgroundColor: 'rgba(165,165,197,0)' }],
-          { duration: 1600 }
-        );
-      }
-      return true;
-    } catch (error) { return false; }
-  }
-  function fail(row, status, messageId) {
-    var full = row.querySelector('details.full');
-    if (full) { full.open = true; }
-    if (status) {
-      status.textContent = messageId
-        ? 'that message is not on screen (a long chat renders only nearby turns); the full passage is open below'
-        : 'this result carries no message id; the passage is shown in full below';
-    }
-    report();
-  }
-  function jump(row) {
-    var messageId = row.getAttribute('data-mid') || '';
-    var chatId = row.getAttribute('data-cid') || '';
-    var status = row.querySelector('.jump-status');
-    if (!messageId) { fail(row, status, messageId); return; }
-
-    // Fast path: when the frame does share the page's origin (standalone use,
-    // or an admin enabled the sandbox flag) the chat document is reachable.
-    var doc = null;
-    try { doc = window.parent.document; } catch (error) { doc = null; }
-    if (doc) {
-      var direct = null;
-      try { direct = messageElement(doc, chatId, messageId); } catch (error) { direct = null; }
-      if (direct && flash(direct)) {
-        if (status) { status.textContent = 'jumped to the message in the chat'; }
-        return;
-      }
-    }
-
-    var settled = false;
-    function settle(text) {
-      settled = true;
-      window.removeEventListener('message', onReply);
-      if (status) { status.textContent = text; }
-    }
-    function onReply(event) {
-      var data = event && event.data;
-      if (!data || data.source !== 'trick-host' || String(data.mid || '') !== messageId) { return; }
-      if (data.ok) { settle('jumped to the message in the chat'); }
-      else { fail(row, status, messageId); }
-    }
-    window.addEventListener('message', onReply);
-    try {
-      window.parent.postMessage({ source: 'trick-card', mid: messageId, cid: chatId }, '*');
-    } catch (error) { fail(row, status, messageId); return; }
-    setTimeout(function () { if (!settled) { fail(row, status, messageId); } }, REPLY_WAIT_MS);
-  }
-  var rows = document.querySelectorAll('li.hit');
-  for (var r = 0; r < rows.length; r++) {
-    rows[r].addEventListener('click', function (event) {
-      if (event.target.closest('details, summary, a, button')) { return; }
-      jump(this);
-    });
-    rows[r].addEventListener('keydown', function (event) {
-      if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); jump(this); }
-    });
-  }
-})();
-</script>
-"""
-
-# Installed in the chat document itself, through __event_call__ type 'execute'.
-# It is the only code that can scroll the page, so it also owns the lookup: the
-# message element id is "message-<chat>-<message>", with "message-<message>" and
-# a suffix match as fallbacks, because virtualised chats and renamed branches
-# have both been seen. The listener is installed once per tab; a second card
-# reuses it. It replies to every request, including a miss, so the card can stop
-# waiting and open the passage instead of staying silent.
-HOST_JS = """
-(function () {
-  try {
-    if (window.__trickJumpInstalled) { return true; }
-    window.__trickJumpInstalled = true;
-    function findMessage(mid, cid) {
-      var el = null;
-      if (cid) { el = document.getElementById('message-' + cid + '-' + mid); }
-      if (!el) { el = document.getElementById('message-' + mid); }
-      if (el) { return el; }
-      var nodes = document.querySelectorAll('[id^="message-"]');
-      for (var i = 0; i < nodes.length; i++) {
-        var id = nodes[i].id || '';
-        if (id === mid || id.slice(-(mid.length + 1)) === '-' + mid) { return nodes[i]; }
-      }
-      return null;
-    }
-    window.addEventListener('message', function (event) {
-      var data = event && event.data;
-      if (!data || data.source !== 'trick-card' || !data.mid) { return; }
-      var mid = String(data.mid);
-      var cid = data.cid ? String(data.cid) : '';
-      var el = null;
-      try { el = findMessage(mid, cid); } catch (error) { el = null; }
-      var ok = false;
-      if (el) {
-        try {
-          el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-          if (el.animate) {
-            el.animate(
-              [{ backgroundColor: 'rgba(165,165,197,.30)' }, { backgroundColor: 'rgba(165,165,197,0)' }],
-              { duration: 1600 }
-            );
-          }
-          ok = true;
-        } catch (error) { ok = false; }
-      }
-      try {
-        if (event.source) { event.source.postMessage({ source: 'trick-host', mid: mid, ok: ok }, '*'); }
-      } catch (error) { /* a closed frame needs no reply */ }
-    }, false);
-    return true;
-  } catch (error) { return false; }
-})()
-"""
-
-# asyncio keeps only a weak reference to a task, so an unreferenced installation
-# task can be collected mid-flight. The set holds them until they finish.
-_JUMP_JOBS: set = set()
+# What does work is the mechanism Open WebUI uses for its own search hits: a
+# link to "?message=<id>" on the chat route, which Chat.svelte turns into
+# ``messagesRef.scrollToMessage(target)``. Markdown written into a message is
+# rendered in the page itself, not in a frame, so those links are ordinary
+# anchors and need no privileges. The action therefore returns the message
+# back with the results appended, and every row is a real link.
+MARKER = "<!-- trick:results -->"
+# The block is rebuilt on every press: everything from MARKER to the end of the
+# message is replaced, so repeated searches do not stack up. The original text
+# above the marker is never touched.
 
 
 class Action:
@@ -381,11 +196,6 @@ class Action:
 
         transcript, dropped = self._transcript(messages)
 
-        # Install the scroll listener in the page before searching, so the card
-        # is usable the moment it renders. This is a second event call, which is
-        # why it starts after the dialog returned: one call in flight at a time.
-        self._install_jump_listener(__event_call__)
-
         payload = {
             "query": query[:2000],
             "limit": max(1, min(int(self.valves.LIMIT), 26)),
@@ -406,14 +216,6 @@ class Action:
             DEGRADED_TEXT.get(str(code), str(code)) for code in (result.get("degraded") or [])
         ]
 
-        blocks: list[tuple[str, str]] = []
-        if origin == "unavailable":
-            blocks.append((self._unread_chat_block(), ""))
-        elif transcript and not chat:
-            blocks.append((self._no_passage_block(query), ""))
-        if chat:
-            blocks.append((self._chat_block(chat, dropped, str(body.get("chat_id") or "")), ""))
-
         # This button is a find for the conversation it sits in. The catalogues
         # are a different product surface (CLI, MCP) and answering a chat
         # question with eight R packages read as noise, so they are off by
@@ -421,58 +223,173 @@ class Action:
         # conversation had nothing, 'always' shows them beside every hit.
         mode = str(self.valves.SOURCES or "never").strip().lower()
         show_rows = bool(rows) and (mode == "always" or (mode == "auto" and not chat))
-        if show_rows:
-            blocks.append((self._rows_block(rows), ""))
-        elif rows:
-            count = len(rows)
-            blocks.append(
-                (
-                    f"<p class='note'>{count} catalogue source"
-                    f"{'s' if count != 1 else ''} matched outside this conversation and "
-                    f"{'is' if count == 1 else 'are'} hidden (SOURCES={html.escape(mode)}). "
-                    "Set the valve to 'always' to list them.</p>",
-                    "",
-                )
-            )
-        if not blocks:
-            blocks.append((f"<p class='none'>Nothing matched <b>{html.escape(query)}</b>.</p>", ""))
-        return self._card(
-            f"Trick: {query}",
-            blocks,
-            degraded,
-            with_rows=show_rows,
-            blend_note=self._score_note(result.get("report") or {}),
+        block = self._results_html(
+            query,
+            chat,
+            rows if show_rows else [],
+            hidden=0 if show_rows else len(rows),
+            sources_mode=mode,
+            # 'weak' is a property of the conversation ranking, so it lives in
+            # chat_report; reading 'report' silently hid the warning.
+            weak=bool((result.get("chat_report") or result.get("report") or {}).get("weak")) and bool(chat),
+            degraded=degraded,
+            transcript=bool(transcript),
+            origin=origin,
+            dropped=dropped,
         )
 
-    # -- host-side jump ----------------------------------------------------
-    @staticmethod
-    def _install_jump_listener(event_call) -> None:
-        """Put the scroll listener into the chat page. Never raises, never blocks.
+        attached = self._attach(body, block)
+        if attached:
+            return attached
+        # No message id (an API call, not a browser): there is nothing to write
+        # the block into, so fall back to the embed.
+        return self._card(f"Trick: {query}", [(block, "")], degraded)
 
-        ``__event_call__`` type 'execute' is the one route that runs code in the
-        chat document (the card's iframe has an opaque origin). The dialog above
-        already returned, so this is the only call in flight. A client that does
-        not answer leaves the card on its fallback, so the result must not wait
-        for it: the task is bounded and its result is discarded.
+    # -- the results block --------------------------------------------------
+    def _results_html(
+        self,
+        query: str,
+        chat: list,
+        catalogue: list,
+        *,
+        hidden: int = 0,
+        sources_mode: str = "never",
+        weak: bool = False,
+        degraded: list | None = None,
+        transcript: bool = False,
+        origin: str = "",
+        dropped: int = 0,
+    ) -> str:
+        """The block written into the message. Raw HTML, so the rows are links.
+
+        Every row links to ``?message=<id>`` on this chat route, which is how
+        Open WebUI reveals a search hit itself (Chat.svelte reads the ``message``
+        query parameter and calls ``scrollToMessage``). A message is rendered in
+        the page, not in a sandboxed frame, so the anchor needs no permission and
+        no script. ``<details>`` makes the block collapsible without any JS.
         """
-        if event_call is None:
-            return
+        parts: list[str] = ["<details open>"]
+        count = len(chat)
+        limit = max(1, int(self.valves.CHAT_RESULTS))
+        shown = min(count, limit)
+        head = f"<b>Trick</b> · {html.escape(query)}"
+        if count:
+            head += f" · {count} passage{'' if count == 1 else 's'} match"
+            if count > shown:
+                # Saying "8 matches" above three rows reads as a bug; say both.
+                head += f", showing the closest {shown}"
+        parts.append(f"<summary>{head}</summary>")
 
-        async def run() -> None:
+        if origin == "unavailable":
+            parts.append(
+                "<p>This conversation could not be read, so only the catalogues were "
+                "searched. Try again, or use <code>trick tui --transcript</code> with an "
+                "exported chat.</p>"
+            )
+        elif transcript and not chat:
+            parts.append(
+                "<p>No passage in this conversation contains the words that distinguish "
+                f"<b>{html.escape(query)}</b>.</p>"
+            )
+        if weak:
+            parts.append(
+                "<p><i>Weak match: no passage carries the distinctive words of this "
+                "question, so these are the closest turns. Check the matched terms "
+                "before trusting a row.</i></p>"
+            )
+        if chat:
+            parts.append("<ol>")
+            for row in chat[:limit]:
+                parts.append(self._row_html(row))
+            parts.append("</ol>")
+            if dropped:
+                parts.append(f"<p><small>The oldest {dropped} turns were not searched.</small></p>")
+        if catalogue:
+            parts.append(self._catalogue_html(catalogue))
+        elif hidden:
+            parts.append(
+                f"<p><small>{hidden} catalogue source{'s' if hidden != 1 else ''} matched "
+                f"outside this conversation and {'are' if hidden != 1 else 'is'} hidden "
+                f"(SOURCES={html.escape(sources_mode)}).</small></p>"
+            )
+        if not chat and not catalogue and origin != "unavailable" and not transcript:
+            parts.append(f"<p>Nothing matched <b>{html.escape(query)}</b>.</p>")
+        note = "; ".join(str(item) for item in (degraded or []) if item)
+        if note:
+            parts.append(f"<p><small>degraded: {html.escape(note)}</small></p>")
+        parts.append("</details>")
+        return "".join(parts)
+
+    def _row_html(self, row: dict) -> str:
+        role = "you" if str(row.get("role")) == "user" else str(row.get("role") or "assistant")
+        label = f"turn {int(row.get('turn') or 0)} · {role}"
+        mid = str(row.get("message_id") or "")
+        head = html.escape(label)
+        if mid:
+            quoted = urllib.parse.quote(mid, safe="")
+            head = f"<a href='?message={quoted}'>{html.escape(label)}</a>"
+        terms = ""
+        matched = [str(term) for term in (row.get("matched") or []) if term]
+        if matched:
+            terms = f" · matched: {html.escape(', '.join(matched))}"
             try:
-                await asyncio.wait_for(
-                    event_call({"type": "execute", "data": {"code": HOST_JS}}),
-                    timeout=8.0,
-                )
-            except Exception:
+                # Coverage is the share of the question's distinctive weight this
+                # passage carries; below the strong threshold the row is the
+                # closest turn, not an answer. Say so on the row itself.
+                if 0.0 < float(row.get("coverage") or 0.0) < 0.5:
+                    terms += " (partial)"
+            except (TypeError, ValueError):
                 pass
+        if self.valves.SHOW_SCORES:
+            try:
+                terms += f" · {float(row.get('final_score') or 0.0):.2f}"
+            except (TypeError, ValueError):
+                pass
+        text = " ".join(str(row.get("text") or "").split())
+        if len(text) > 240:
+            text = text[:237].rstrip() + "..."
+        return f"<li>{head}{terms}<br>{html.escape(text)}</li>"
 
-        try:
-            task = asyncio.create_task(run())
-        except RuntimeError:
-            return
-        _JUMP_JOBS.add(task)
-        task.add_done_callback(_JUMP_JOBS.discard)
+    @staticmethod
+    def _catalogue_html(rows: list) -> str:
+        """Catalogue hits, kept plain: they are a different corpus, not a passage."""
+        items = []
+        for row in rows[:26]:
+            key = str(row.get("key") or row.get("id") or "")
+            source = str(row.get("source") or "")
+            title = str(row.get("title") or "")
+            label = f"{source}/{key}" if source else key
+            try:
+                score = f" · {float(row.get('final_score') or 0.0):.2f}"
+            except (TypeError, ValueError):
+                score = ""
+            summary = " ".join(str(row.get("summary") or "").split())
+            if len(summary) > 160:
+                summary = summary[:157].rstrip() + "..."
+            tail = f"<br>{html.escape(summary)}" if summary else ""
+            items.append(f"<li>{html.escape(label)}{score} — {html.escape(title)}{tail}</li>")
+        return "<p><small>Catalogue sources:</small></p><ul>" + "".join(items) + "</ul>"
+
+    @staticmethod
+    def _attach(body, block: str) -> dict:
+        """Return the message back with the block appended, or {} when it cannot.
+
+        Open WebUI applies ``res.messages`` to the chat and saves it, which is
+        the documented way for an action to update the message it ran on. Only
+        the message the button was pressed on is touched, and only below the
+        marker: a second search replaces the previous block instead of stacking.
+        """
+        mid = str((body or {}).get("id") or "").strip()
+        if not mid:
+            return {}
+        current = ""
+        for item in (body.get("messages") or []):
+            if isinstance(item, dict) and str(item.get("id")) == mid:
+                current = str(item.get("content") or "")
+                break
+        base = current.split(MARKER)[0].rstrip()
+        content = f"{base}\n\n{MARKER}\n{block}" if base else f"{MARKER}\n{block}"
+        return {"messages": [{"id": mid, "content": content}]}
 
     # -- dialog ------------------------------------------------------------
     async def _ask(self, event_call) -> tuple[str | None, bool]:
@@ -501,156 +418,25 @@ class Action:
         return (text or None), False
 
     # -- rendering ---------------------------------------------------------
-    @staticmethod
-    def _score_note(report: dict) -> str:
-        """Describe the printed number out of the answer's own weights.
+    def _card(self, title: str, blocks, degraded: list | None = None) -> "_HTMLResponse":
+        """Fallback embed, used only when the caller sends no message id.
 
-        The service ships ``weights`` with every result, so the card cannot drift
-        from the formula it is explaining. A result from an older bridge that
-        lacks the field still gets an honest sentence, without invented numbers.
+        A browser call writes the results into the message instead (see
+        ``_results_html``): that is where the links work. An API call has no
+        message to write into, so it gets a framed copy. No script, because
+        there is nothing in this frame to click.
         """
-        weights = report.get("weights")
-        text = "The number is a blend of the model probability and the retrieval score; it orders this list only, and is not a confidence. "
-        if isinstance(weights, (list, tuple)) and len(weights) == 2:
-            try:
-                model, retrieval = float(weights[0]), float(weights[1])
-            except (TypeError, ValueError):
-                return text
-            text = (
-                f"The number is {model:.2f} x laya probability + {retrieval:.2f} x retrieval: "
-                "a blend that orders this list, not a confidence, and not comparable between queries. "
-            )
-        return text
-
-    def _card(
-        self,
-        title: str,
-        blocks: list[tuple[str, str]],
-        degraded: list | None = None,
-        with_rows: bool | None = None,
-        blend_note: str = "",
-    ) -> "_HTMLResponse":
-        parts = [
-            "<!DOCTYPE html><html><head><meta charset='utf-8'>",
-            f"<style>{STYLE}</style></head><body>",
-            "<details id='trick-card' open>",
-            "<summary>",
-            f"<span class='title'>{html.escape(title)}</span>",
-            "<span class='x' role='button' aria-label='Close' title='Close (Esc)'>&#215;</span>",
-            "</summary>",
-            "<div id='trick-body'>",
-        ]
-        for block, _ in blocks:
-            parts.append(block)
-        if degraded:
-            note = "; ".join(html.escape(str(item)) for item in degraded if item)
-            if note:
-                parts.append(f"<p class='note'>degraded: {note}</p>")
-        if with_rows:
-            parts.append(
-                "<p class='note'>* re-ordered by laya, - retrieval only. "
-                + (blend_note or "")
-                + "S4/S5 mean a source or the scorer did not answer; the ranking is then "
-                "text-only, not wrong-but-hidden.</p>"
-            )
-        parts.append("</div>")
-        parts.append("</details>")
-        parts.append(SCRIPT)
-        parts.append("</body></html>")
-        return _HTMLResponse(content="".join(parts), headers={"Content-Disposition": "inline"})
-
-    @staticmethod
-    def _unread_chat_block() -> str:
-        return (
-            "<p class='none'>This conversation could not be read, so only the "
-            "catalogues were searched. Send the message again, or use "
-            "<code>trick tui --transcript</code> with the exported chat.</p>"
+        body = "".join(block for block, _ in blocks)
+        note = "; ".join(str(item) for item in (degraded or []) if item)
+        if note:
+            body += f"<p>degraded: {html.escape(note)}</p>"
+        return _HTMLResponse(
+            content=(
+                "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+                f"<title>{html.escape(title)}</title></head><body>{body}</body></html>"
+            ),
+            headers={"Content-Disposition": "inline"},
         )
-
-    @staticmethod
-    def _no_passage_block(query: str) -> str:
-        return (
-            f"<p class='none'>No passage in this conversation contains "
-            f"<b>{html.escape(query)}</b>.</p>"
-        )
-
-    def _chat_block(self, chat: list, dropped: int, chat_id: str = "") -> str:
-        shown = chat[: max(1, int(self.valves.CHAT_RESULTS))]
-        head = f"<h3>Conversation ({len(chat)} match{'es' if len(chat) != 1 else ''}"
-        if dropped:
-            head += f", oldest {dropped} turns not searched"
-        head += ")</h3>"
-        items = []
-        for row in shown:
-            role = "you" if row.get("role") == "user" else str(row.get("role") or "assistant")
-            marker = "*" if row.get("scored_by_laya") else "-"
-            full = " ".join(str(row.get("text") or "").split())
-            text = full
-            if len(text) > 400:
-                text = text[:397].rstrip() + "..."
-            mid = str(row.get("message_id") or "")
-            attrs = ""
-            hint = ""
-            if mid:
-                # Clicking the row jumps to the message in the chat. The ids are
-                # quoted because they are only ever used as attribute values.
-                attrs = (
-                    " class='hit'"
-                    f" data-cid='{html.escape(chat_id, quote=True)}'"
-                    f" data-mid='{html.escape(mid, quote=True)}'"
-                    " tabindex='0' role='link'"
-                    " aria-label='Show this passage in the chat'"
-                )
-                hint = "<span class='hint'>click to show in chat</span>"
-            # Why this row is here: the query terms it actually contains. Without
-            # it a hit that shares one rare word with the question looks random.
-            shared = [str(term) for term in (row.get("matched") or []) if term]
-            if shared:
-                hint += (
-                    "<span class='hint'>matched: "
-                    + html.escape(", ".join(shared[:6]))
-                    + "</span>"
-                )
-            body = (
-                f"<span class='turn'>turn {html.escape(str(row.get('turn', '?')))} - "
-                f"{html.escape(role)} {marker}</span>{hint}"
-                f"<div class='quote'>{html.escape(text)}</div>"
-            )
-            if full != text:
-                body += (
-                    "<details class='full'><summary>full passage</summary>"
-                    f"<div class='quote'>{html.escape(full)}</div></details>"
-                )
-            if mid:
-                body += "<div class='jump-status'></div>"
-            items.append(f"<li{attrs}>{body}</li>")
-        return head + "<ol>" + "".join(items) + "</ol>"
-
-    def _rows_block(self, rows: list) -> str:
-        items = []
-        for row in rows:
-            label = SOURCE_LABELS.get(row.get("source", ""), str(row.get("source", "?")))
-            title = str(row.get("title") or row.get("key") or "").strip()
-            url = str(row.get("url") or "").strip()
-            marker = "*" if row.get("score_label") == "laya" else "-"
-            suffix = ""
-            score = row.get("final_score")
-            if self.valves.SHOW_SCORES and isinstance(score, (int, float)):
-                suffix = f" - {score:.3f}"
-            head = html.escape(title)
-            if url.startswith("http"):
-                head = f"<a href='{html.escape(url, quote=True)}' target='_blank' rel='noopener noreferrer'>{head}</a>"
-            summary = " ".join(str(row.get("summary") or "").split())
-            if len(summary) > 240:
-                summary = summary[:237].rstrip() + "..."
-            items.append(
-                "<li>"
-                f"{head}"
-                f"<div class='meta'>{html.escape(label)} / {html.escape(str(row.get('key', '')))} {marker}{html.escape(suffix)}</div>"
-                + (f"<div class='quote'>{html.escape(summary)}</div>" if summary else "")
-                + "</li>"
-            )
-        return f"<h3>Sources ({len(rows)})</h3><ol>" + "".join(items) + "</ol>"
 
     def _failure_card(self, answer: dict) -> "_HTMLResponse":
         status = answer.get("status")

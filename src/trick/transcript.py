@@ -22,6 +22,7 @@ that long is also the smallest unit worth showing a user.
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 import sqlite3
 import time
@@ -30,6 +31,7 @@ from typing import Iterable, Sequence
 
 from .errors import ContractViolation, ResourceExhausted, ScorerUnavailable, TrickError
 from .quant import SIG_DIM, feature_hash_signature, sig_cosine
+from .stopwords import STOPWORDS
 
 MIN_CHARS = 120
 MAX_CHARS = 600
@@ -55,6 +57,17 @@ PHRASE_BONUS = 1.25
 # twice. Measured on a 30-turn chat: copies of one repeated sentence score
 # 0.944-0.968 against each other, distinct passages 0.08-0.60.
 NEAR_DUP_COSINE = 0.94
+# A question is mostly function words: "i5 en cok problem yasadigimiz yer" is
+# four content terms and three words that occur in every turn. Searching the
+# function words too produced three rows that shared only "en" and "cok", which
+# reads as a wrong answer. These are dropped from the query before it is scored.
+# The list is data and lives in stopwords.py; the language gate exempts that one
+# file because a Turkish stopword list cannot be written without those letters.
+
+# Share of the question's distinctive weight (idf-weighted) that a passage must
+# carry before its row is called a match. "en" and "cok" carry near-zero idf, so
+# a passage that shares only those lands at 0.0 and is dropped, not shown.
+STRONG_COVERAGE = 0.5
 
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?\u2026])\s+|\n{2,}")
 _WHITESPACE = re.compile(r"[ \t\r\f\v]+")
@@ -110,6 +123,9 @@ class ChatRow:
     # problem was and got a turn that only mentions i5"), so every row carries
     # the terms it shares with the query.
     matched: tuple[str, ...] = ()
+    # Share of the question's distinctive weight this passage carries. A row
+    # that shares only function words scores 0.0 and is not shown as a match.
+    coverage: float = 0.0
 
     @property
     def score_label(self) -> str:
@@ -131,6 +147,7 @@ class ChatRow:
             "from_cache": self.from_cache,
             "message_id": self.mid,
             "matched": list(self.matched),
+            "coverage": round(self.coverage, 3),
         }
 
     @classmethod
@@ -148,6 +165,7 @@ class ChatRow:
             scored_by_laya=bool(item.get("scored_by_laya")),
             from_cache=bool(item.get("from_cache")),
             mid=str(item.get("message_id") or ""),
+            coverage=float(item.get("coverage") or 0.0),
             matched=tuple(str(term) for term in (item.get("matched") or ())),
         )
 
@@ -335,7 +353,11 @@ def snippet(text: str, query: str, *, width: int = SNIPPET_CHARS) -> str:
 
 
 def _terms(query: str) -> list[str]:
-    return [term for term in re.split(r"[^\w]+", query.lower()) if len(term) >= 2]
+    return [
+        term
+        for term in re.split(r"[^\w]+", query.lower())
+        if len(term) >= 2 and term not in STOPWORDS
+    ]
 
 
 class TranscriptIndex:
@@ -554,6 +576,8 @@ class ConversationSearch:
 
         model_weight, retrieval_weight = self.weights
         terms = _terms(query)
+        weights = self._coverage_weights(terms, index.chunks)
+        total_weight = sum(weights.values())
         rows: list[ChatRow] = []
         blended: list[tuple[float, ChatRow, Chunk]] = []
         for cid in ordered:
@@ -563,6 +587,11 @@ class ConversationSearch:
             final = retrieval_weight * retrieval
             if probability is not None:
                 final += model_weight * probability
+            lowered = chunk.text.lower()
+            matched = tuple(term for term in terms if term in lowered)
+            coverage = (
+                sum(weights[term] for term in matched) / total_weight if total_weight > 0.0 else 0.0
+            )
             blended.append(
                 (
                     final,
@@ -578,7 +607,8 @@ class ConversationSearch:
                         final_score=final,
                         scored_by_laya=scored,
                         mid=chunk.mid,
-                        matched=tuple(term for term in terms if term in chunk.text.lower())[:6],
+                        matched=matched[:6],
+                        coverage=coverage,
                     ),
                     chunk,
                 )
@@ -600,9 +630,18 @@ class ConversationSearch:
         # sits in the gap. Near-duplicate work is capped by the shortlist (<= 12
         # passages, <= 66 comparisons), so it cannot become a cost.
         collapsed = 0
+        no_term = 0
+        kept_coverage: list[float] = []
         seen: set[str] = set()
         kept_chunks: list[Chunk] = []
         for _, row, chunk in blended:
+            if row.coverage <= 0.0:
+                # The passage shares no distinctive term with the question. It
+                # can still look plausible to the model or the signature cache,
+                # but showing it as a match is what made three unrelated turns
+                # answer "where is the problem". Dropped, and counted.
+                no_term += 1
+                continue
             key = " ".join(row.text.lower().split())
             if key in seen:
                 collapsed += 1
@@ -626,8 +665,10 @@ class ConversationSearch:
                     scored_by_laya=row.scored_by_laya,
                     mid=row.mid,
                     matched=row.matched,
+                    coverage=row.coverage,
                 )
             )
+            kept_coverage.append(row.coverage)
             if len(rows) >= max(1, int(limit)):
                 break
 
@@ -639,11 +680,31 @@ class ConversationSearch:
             "scored_by_laya": scored,
             "gated": gated,
             "collapsed_duplicates": collapsed,
+            "no_shared_term": no_term,
+            "weak": bool(rows) and max(kept_coverage or [0.0]) < STRONG_COVERAGE,
+            "best_coverage": round(max(kept_coverage or [0.0]), 3),
+            "terms": terms,
             "elapsed_ms": round((time.monotonic() - started) * 1000.0, 1),
             "timings": {"bm25_ms": round(bm25_ms, 1), "laya_ms": round(laya_ms, 1)},
             "degraded": sorted(set(degraded)),
         }
         return rows, report
+
+    def _coverage_weights(self, terms: Sequence[str], chunks: Sequence[Chunk]) -> dict[str, float]:
+        """idf per query term, measured on this transcript's own passages.
+
+        A word that occurs in every turn ("en", "cok", "the") says nothing about
+        which turn answers the question, so its weight collapses to ~0 and a
+        passage that shares only such words ends up with zero coverage.
+        """
+        if not terms:
+            return {}
+        total = max(1, len(chunks))
+        weights: dict[str, float] = {}
+        for term in terms:
+            df = sum(1 for chunk in chunks if term in chunk.text.lower())
+            weights[term] = math.log(1.0 + total / (1.0 + df))
+        return weights
 
     def _gate_closed(self, scores: dict[int, float]) -> bool:
         if self.gate_margin <= 0.0 or len(scores) < 2:

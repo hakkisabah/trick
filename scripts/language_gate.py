@@ -16,6 +16,11 @@ TR_TO = "cgiosuCGIOSU"
 TABLE = str.maketrans(TR_FROM, TR_TO)
 SKIP_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".woff", ".woff2"}
 SKIP_NAMES = {".git"}
+# One file is data rather than prose: a Turkish stopword list cannot be written
+# without the letters this gate exists to forbid. Exempting the path (not the
+# content type) keeps the exception narrow - any other file that grows a Turkish
+# line still fails the gate.
+SKIP_PATHS = {Path("src/trick/stopwords.py")}
 
 
 def tracked_files() -> list[Path]:
@@ -36,6 +41,8 @@ def main() -> int:
         if path.suffix.lower() in SKIP_SUFFIXES:
             continue
         if any(part in SKIP_NAMES for part in path.parts):
+            continue
+        if path in SKIP_PATHS:
             continue
         try:
             text = path.read_text(encoding="utf-8")
