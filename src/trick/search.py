@@ -382,7 +382,12 @@ class SearchEngine:
                     query=query,
                     rows=rows,
                     degraded=list(cached.get("degraded") or []),
-                    report={"cached": True, "elapsed_ms": 0.0},
+                    report={
+                        "cached": True,
+                        "elapsed_ms": 0.0,
+                        "weights": list(self.weights),
+                        "blend_mode": self.blend_mode,
+                    },
                     chat=[
                         ChatRow.from_dict(i + 1, item)
                         for i, item in enumerate(cached.get("chat") or [])
@@ -509,6 +514,10 @@ class SearchEngine:
                 "scored_by_laya": scored,
                 "gated": gated,
                 "scorer": getattr(self.scorer, "name", "unknown"),
+                # Shipped with every answer so a client can describe the number it
+                # prints instead of hard-coding a formula that drifts.
+                "weights": list(self.weights),
+                "blend_mode": self.blend_mode,
                 "stats": _stats(self.scorer),
             },
             chat=chat_rows,

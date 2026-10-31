@@ -133,10 +133,11 @@ class Action:
         LIMIT: int = Field(default=8, description="How many catalogue sources to show (1-26).")
         LIVE: bool = Field(default=True, description="Query the live source APIs as well.")
         SOURCES: str = Field(
-            default="auto",
+            default="always",
             description=(
-                "When to list catalogue sources beside the conversation hits: "
-                "'auto' (only when the conversation had no match), 'always', or 'never'."
+                "When to list catalogue sources beside the conversation hits. "
+                "'always' (default) lists every match; 'auto' is the optional quiet mode, "
+                "listing them only when the conversation had no match; 'never' hides them."
             ),
         )
         SEARCH_CHAT: bool = Field(
@@ -246,14 +247,14 @@ class Action:
             blocks.append((self._chat_block(chat, dropped), ""))
 
         # A find in a long conversation must not bury the answer under eight
-        # near-random catalogue rows: when the conversation answered, the
-        # sources are suppressed unless the reader asked for them. When it did
-        # not answer, they are the useful next step and are shown.
-        mode = str(self.valves.SOURCES or "auto").strip().lower()
+        # near-random catalogue rows, but that judgement is the reader's: the
+        # default lists both blocks, and 'auto' is the optional quiet mode that
+        # hides the sources once the conversation answered.
+        mode = str(self.valves.SOURCES or "always").strip().lower()
         show_rows = bool(rows) and (mode == "always" or (mode == "auto" and not chat))
         if show_rows:
             blocks.append((self._rows_block(rows), ""))
-        elif rows and chat:
+        elif rows and chat and mode == "auto":
             blocks.append(
                 (
                     f"<p class='note'>{len(rows)} catalogue sources matched too; "
@@ -263,7 +264,13 @@ class Action:
             )
         if not blocks:
             blocks.append((f"<p class='none'>Nothing matched <b>{html.escape(query)}</b>.</p>", ""))
-        return self._card(f"Trick: {query}", blocks, degraded, with_rows=show_rows)
+        return self._card(
+            f"Trick: {query}",
+            blocks,
+            degraded,
+            with_rows=show_rows,
+            blend_note=self._score_note(result.get("report") or {}),
+        )
 
     # -- dialog ------------------------------------------------------------
     async def _ask(self, event_call) -> tuple[str | None, bool]:
@@ -292,12 +299,34 @@ class Action:
         return (text or None), False
 
     # -- rendering ---------------------------------------------------------
+    @staticmethod
+    def _score_note(report: dict) -> str:
+        """Describe the printed number out of the answer's own weights.
+
+        The service ships ``weights`` with every result, so the card cannot drift
+        from the formula it is explaining. A result from an older bridge that
+        lacks the field still gets an honest sentence, without invented numbers.
+        """
+        weights = report.get("weights")
+        text = "The number is a blend of the model probability and the retrieval score; it orders this list only, and is not a confidence. "
+        if isinstance(weights, (list, tuple)) and len(weights) == 2:
+            try:
+                model, retrieval = float(weights[0]), float(weights[1])
+            except (TypeError, ValueError):
+                return text
+            text = (
+                f"The number is {model:.2f} x laya probability + {retrieval:.2f} x retrieval: "
+                "a blend that orders this list, not a confidence, and not comparable between queries. "
+            )
+        return text
+
     def _card(
         self,
         title: str,
         blocks: list[tuple[str, str]],
         degraded: list | None = None,
         with_rows: bool | None = None,
+        blend_note: str = "",
     ) -> "_HTMLResponse":
         parts = [
             "<!DOCTYPE html><html><head><meta charset='utf-8'>",
@@ -318,7 +347,8 @@ class Action:
         if with_rows:
             parts.append(
                 "<p class='note'>* re-ordered by laya, - retrieval only. "
-                "S4/S5 mean a source or the scorer did not answer; the ranking is then "
+                + (blend_note or "")
+                + "S4/S5 mean a source or the scorer did not answer; the ranking is then "
                 "text-only, not wrong-but-hidden.</p>"
             )
         parts.append("</div>")

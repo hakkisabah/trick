@@ -175,6 +175,20 @@ def main() -> int:
     else:
         print(f"next: paste the contents of {token_path} into the action's TRICK_TOKEN valve")
 
+    # Valves are stored in Open WebUI's database, so a value written by an older
+    # release outlives the code that defaulted it. Report what is actually stored
+    # instead of assuming the new default took effect.
+    status, valves = request(f"{base}/api/v1/functions/id/{FUNCTION_ID}/valves", key)
+    if status == 200 and isinstance(valves, dict):
+        sources = str(valves.get("SOURCES") or "always")
+        print(f"SOURCES valve: {sources}")
+        if sources.strip().lower() == "auto":
+            print(
+                "  note: 'auto' is the optional quiet mode (sources hidden when the chat "
+                "matched). Set SOURCES to 'always' in Admin Settings -> Functions -> Trick "
+                "to list them beside the conversation hits."
+            )
+
     print("done: open a chat, press the Trick button under any answer, type what you are looking for")
     return 0
 

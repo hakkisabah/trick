@@ -61,6 +61,7 @@ RESULT = {
             {"turn": 3, "role": "assistant", "text": "we settled on 0.15", "scored_by_laya": False}
         ],
         "degraded": [],
+        "report": {"weights": [0.2, 0.8], "blend_mode": "fused"},
     },
 }
 
@@ -134,13 +135,59 @@ def test_dispatches_with_body_only(monkeypatch):
     assert posted[0]["scope"] == "both"
     assert posted[0]["messages"][0]["role"] == "user"
     card = html_of(response)
-    # The conversation answered, so the catalogue rows are suppressed: burying
-    # the passage under unrelated sources is the bug this locks down.
+    # Default ('always'): the passage and the sources are both listed. Which of
+    # the two matters is the reader's call, so the card does not hide one.
     assert "we settled on 0.15" in card
     assert "turn 3" in card
+    assert "DESeq2" in card
+    assert "0.20 x laya probability + 0.80 x retrieval" in card
+    assert response.headers.get("Content-Disposition") == "inline"
+
+
+def test_auto_quiet_mode_hides_sources_once_the_chat_answered(monkeypatch):
+    """'auto' is the optional mode, not the default: it must stay reachable."""
+    module = load_module()
+    monkeypatch.setattr(module.Action, "_post", lambda self, payload: RESULT)
+    original = module.Action.__init__
+
+    def init(self):
+        original(self)
+        self.valves.SOURCES = "auto"
+
+    monkeypatch.setattr(module.Action, "__init__", init)
+    body = {"id": "m1", "messages": [{"role": "user", "content": "differential expression"}]}
+
+    card = html_of(asyncio.run(dispatch_like_open_webui(module, body)))
+
+    assert "we settled on 0.15" in card
     assert "DESeq2" not in card
     assert "catalogue sources matched too" in card
-    assert response.headers.get("Content-Disposition") == "inline"
+
+
+def test_never_quiet_mode_hides_sources_without_nagging(monkeypatch):
+    module = load_module()
+    monkeypatch.setattr(module.Action, "_post", lambda self, payload: RESULT)
+    original = module.Action.__init__
+
+    def init(self):
+        original(self)
+        self.valves.SOURCES = "never"
+
+    monkeypatch.setattr(module.Action, "__init__", init)
+    body = {"id": "m1", "messages": [{"role": "user", "content": "differential expression"}]}
+
+    card = html_of(asyncio.run(dispatch_like_open_webui(module, body)))
+
+    assert "DESeq2" not in card
+    assert "catalogue sources matched too" not in card
+
+
+def test_score_note_omits_numbers_when_the_answer_has_no_weights():
+    """An older bridge must not make the card print an invented formula."""
+    module = load_module()
+    note = module.Action._score_note({})
+    assert "0.20" not in note
+    assert "not a confidence" in note
 
 
 def test_rows_are_listed_when_the_valve_asks_for_them(monkeypatch):
