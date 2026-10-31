@@ -202,12 +202,17 @@ def test_the_buried_passage_reaches_rank_one_with_turn_and_offsets() -> None:
     search = ConversationSearch(scorer, gate_margin=0.0)
     rows, report = search.search("spatial join reproject layers", long_chat(), limit=5)
     assert rows
+    # Exactly one passage shares a query term with the query now that hash-only
+    # candidates are gone, so there is nothing for the model to break a tie on:
+    # it must not be called, and the row says so instead of faking a score.
+    assert len(rows) == 1
     assert rows[0].turn == 6
     assert "EPSG:3857" in rows[0].text
-    assert rows[0].scored_by_laya is True
+    assert rows[0].scored_by_laya is False
+    assert report["scored_by_laya"] is False
+    assert scorer.calls == []
     assert rows[0].char_end > rows[0].char_start
-    assert report["scored_by_laya"] is True
-    assert scorer.calls and len(scorer.calls[0]) <= 12
+    assert rows[0].retrieval_score > 0.0
     # The reported score is the documented blend, not an unexplained number.
     model_weight, retrieval_weight = search.weights
     if rows[0].laya_probability is not None:
@@ -264,7 +269,9 @@ def test_the_shortlist_never_exceeds_the_choice_contract() -> None:
 def test_a_clear_retrieval_winner_skips_the_model_call() -> None:
     scorer = ScriptedScorer()
     search = ConversationSearch(scorer, gate_margin=0.15)
-    _rows, report = search.search("EPSG:3857 reproject", long_chat(), limit=5)
+    # One term from another passage (dispersion) gives two candidates, so the
+    # margin rule is what skips the model - not the single-candidate shortcut.
+    _rows, report = search.search("EPSG:3857 reproject layers dispersion", long_chat(), limit=5)
     assert report["gated"] is True
     assert scorer.calls == []
 
@@ -272,7 +279,7 @@ def test_a_clear_retrieval_winner_skips_the_model_call() -> None:
 def test_scorer_failure_degrades_to_retrieval_only_with_s5() -> None:
     scorer = ScriptedScorer(error=ScorerUnavailable("laya is down"))
     search = ConversationSearch(scorer, gate_margin=0.0)
-    rows, report = search.search("spatial join reproject layers", long_chat(), limit=5)
+    rows, report = search.search("dispersion normalization library", long_chat(), limit=5)
     assert rows
     assert rows[0].scored_by_laya is False
     assert report["degraded"] == ["S5"]
@@ -524,3 +531,18 @@ def test_tuning_a_ranking_constant_invalidates_the_decision_cache(tmp_path: Path
     assert second.report.get("cached") is True
     assert tuned.pipeline_key != fresh.pipeline_key
     assert third.report.get("cached") is not True
+
+
+def test_a_hash_only_candidate_is_not_a_match(monkeypatch) -> None:
+    """The bug a reader reported: "find this phrase" returned a turn about
+    something else. A 16-byte signature cosine can pass 0.25 on unrelated text,
+    so a signature hit now needs a shared query term as well."""
+    index = TranscriptIndex(long_chat())
+    # Force the signature channel to claim a perfect match; without the lexical
+    # gate every passage would become a candidate.
+    monkeypatch.setattr("trick.transcript.sig_cosine", lambda *_args, **_kwargs: 0.99)
+    assert index.candidates("xgboost forecasting quantile") == {}
+
+    # The same forced signature, with one real term, still contributes.
+    hits = index.candidates("dispersion")
+    assert hits, "lexical hits must survive the gate"

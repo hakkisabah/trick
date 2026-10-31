@@ -375,13 +375,25 @@ class TranscriptIndex:
         return scored
 
     def candidates(self, query: str, *, limit: int = PREFILTER) -> dict[int, float]:
-        """Union of BM25 hits and signature hits, with the phrase bonus applied."""
+        """Union of BM25 hits and signature hits, with the phrase bonus applied.
+
+        A signature hit must also share a query term with the passage. The
+        signature is 16 bytes of feature hash: on a long conversation its cosine
+        reaches 0.25 for passages about something else entirely, and those pure
+        hash hits were exactly the irrelevant matches a reader reported ("find
+        the phrase" returning a turn about anything). The signature still breaks
+        ties among lexically plausible passages, which is what it is for.
+        """
+        terms = _terms(query)
+        lexical = [
+            chunk for chunk in self.chunks if any(term in chunk.text.lower() for term in terms)
+        ]
         scores: dict[int, float] = {}
         for chunk_id, score in self.bm25(query, limit=limit):
             scores[chunk_id] = max(scores.get(chunk_id, 0.0), score)
-        if self.chunks:
+        if lexical and terms:
             query_sig = feature_hash_signature(query)
-            for chunk in self.chunks:
+            for chunk in lexical:
                 cosine = sig_cosine(query_sig, chunk.signature)
                 if cosine > 0.25:
                     scores.setdefault(chunk.chunk_id, cosine)
