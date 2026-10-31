@@ -116,7 +116,7 @@ def test_empty_and_whitespace_messages_produce_no_chunks() -> None:
 def test_turn_numbers_survive_chunking() -> None:
     messages = long_chat(6)
     chunks = chunk_messages(messages)
-    assert {chunk.turn for chunk in chunks} == {0, 1, 2, 3, 4, 5}
+    assert {chunk.turn for chunk in chunks} == {1, 2, 3, 4, 5, 6}
 
 
 # ---------------------------------------------------------------------------
@@ -178,7 +178,7 @@ def test_index_finds_the_one_passage_that_mentions_the_term() -> None:
     assert hits
     best = max(hits, key=lambda item: item[1])[0]
     chunk = next(chunk for chunk in index.chunks if chunk.chunk_id == best)
-    assert chunk.turn == 5
+    assert chunk.turn == 6
     assert "EPSG:3857" in chunk.text
 
 
@@ -202,7 +202,7 @@ def test_the_buried_passage_reaches_rank_one_with_turn_and_offsets() -> None:
     search = ConversationSearch(scorer, gate_margin=0.0)
     rows, report = search.search("spatial join reproject layers", long_chat(), limit=5)
     assert rows
-    assert rows[0].turn == 5
+    assert rows[0].turn == 6
     assert "EPSG:3857" in rows[0].text
     assert rows[0].scored_by_laya is True
     assert rows[0].char_end > rows[0].char_start
@@ -242,7 +242,7 @@ def test_the_model_breaks_a_retrieval_tie() -> None:
     decided = ConversationSearch(ScriptedScorer(marker="polygon layer!"), gate_margin=0.0)
     rows, report = decided.search(query, tie_chat(), limit=4)
     assert report["scored_by_laya"] is True
-    assert rows[0].turn == 9
+    assert rows[0].turn == 10
 
     undecided = ConversationSearch(ScriptedScorer(error=ScorerUnavailable("down")), gate_margin=0.0)
     plain, _ = undecided.search(query, tie_chat(), limit=4)
@@ -250,7 +250,7 @@ def test_the_model_breaks_a_retrieval_tie() -> None:
     assert sorted(round(row.retrieval_score, 6) for row in plain) == sorted(
         round(row.retrieval_score, 6) for row in rows
     )
-    assert plain[0].turn == 4
+    assert plain[0].turn == 5
     assert plain[0].final_score == pytest.approx(plain[1].final_score, rel=1e-9)
 
 
@@ -347,11 +347,11 @@ def test_engine_returns_both_blocks_when_a_transcript_is_sent(tmp_path: Path) ->
     finally:
         engine.store.close()
     assert outcome.scope == "both"
-    assert outcome.chat and outcome.chat[0].turn == 5
+    assert outcome.chat and outcome.chat[0].turn == 6
     assert outcome.rows and outcome.rows[0].key == "sf"
     assert outcome.ok is True
     payload = outcome.as_dict()
-    assert payload["chat"][0]["turn"] == 5
+    assert payload["chat"][0]["turn"] == 6
     assert payload["scope"] == "both"
 
 
@@ -413,7 +413,7 @@ def test_a_long_chat_is_windowed_and_says_so(tmp_path: Path) -> None:
         engine.store.close()
     assert outcome.chat_report["dropped_turns"] == 24
     # The passage at turn 5 is outside the window, so it must not be found.
-    assert all(row.turn >= 24 for row in outcome.chat)
+    assert all(row.turn >= 25 for row in outcome.chat)
 
 
 def test_the_cache_never_crosses_two_conversations(tmp_path: Path) -> None:
@@ -426,9 +426,9 @@ def test_the_cache_never_crosses_two_conversations(tmp_path: Path) -> None:
         three = engine.search("spatial join", messages=first)
     finally:
         engine.store.close()
-    assert one.chat and one.chat[0].turn == 5
+    assert one.chat and one.chat[0].turn == 6
     assert two.chat == []
-    assert three.chat and three.chat[0].turn == 5
+    assert three.chat and three.chat[0].turn == 6
     assert three.report.get("cached") is True
 
 
@@ -459,11 +459,11 @@ def test_renderer_shows_the_conversation_block_before_the_sources(tmp_path: Path
         engine.store.close()
     text = render_outcome(outcome, verbose=True)
     assert "conversation:" in text
-    assert "turn 5" in text
+    assert "turn 6" in text
     assert text.index("conversation:") < text.index("sf: Simple Features")
     compact = render_compact(outcome)
     assert "conversation matches" in compact
-    assert "turn 5" in compact
+    assert "turn 6" in compact
 
 
 def test_renderer_says_no_sources_when_only_the_chat_matched(tmp_path: Path) -> None:

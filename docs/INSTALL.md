@@ -402,6 +402,7 @@ you press the button; that is why it comes second.
 | `TRICK_TOKEN` | contents of `$HOME/.local/share/trick/bridge.token` | written by the installer; no quotes |
 | `LIMIT` | `8` | 1-26 |
 | `LIVE` | `true` | `false` = local catalogue only |
+| `SOURCES` | `auto` | `auto` = list catalogue sources only when the conversation had no match; `always`; `never` |
 | `TIMEOUT_S` | `25` | raise only on a slow network |
 | `SHOW_SCORES` | `true` | blended score per row |
 | `SEARCH_CHAT` | `true` | also search inside the conversation |
@@ -413,10 +414,14 @@ you press the button; that is why it comes second.
 Verify end to end: open a chat that has a few turns, press the Trick button (the
 magnifier) under any answer, type `differential expression for RNA-seq counts`,
 press Enter. Expected: a card in about 1-2 s with a `Conversation` block (turn
-number, role, quoted passage) when the chat mentions the subject, then a `Sources`
-block with R/Bioconductor packages, `source`/`key`, a blended score, `*` for
-laya-scored rows and `-` for retrieval-only rows. Closing the dialog without typing
-searches nothing.
+number, role, quoted passage) when the chat mentions the subject. With `SOURCES`
+at its `auto` default the catalogue rows stay hidden behind one line
+(`N catalogue sources matched too`) so the passage is not buried; set the valve
+to `always` to see them. When the conversation has no match, the card says so and
+lists the sources with `source`/`key`, a blended score, `*` for laya-scored rows
+and `-` for retrieval-only rows. The card closes from the `x` in its header or on
+Escape, and reopens from the same line - it needs no script to do that. Closing
+the input dialog without typing searches nothing.
 
 Failure text is intentional and names the fix:
 

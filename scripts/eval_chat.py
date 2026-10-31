@@ -166,8 +166,10 @@ def run(scorer, *, weights, gate: float, label: str) -> dict:
         elapsed.append((time.monotonic() - started) * 1000.0)
         if report.get("scored_by_laya"):
             laya_calls += 1
-        ranks.append(next((row.rank for row in rows if row.turn == planted[slot]), None))
-        if rows and rows[0].turn in decoys:
+        # Turn numbers are 1-based on the wire; the planter below counts list
+        # indexes, so the comparison subtracts one instead of renumbering both.
+        ranks.append(next((row.rank for row in rows if row.turn - 1 == planted[slot]), None))
+        if rows and rows[0].turn - 1 in decoys:
             decoy_top += 1
     hits = sum(1 for rank in ranks if rank is not None and rank <= 3)
     reciprocal = [0.0 if rank is None else 1.0 / rank for rank in ranks]

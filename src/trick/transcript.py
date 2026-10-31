@@ -225,43 +225,45 @@ def split_message(message: Message, *, turn: int, next_id: int) -> list[Chunk]:
     if not pieces:
         pieces = [(0, len(text))]
 
-    chunks: list[Chunk] = []
     start: int | None = None
     end = 0
+    spans: list[tuple[int, int]] = []
     for piece_start, piece_end in pieces:
         if start is None:
             start = piece_start
         end = piece_end
         if end - start < MIN_CHARS:
             continue
-        chunks.append(_make_chunk(next_id + len(chunks), turn, message.role, text, start, end))
+        spans.append((start, end))
         start = None
     if start is not None:
-        chunks.append(_make_chunk(next_id + len(chunks), turn, message.role, text, start, end))
+        spans.append((start, end))
 
     # A single sentence longer than MAX_CHARS is split on word boundaries so the
-    # choice question never receives a candidate it cannot fit.
-    out: list[Chunk] = []
-    for chunk in chunks:
-        if len(chunk.text) <= MAX_CHARS:
-            out.append(chunk)
-            continue
-        offset = chunk.char_start
+    # choice question never receives a candidate it cannot fit. Both passes feed
+    # one counter: reusing ``next_id`` here collided with the ids the first pass
+    # had already handed out, and a duplicate rowid made the whole transcript
+    # index fail to build ("constraint failed") on any chat with a long message.
+    ordered: list[tuple[int, int]] = []
+    for span_start, span_end in spans:
         # Raw text again: the offsets reported to a UI must index the original
         # message, not the whitespace-collapsed copy that is indexed.
-        body = text[offset : chunk.char_end]
+        offset = span_start
+        body = text[offset:span_end]
         while body:
             if len(body) <= MAX_CHARS:
-                out.append(
-                    _make_chunk(next_id + len(out), turn, message.role, text, offset, offset + len(body))
-                )
+                ordered.append((offset, offset + len(body)))
                 break
             cut = body.rfind(" ", 0, MAX_CHARS)
             cut = MAX_CHARS if cut <= 0 else cut
-            out.append(_make_chunk(next_id + len(out), turn, message.role, text, offset, offset + cut))
+            ordered.append((offset, offset + cut))
             offset += cut
-            body = text[offset : chunk.char_end]
-    return out
+            body = text[offset:span_end]
+
+    return [
+        _make_chunk(next_id + position, turn, message.role, text, start_at, end_at)
+        for position, (start_at, end_at) in enumerate(ordered)
+    ]
 
 
 def _make_chunk(chunk_id: int, turn: int, role: str, text: str, start: int, end: int) -> Chunk:
@@ -279,7 +281,9 @@ def _make_chunk(chunk_id: int, turn: int, role: str, text: str, start: int, end:
 
 def chunk_messages(messages: Sequence[Message]) -> list[Chunk]:
     chunks: list[Chunk] = []
-    for turn, message in enumerate(messages):
+    # Turns are numbered from 1: the number is shown to a reader ("turn 24"),
+    # and a first message labelled "turn 0" reads like a missing value.
+    for turn, message in enumerate(messages, start=1):
         chunks.extend(split_message(message, turn=turn, next_id=len(chunks)))
     return [chunk for chunk in chunks if chunk.text]
 
@@ -332,7 +336,13 @@ class TranscriptIndex:
             )
         except sqlite3.Error as exc:
             conn.close()
-            raise ResourceExhausted(f"cannot build the transcript index: {exc}") from exc
+            ids = [chunk.chunk_id for chunk in self.chunks]
+            duplicates = len(ids) - len(set(ids))
+            raise ResourceExhausted(
+                f"cannot build the transcript index: {exc} "
+                f"(chunks={len(ids)} duplicate_ids={duplicates} "
+                f"first={ids[:3]} last={ids[-3:]})"
+            ) from exc
         self._conn = conn
 
     def close(self) -> None:

@@ -57,7 +57,7 @@ DEFAULT_SHORTLIST = 12
 # folded into the key automatically (see ``_pipeline_digest``), so tuning one of
 # them already invalidates the cache; this number is for algorithm changes that
 # keep the constants identical.
-CACHE_VERSION = 3
+CACHE_VERSION = 4
 DEFAULT_PREFILTER = 200
 # Model vs retrieval weight. Was 0.3/0.7 in phase 2; a sweep with the live model
 # over both gold sets moved it to 0.2/0.8 (canonical nDCG@10 0.797 -> 0.803,
@@ -329,6 +329,7 @@ class SearchEngine:
 
         chat_rows: list[ChatRow] = []
         chat_report: dict = {}
+        chat_failed = False
         if transcript:
             stage = time.monotonic()
             try:
@@ -336,6 +337,7 @@ class SearchEngine:
                     query, transcript, limit=max(1, min(int(limit), 8))
                 )
             except TrickError as exc:
+                chat_failed = True
                 degraded.append(exc.s_code)
                 chat_report = {"reason": f"{exc.s_code}: {exc}"}
             timings["chat_ms"] = (time.monotonic() - stage) * 1000.0
@@ -366,7 +368,15 @@ class SearchEngine:
 
         if self.use_cache:
             cached = self.store.cache_get(query, self.scorer.name, extra=cache_extra)
-            if cached and isinstance(cached.get("rows"), list):
+            # A cached payload whose chat stage failed is not an answer: it
+            # replays one old failure forever, and the reader sees a permanent
+            # "cannot search the conversation" for a chat that is fine. Errors
+            # are never cached (see the write below) and never trusted here.
+            # Only an S-code is an error; "no lexical match" is a real empty
+            # result and stays cacheable.
+            reason = str((cached or {}).get("chat_report", {}).get("reason") or "")
+            stale_chat = bool(transcript) and reason[:1] == "S"
+            if cached and isinstance(cached.get("rows"), list) and not stale_chat:
                 rows = [_row_from_cache(i + 1, item) for i, item in enumerate(cached["rows"][:limit])]
                 return SearchOutcome(
                     query=query,
@@ -464,7 +474,10 @@ class SearchEngine:
         # Stage 6: blend and order.
         rows = self._blend(ordered_ids, docs, text_scores, cut_scores, probabilities, scored, limit)
         cache_written = None
-        if self.use_cache and rows:
+        # A failed chat stage is not cached at all: the payload would carry the
+        # S-code in ``degraded`` and replay one transient error (a bad chunk, a
+        # memory spike, a lock) for that query in that conversation forever.
+        if self.use_cache and rows and not chat_failed:
             cache_written = self.store.cache_put(
                 query,
                 self.scorer.name,
@@ -473,6 +486,7 @@ class SearchEngine:
                     "degraded": sorted(set(degraded)),
                     "chat": [row.as_dict() for row in chat_rows],
                     "chat_report": chat_report,
+                    "chat_failed": False,
                 },
                 extra=cache_extra,
             )

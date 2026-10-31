@@ -134,9 +134,43 @@ def test_dispatches_with_body_only(monkeypatch):
     assert posted[0]["scope"] == "both"
     assert posted[0]["messages"][0]["role"] == "user"
     card = html_of(response)
-    assert "DESeq2" in card
+    # The conversation answered, so the catalogue rows are suppressed: burying
+    # the passage under unrelated sources is the bug this locks down.
+    assert "we settled on 0.15" in card
     assert "turn 3" in card
+    assert "DESeq2" not in card
+    assert "catalogue sources matched too" in card
     assert response.headers.get("Content-Disposition") == "inline"
+
+
+def test_rows_are_listed_when_the_valve_asks_for_them(monkeypatch):
+    module = load_module()
+    monkeypatch.setattr(module.Action, "_post", lambda self, payload: RESULT)
+    original = module.Action.__init__
+
+    def init(self):
+        original(self)
+        self.valves.SOURCES = "always"
+
+    monkeypatch.setattr(module.Action, "__init__", init)
+    body = {"id": "m1", "messages": [{"role": "user", "content": "differential expression"}]}
+
+    card = html_of(asyncio.run(dispatch_like_open_webui(module, body)))
+
+    assert "DESeq2" in card
+    assert "we settled on 0.15" in card
+
+
+def test_sources_are_shown_when_the_conversation_has_no_match(monkeypatch):
+    module = load_module()
+    empty_chat = {"ok": True, "result": {**RESULT["result"], "chat": []}}
+    monkeypatch.setattr(module.Action, "_post", lambda self, payload: empty_chat)
+    body = {"id": "m1", "messages": [{"role": "user", "content": "differential expression"}]}
+
+    card = html_of(asyncio.run(dispatch_like_open_webui(module, body)))
+
+    assert "DESeq2" in card
+    assert "no passage in this conversation contains" in card.lower()
 
 
 def test_input_dialog_is_used_when_available(monkeypatch):
@@ -206,8 +240,11 @@ def test_chat_text_is_escaped(monkeypatch):
 
     card = html_of(asyncio.run(dispatch_like_open_webui(module, body)))
 
-    assert "<script>" not in card
-    assert "&lt;script&gt;" in card
+    # The only script in the card is the fixed one in SCRIPT; reader text and
+    # result text must arrive escaped, never as markup.
+    assert card.count("<script>") == module.SCRIPT.count("<script>") == 1
+    assert "<script>alert(1)" not in card
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in card
 
 
 def test_bridge_failure_explains_the_fix(monkeypatch):
@@ -246,3 +283,101 @@ def test_is_an_action_not_a_model():
     assert not hasattr(module, "Pipe"), "an Action file must not define Pipe"
     assert hasattr(module.Action, "action")
     assert not hasattr(module.Action, "pipes")
+
+
+# -- the conversation really has to come from the chat --------------------
+#
+# Open WebUI 0.12.4 sends the message object as ``body``: ``id``, ``chat_id``,
+# ``model`` - and no ``messages`` array. A tool that reads only ``body["messages"]``
+# answers with catalogue hits and nothing from the chat, which is the bug a
+# reader hit: "en buyuk hata nerede yapildi" returned Crossref rows.
+
+
+def test_chat_id_without_messages_reads_the_stored_chat(monkeypatch):
+    module = load_module()
+    posted: list[dict] = []
+    monkeypatch.setattr(module.Action, "_post", lambda self, payload: posted.append(payload) or RESULT)
+
+    async def fake_storage(self, chat_id, message_id):
+        assert chat_id == "c-1"
+        assert message_id == "m-9"
+        return [
+            {"role": "user", "content": "the taper looked wrong"},
+            {"role": "assistant", "content": "the biggest mistake was the threshold"},
+        ]
+
+    monkeypatch.setattr(module.Action, "_from_storage", fake_storage)
+    body = {"id": "m-9", "chat_id": "c-1", "session_id": "s", "model": "llama"}
+
+    card = html_of(asyncio.run(dispatch_like_open_webui(module, body)))
+
+    assert posted[0]["scope"] == "both"
+    assert [m["content"] for m in posted[0]["messages"]][-1].startswith("the biggest mistake")
+    assert "Conversation (1 match" in card
+
+
+def test_unread_chat_is_stated_not_silently_skipped(monkeypatch):
+    module = load_module()
+    monkeypatch.setattr(module.Action, "_post", lambda self, payload: RESULT)
+
+    async def empty_storage(self, chat_id, message_id):
+        return []
+
+    monkeypatch.setattr(module.Action, "_from_storage", empty_storage)
+    body = {"id": "m-9", "chat_id": "c-1", "model": "llama"}
+
+    card = html_of(
+        asyncio.run(dispatch_like_open_webui(module, body, __event_call__=Recorder("hata")))
+    )
+
+    assert "could not be read" in card
+
+
+def test_branch_walk_follows_parent_ids():
+    """An edited chat is a tree; search must stay on the branch on screen."""
+    module = load_module()
+    chat = {
+        "history": {
+            "currentId": "c",
+            "messages": {
+                "a": {"id": "a", "parentId": None, "role": "user", "content": "root"},
+                "b": {"id": "b", "parentId": "a", "role": "assistant", "content": "old edit"},
+                "c": {"id": "c", "parentId": "a", "role": "assistant", "content": "on screen"},
+            },
+        }
+    }
+
+    ordered = module.Action._order(chat, "")
+
+    assert [m["content"] for m in ordered] == ["root", "on screen"]
+
+
+def test_no_passage_note_when_the_chat_has_no_hit(monkeypatch):
+    module = load_module()
+    payload = json.loads(json.dumps(RESULT))
+    payload["result"]["chat"] = []
+    monkeypatch.setattr(module.Action, "_post", lambda self, p: payload)
+    body = {"id": "m1", "messages": [{"role": "user", "content": "unrelated text"}]}
+
+    card = html_of(asyncio.run(dispatch_like_open_webui(module, body)))
+
+    assert "No passage in this conversation contains" in card
+    assert "Sources (1)" in card
+
+
+def test_card_offers_a_way_to_close_itself(monkeypatch):
+    """The embed iframe cannot be removed by the document it holds, so the card
+    collapses to one line: natively, through <details>, and on Escape."""
+    module = load_module()
+    monkeypatch.setattr(module.Action, "_post", lambda self, p: RESULT)
+
+    card = html_of(asyncio.run(dispatch_like_open_webui(module, {"id": "m1"})))
+
+    # A <details>/<summary> pair closes without a single line of script, which
+    # is what a sandboxed embed can be relied on to run.
+    assert "<details id='trick-card' open>" in card
+    assert "<summary>" in card
+    assert "id='trick-body'" in card
+    assert "<summary>" in card and "aria-label='Close'" in card
+    assert "event.key === 'Escape'" in card
+    assert card.index("<summary>") < card.index("id='trick-body'")

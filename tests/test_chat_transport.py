@@ -93,7 +93,7 @@ def test_a_transcript_survives_the_socket(server) -> None:
         client.close()
     assert outcome.scope == "both"
     assert outcome.chat
-    assert outcome.chat[0].turn == 6
+    assert outcome.chat[0].turn == 7
     assert "EPSG:3857" in outcome.chat[0].text
     assert outcome.chat_report["turn_count"] == 14
 
@@ -158,7 +158,7 @@ def test_a_transcript_survives_the_http_bridge(tmp_path: Path) -> None:
     assert status == 200, payload
     result = payload["result"]
     assert result["scope"] == "both"
-    assert result["chat"][0]["turn"] == 6
+    assert result["chat"][0]["turn"] == 7
     assert result["rows"]
     assert result.get("degraded_text") == []
 
@@ -208,7 +208,7 @@ def test_a_transcript_survives_the_mcp_tool_call(tmp_path: Path) -> None:
     result = responses[0]["result"]
     assert result["isError"] is False
     structured = result["structuredContent"]
-    assert structured["chat"][0]["turn"] == 6
+    assert structured["chat"][0]["turn"] == 7
     assert structured["scope"] == "both"
     assert "conversation matches" in result["content"][0]["text"]
 

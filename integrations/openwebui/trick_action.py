@@ -3,7 +3,7 @@ title: Trick
 author: hakkisabah
 author_url: https://github.com/hakkisabah/trick
 funding_url: https://github.com/hakkisabah/trick
-version: 0.6.0
+version: 0.7.0
 required_open_webui_version: 0.5.0
 description: Find a passage in a long conversation, and scored sources beside it.
 """
@@ -73,7 +73,13 @@ DEGRADED_TEXT = {
 
 STYLE = """
 :root { color-scheme: light dark; }
-body { font: 14px/1.45 system-ui, -apple-system, Segoe UI, sans-serif; margin: 0; padding: 12px 14px; }
+body { font: 14px/1.45 system-ui, -apple-system, Segoe UI, sans-serif; margin: 0; padding: 10px 14px; }
+details#trick-card > summary { display: flex; align-items: baseline; gap: 8px; margin: 0 0 6px; cursor: pointer; list-style: none; }
+details#trick-card > summary::-webkit-details-marker { display: none; }
+details#trick-card > summary .title { flex: 1; font-size: 12px; opacity: .7; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+details#trick-card > summary .x { font-size: 15px; line-height: 1; padding: 2px 6px; opacity: .6; }
+details#trick-card > summary:hover .x { opacity: 1; }
+details#trick-card:not([open]) > summary .x { transform: rotate(45deg); }
 h3 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; opacity: .65; margin: 14px 0 6px; }
 h3:first-of-type { margin-top: 0; }
 ol, ul { margin: 0; padding-left: 18px; }
@@ -84,6 +90,33 @@ li { margin: 0 0 10px; }
 a { color: inherit; }
 .note { font-size: 12px; opacity: .75; margin-top: 10px; }
 .none { opacity: .7; }
+"""
+
+# Closing the card. Open WebUI renders an HTMLResponse embed in a sandboxed
+# iframe, so this document cannot remove its own frame from the parent page.
+# Two mechanisms are used because only one of them is guaranteed: the card is a
+# native ``<details>`` element, so the summary line collapses it with no script
+# at all, and the script only adds Escape and the parent height report. A panel
+# that could only be closed by script stayed open, which is what a reader
+# reported.
+SCRIPT = """
+<script>
+(function () {
+  var card = document.getElementById('trick-card');
+  if (!card) { return; }
+  function report() {
+    try {
+      parent.postMessage({ type: 'iframe:height', height: document.body.scrollHeight }, '*');
+    } catch (error) { /* a host that does not listen is not an error */ }
+  }
+  card.addEventListener('toggle', report);
+  document.addEventListener('keydown', function (event) {
+    if (event.key === 'Escape') { card.open = false; }
+  });
+  window.addEventListener('load', report);
+  report();
+})();
+</script>
 """
 
 
@@ -99,6 +132,13 @@ class Action:
         )
         LIMIT: int = Field(default=8, description="How many catalogue sources to show (1-26).")
         LIVE: bool = Field(default=True, description="Query the live source APIs as well.")
+        SOURCES: str = Field(
+            default="auto",
+            description=(
+                "When to list catalogue sources beside the conversation hits: "
+                "'auto' (only when the conversation had no match), 'always', or 'never'."
+            ),
+        )
         SEARCH_CHAT: bool = Field(
             default=True,
             description="Also search inside the conversation itself, not only the catalogues.",
@@ -163,7 +203,7 @@ class Action:
     ):
         # body carries the conversation, the chat id and the id of the message
         # the button was pressed on. Nothing else is guaranteed across versions.
-        messages = body.get("messages") if isinstance(body, dict) else None
+        messages, origin = await self._conversation(body)
 
         query, ask_failed = await self._ask(__event_call__)
         if query is None:
@@ -198,13 +238,32 @@ class Action:
         ]
 
         blocks: list[tuple[str, str]] = []
+        if origin == "unavailable":
+            blocks.append((self._unread_chat_block(), ""))
+        elif transcript and not chat:
+            blocks.append((self._no_passage_block(query), ""))
         if chat:
             blocks.append((self._chat_block(chat, dropped), ""))
-        if rows:
+
+        # A find in a long conversation must not bury the answer under eight
+        # near-random catalogue rows: when the conversation answered, the
+        # sources are suppressed unless the reader asked for them. When it did
+        # not answer, they are the useful next step and are shown.
+        mode = str(self.valves.SOURCES or "auto").strip().lower()
+        show_rows = bool(rows) and (mode == "always" or (mode == "auto" and not chat))
+        if show_rows:
             blocks.append((self._rows_block(rows), ""))
+        elif rows and chat:
+            blocks.append(
+                (
+                    f"<p class='note'>{len(rows)} catalogue sources matched too; "
+                    "set the SOURCES valve to 'always' to list them.</p>",
+                    "",
+                )
+            )
         if not blocks:
             blocks.append((f"<p class='none'>Nothing matched <b>{html.escape(query)}</b>.</p>", ""))
-        return self._card(f"Trick: {query}", blocks, degraded)
+        return self._card(f"Trick: {query}", blocks, degraded, with_rows=show_rows)
 
     # -- dialog ------------------------------------------------------------
     async def _ask(self, event_call) -> tuple[str | None, bool]:
@@ -233,11 +292,22 @@ class Action:
         return (text or None), False
 
     # -- rendering ---------------------------------------------------------
-    def _card(self, title: str, blocks: list[tuple[str, str]], degraded: list | None = None) -> "_HTMLResponse":
+    def _card(
+        self,
+        title: str,
+        blocks: list[tuple[str, str]],
+        degraded: list | None = None,
+        with_rows: bool | None = None,
+    ) -> "_HTMLResponse":
         parts = [
             "<!DOCTYPE html><html><head><meta charset='utf-8'>",
             f"<style>{STYLE}</style></head><body>",
-            f"<div class='meta'>{html.escape(title)}</div>",
+            "<details id='trick-card' open>",
+            "<summary>",
+            f"<span class='title'>{html.escape(title)}</span>",
+            "<span class='x' role='button' aria-label='Close' title='Close (Esc)'>&#215;</span>",
+            "</summary>",
+            "<div id='trick-body'>",
         ]
         for block, _ in blocks:
             parts.append(block)
@@ -245,13 +315,32 @@ class Action:
             note = "; ".join(html.escape(str(item)) for item in degraded if item)
             if note:
                 parts.append(f"<p class='note'>degraded: {note}</p>")
-        parts.append(
-            "<p class='note'>* re-ordered by laya, - retrieval only. "
-            "S4/S5 mean a source or the scorer did not answer; the ranking is then "
-            "text-only, not wrong-but-hidden.</p>"
-        )
+        if with_rows:
+            parts.append(
+                "<p class='note'>* re-ordered by laya, - retrieval only. "
+                "S4/S5 mean a source or the scorer did not answer; the ranking is then "
+                "text-only, not wrong-but-hidden.</p>"
+            )
+        parts.append("</div>")
+        parts.append("</details>")
+        parts.append(SCRIPT)
         parts.append("</body></html>")
         return _HTMLResponse(content="".join(parts), headers={"Content-Disposition": "inline"})
+
+    @staticmethod
+    def _unread_chat_block() -> str:
+        return (
+            "<p class='none'>This conversation could not be read, so only the "
+            "catalogues were searched. Send the message again, or use "
+            "<code>trick tui --transcript</code> with the exported chat.</p>"
+        )
+
+    @staticmethod
+    def _no_passage_block(query: str) -> str:
+        return (
+            f"<p class='none'>No passage in this conversation contains "
+            f"<b>{html.escape(query)}</b>. What follows is outside the chat.</p>"
+        )
 
     def _chat_block(self, chat: list, dropped: int) -> str:
         shown = chat[: max(1, int(self.valves.CHAT_RESULTS))]
@@ -325,6 +414,92 @@ class Action:
         return self._card("Trick", [(block, "")])
 
     # -- conversation scope ------------------------------------------------
+    async def _conversation(self, body) -> tuple[list[dict], str]:
+        """Find the conversation the button was pressed in.
+
+        Open WebUI 0.12.4 hands the action the *message object* (``id``,
+        ``chat_id``, ``session_id``, ``model``) and no ``messages`` array at all,
+        so reading ``body["messages"]`` searched the catalogues and silently
+        skipped the half of the job the tool exists for. Three shapes are
+        accepted, cheapest first:
+
+        ``body``     a ``messages`` list, or a ``chat`` dict, as older or newer
+                     releases send it;
+        ``storage``  the chat row itself, read in-process from Open WebUI's own
+                     models - the path that works on 0.12.4;
+        ``unavailable`` a chat id was given but its content could not be read,
+                     which the card states instead of pretending there was
+                     nothing to find.
+
+        Ownership is not re-checked here: ``verify_chat_ownership`` runs in
+        ``main.py`` before the action is dispatched, on the same ``chat_id``.
+        """
+        if not isinstance(body, dict) or not self.valves.SEARCH_CHAT:
+            return [], ""
+        inline = body.get("messages")
+        if isinstance(inline, list) and inline:
+            return [item for item in inline if isinstance(item, dict)], "body"
+        if isinstance(body.get("chat"), dict):
+            ordered = self._order(body["chat"], str(body.get("id") or ""))
+            if ordered:
+                return ordered, "body"
+        chat_id = str(body.get("chat_id") or "").strip()
+        if not chat_id:
+            return [], ""
+        ordered = await self._from_storage(chat_id, str(body.get("id") or ""))
+        return (ordered, "storage") if ordered else ([], "unavailable")
+
+    @classmethod
+    def _order(cls, chat: dict, anchor: str = "") -> list[dict]:
+        """Rebuild the branch the button was pressed on, oldest turn first.
+
+        A chat is a tree: editing a message forks it. Walking ``parentId`` from
+        the pressed message keeps the search on the branch the reader sees,
+        instead of mixing in abandoned edits that they no longer have on screen.
+        """
+        history = chat.get("history") if isinstance(chat.get("history"), dict) else {}
+        raw = history.get("messages") or chat.get("messages")
+        start = anchor or str(history.get("currentId") or chat.get("currentId") or "")
+        if isinstance(raw, dict):
+            return cls._walk(raw, start)
+        if isinstance(raw, list):
+            return [item for item in raw if isinstance(item, dict)]
+        return []
+
+    @classmethod
+    def _walk(cls, messages: dict, anchor: str) -> list[dict]:
+        node = messages.get(anchor) if anchor else None
+        if not isinstance(node, dict):
+            # No anchor: the timestamps are the only ordering that cannot lie.
+            return sorted(
+                (item for item in messages.values() if isinstance(item, dict)),
+                key=lambda item: float(item.get("timestamp") or 0),
+            )
+        chain: list[dict] = []
+        seen: set[int] = set()
+        while isinstance(node, dict) and id(node) not in seen:
+            seen.add(id(node))
+            chain.append(node)
+            parent = node.get("parentId")
+            node = messages.get(parent) if parent else None
+        chain.reverse()
+        return chain
+
+    async def _from_storage(self, chat_id: str, message_id: str) -> list[dict]:
+        """Read the chat from Open WebUI's own models, inside its own process."""
+        try:  # imported late: the host test venv has no open_webui package
+            from open_webui.models.chats import Chats  # type: ignore
+        except Exception:
+            return []
+        try:
+            chat = await Chats.get_chat_by_id(chat_id)
+        except Exception:
+            return []
+        data = getattr(chat, "chat", None)
+        if not isinstance(data, dict):
+            return []
+        return self._order(data, message_id)
+
     @staticmethod
     def _last_user_message(messages) -> str:
         if not isinstance(messages, list):
