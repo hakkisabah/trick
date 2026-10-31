@@ -58,7 +58,13 @@ RESULT = {
             }
         ],
         "chat": [
-            {"turn": 3, "role": "assistant", "text": "we settled on 0.15", "scored_by_laya": False}
+            {
+                "turn": 3,
+                "role": "assistant",
+                "text": "we settled on 0.15",
+                "scored_by_laya": False,
+                "message_id": "a-2",
+            }
         ],
         "degraded": [],
         "report": {"weights": [0.2, 0.8], "blend_mode": "fused"},
@@ -122,10 +128,11 @@ def test_dispatches_with_body_only(monkeypatch):
 
     body = {
         "id": "m1",
+        "chat_id": "c0ffee",
         "model": "gpt",
         "messages": [
-            {"role": "user", "content": "differential expression for RNA-seq counts"},
-            {"role": "assistant", "content": "we settled on 0.15"},
+            {"id": "u-1", "role": "user", "content": "differential expression for RNA-seq counts"},
+            {"id": "a-2", "role": "assistant", "content": "we settled on 0.15"},
         ],
     }
     response = asyncio.run(dispatch_like_open_webui(module, body))
@@ -134,14 +141,57 @@ def test_dispatches_with_body_only(monkeypatch):
     assert posted[0]["query"] == "differential expression for RNA-seq counts"
     assert posted[0]["scope"] == "both"
     assert posted[0]["messages"][0]["role"] == "user"
+    # The message id travels with the turn so the card can point back at it.
+    assert posted[0]["messages"][1]["id"] == "a-2"
     card = html_of(response)
-    # Default ('always'): the passage and the sources are both listed. Which of
-    # the two matters is the reader's call, so the card does not hide one.
+    # Default ('never'): this button finds in the conversation. The catalogues
+    # answer a different question, so they are not mixed into the hits; the card
+    # still says that they matched, instead of pretending they do not exist.
     assert "we settled on 0.15" in card
     assert "turn 3" in card
-    assert "DESeq2" in card
-    assert "0.20 x laya probability + 0.80 x retrieval" in card
+    assert "DESeq2" not in card
+    assert "hidden (SOURCES=never)" in card
     assert response.headers.get("Content-Disposition") == "inline"
+
+
+def test_chat_rows_are_clickable_and_jump_to_the_message(monkeypatch):
+    """Every conversation hit carries the ids the chat needs to scroll to it."""
+    module = load_module()
+    monkeypatch.setattr(module.Action, "_post", lambda self, payload: RESULT)
+    body = {
+        "id": "m1",
+        "chat_id": "c0ffee",
+        "messages": [
+            {"id": "u-1", "role": "user", "content": "differential expression"},
+            {"id": "a-2", "role": "assistant", "content": "we settled on 0.15"},
+        ],
+    }
+
+    card = html_of(asyncio.run(dispatch_like_open_webui(module, body)))
+
+    assert "class='hit'" in card
+    assert "data-mid='a-2'" in card
+    assert "data-cid='c0ffee'" in card
+    assert "click to show in chat" in card
+    assert "message-' + chatId + '-' + messageId" in card
+    assert "scrollIntoView" in card
+    # The fallback must exist: without it a blocked cross-frame access would make
+    # the row do nothing at all.
+    assert "the full passage is open below" in card
+
+
+def test_chat_row_without_an_id_is_not_offered_as_clickable(monkeypatch):
+    """A client that sends no message ids must not produce dead links."""
+    module = load_module()
+    no_id = {"ok": True, "result": {**RESULT["result"], "chat": [{**RESULT["result"]["chat"][0], "message_id": ""}]}}
+    monkeypatch.setattr(module.Action, "_post", lambda self, payload: no_id)
+    body = {"id": "m1", "chat_id": "c0ffee", "messages": [{"role": "user", "content": "x"}]}
+
+    card = html_of(asyncio.run(dispatch_like_open_webui(module, body)))
+
+    assert "we settled on 0.15" in card
+    assert "class='hit'" not in card
+    assert "data-mid=" not in card
 
 
 def test_auto_quiet_mode_hides_sources_once_the_chat_answered(monkeypatch):
@@ -161,10 +211,11 @@ def test_auto_quiet_mode_hides_sources_once_the_chat_answered(monkeypatch):
 
     assert "we settled on 0.15" in card
     assert "DESeq2" not in card
-    assert "catalogue sources matched too" in card
+    assert "hidden (SOURCES=auto)" in card
 
 
-def test_never_quiet_mode_hides_sources_without_nagging(monkeypatch):
+def test_never_hides_sources_but_says_they_matched(monkeypatch):
+    """'never' stays quiet about the rows themselves, not about their existence."""
     module = load_module()
     monkeypatch.setattr(module.Action, "_post", lambda self, payload: RESULT)
     original = module.Action.__init__
@@ -179,7 +230,7 @@ def test_never_quiet_mode_hides_sources_without_nagging(monkeypatch):
     card = html_of(asyncio.run(dispatch_like_open_webui(module, body)))
 
     assert "DESeq2" not in card
-    assert "catalogue sources matched too" not in card
+    assert "1 catalogue source matched outside this conversation" in card
 
 
 def test_score_note_omits_numbers_when_the_answer_has_no_weights():
@@ -212,6 +263,13 @@ def test_sources_are_shown_when_the_conversation_has_no_match(monkeypatch):
     module = load_module()
     empty_chat = {"ok": True, "result": {**RESULT["result"], "chat": []}}
     monkeypatch.setattr(module.Action, "_post", lambda self, payload: empty_chat)
+    original = module.Action.__init__
+
+    def init(self):
+        original(self)
+        self.valves.SOURCES = "auto"
+
+    monkeypatch.setattr(module.Action, "__init__", init)
     body = {"id": "m1", "messages": [{"role": "user", "content": "differential expression"}]}
 
     card = html_of(asyncio.run(dispatch_like_open_webui(module, body)))
@@ -409,7 +467,9 @@ def test_no_passage_note_when_the_chat_has_no_hit(monkeypatch):
     card = html_of(asyncio.run(dispatch_like_open_webui(module, body)))
 
     assert "No passage in this conversation contains" in card
-    assert "Sources (1)" in card
+    # Still the conversation tool: the catalogue match is named, not listed.
+    assert "Sources (1)" not in card
+    assert "1 catalogue source matched outside this conversation" in card
 
 
 def test_card_offers_a_way_to_close_itself(monkeypatch):

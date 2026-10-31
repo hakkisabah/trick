@@ -402,7 +402,7 @@ you press the button; that is why it comes second.
 | `TRICK_TOKEN` | contents of `$HOME/.local/share/trick/bridge.token` | written by the installer; no quotes |
 | `LIMIT` | `8` | 1-26 |
 | `LIVE` | `true` | `false` = local catalogue only |
-| `SOURCES` | `always` | `always` = list every catalogue match beside the conversation hits; `never` = hide them; `auto` = optional quiet mode, list them only when the conversation had no match |
+| `SOURCES` | `never` | `never` (default) = this button finds in the conversation only; `auto` = also list catalogue matches, but only when the conversation had none; `always` = list them beside every hit |
 | `TIMEOUT_S` | `25` | raise only on a slow network |
 | `SHOW_SCORES` | `true` | blended score per row |
 | `SEARCH_CHAT` | `true` | also search inside the conversation |
@@ -414,18 +414,25 @@ you press the button; that is why it comes second.
 Verify end to end: open a chat that has a few turns, press the Trick button (the
 magnifier) under any answer, type `differential expression for RNA-seq counts`,
 press Enter. Expected: a card in about 1-2 s with a `Conversation` block (turn
-number, role, quoted passage) when the chat mentions the subject, followed by the
-catalogue rows. By default (`SOURCES=always`) both blocks are listed; the `auto`
-valve is the optional quiet mode that hides the sources behind one line
-(`N catalogue sources matched too`) so the passage is not buried, and `never`
-hides them silently. When the conversation has no match, the card says so and
-lists the sources with `source`/`key`, a blended score, `*` for laya-scored rows
-and `-` for retrieval-only rows. The footnote states the blend the score came
-from (the weights are shipped with the answer, so the text cannot drift), and
-that the number orders this list only - it is not a confidence and not comparable
-between queries. The card closes from the `x` in its header or on
-Escape, and reopens from the same line - it needs no script to do that. Closing
-the input dialog without typing searches nothing.
+number, role, quoted passage). Clicking a passage scrolls the chat to the message
+it came from and flashes it; if the browser blocks that (a hardened iframe
+sandbox), the same click opens the full passage inside the card instead, and the
+row says which of the two happened. Pressing Enter or Space on a focused row does
+the same as clicking. With the default `SOURCES=never` the catalogues stay out of
+the way and the card only says in one line that `N catalogue sources matched
+outside this conversation and are hidden`; set the valve to `auto` to list them
+when the chat had no match, or `always` to list them beside every hit. When the
+conversation has no match, the card says so. Listed sources carry `source`/`key`,
+a blended score, `*` for laya-scored rows and `-` for retrieval-only rows. The
+footnote states the blend the score came from (the weights are shipped with the
+answer, so the text cannot drift), and that the number orders this list only - it
+is not a confidence and not comparable between queries. The card closes from the
+`x` in its header or on Escape, and reopens from the same line - it needs no
+script to do that. Closing the input dialog without typing searches nothing.
+
+The catalogue itself is not gone: `python -m trick query` and the MCP
+`trick_search` tool still search CRAN, Bioconductor, arXiv and the live sources,
+which is where a package lookup belongs.
 
 Failure text is intentional and names the fix:
 

@@ -16,9 +16,10 @@
 #     12. integ. secrets no literal credentials under integrations/
 #     13. docs         every documented command and path actually exists
 #     14. chat quality conversation search still finds the planted passages
+#     15. jump         the result-row script scrolls the chat or falls back
 set -eu
 
-TOTAL=14
+TOTAL=15
 
 cd "$(dirname "$0")/.."
 PY="${PY:-.venv/bin/python}"
@@ -308,5 +309,12 @@ print(
     f"laya on {shipping['laya_calls']}/{shipping['queries']} queries"
 )
 PYCODE
+
+echo "== 15/$TOTAL result rows jump to their message"
+if command -v node >/dev/null 2>&1; then
+"$PY" scripts/jump_check.py
+else
+echo "jump check skipped: node is not installed"
+fi
 
 echo "gate: all checks passed"

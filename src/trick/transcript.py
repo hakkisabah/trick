@@ -62,10 +62,16 @@ _WHITESPACE = re.compile(r"[ \t\r\f\v]+")
 
 @dataclass(frozen=True)
 class Message:
-    """One turn, already reduced to what the index needs."""
+    """One turn, already reduced to what the index needs.
+
+    ``mid`` is the id the chat application gave the message. It is carried only
+    so a result can point back at the turn it came from (Open WebUI scrolls to
+    ``#message-<chat>-<mid>``); the ranking never reads it.
+    """
 
     role: str
     content: str
+    mid: str = ""
 
     def as_dict(self) -> dict:
         return {"role": self.role, "content": self.content}
@@ -80,6 +86,7 @@ class Chunk:
     char_start: int
     char_end: int
     signature: bytes
+    mid: str = ""
 
 
 @dataclass(frozen=True)
@@ -97,6 +104,7 @@ class ChatRow:
     final_score: float
     scored_by_laya: bool
     from_cache: bool = False
+    mid: str = ""
 
     @property
     def score_label(self) -> str:
@@ -116,6 +124,7 @@ class ChatRow:
             "score_label": self.score_label,
             "scored_by_laya": self.scored_by_laya,
             "from_cache": self.from_cache,
+            "message_id": self.mid,
         }
 
     @classmethod
@@ -132,6 +141,7 @@ class ChatRow:
             final_score=float(item.get("final_score") or 0.0),
             scored_by_laya=bool(item.get("scored_by_laya")),
             from_cache=bool(item.get("from_cache")),
+            mid=str(item.get("message_id") or ""),
         )
 
 
@@ -171,7 +181,7 @@ def normalise_messages(raw: Iterable[object]) -> list[Message]:
             raise ContractViolation(f"message {position} has unsupported content type")
         if len(content) > MAX_TOTAL_CHARS:
             raise ContractViolation(f"message {position} is larger than the transcript contract")
-        out.append(Message(role=role, content=content))
+        out.append(Message(role=role, content=content, mid=str(item.get("id") or "")))
     if len(out) > MAX_MESSAGES:
         raise ResourceExhausted(f"transcript has {len(out)} messages, limit is {MAX_MESSAGES}")
     total = sum(len(message.content) for message in out)
@@ -193,10 +203,17 @@ def window_messages(messages: Sequence[Message], *, tail: int) -> list[Message]:
 
 
 def fingerprint(messages: Sequence[Message]) -> str:
-    """Stable id of a transcript, used as the index and cache key."""
+    """Stable id of a transcript, used as the index and cache key.
+
+    The message id is part of the key even though the ranking never reads it: a
+    cached row carries the id of the turn it came from, so two transcripts with
+    the same text but different ids must not share an entry.
+    """
     digest = hashlib.blake2s(digest_size=12)
     for message in messages:
         digest.update(message.role.encode("utf-8", "replace"))
+        digest.update(b"\x1f")
+        digest.update(message.mid.encode("utf-8", "replace"))
         digest.update(b"\x1f")
         digest.update(message.content.encode("utf-8", "replace"))
         digest.update(b"\x1e")
@@ -261,12 +278,14 @@ def split_message(message: Message, *, turn: int, next_id: int) -> list[Chunk]:
             body = text[offset:span_end]
 
     return [
-        _make_chunk(next_id + position, turn, message.role, text, start_at, end_at)
+        _make_chunk(next_id + position, turn, message.role, text, start_at, end_at, message.mid)
         for position, (start_at, end_at) in enumerate(ordered)
     ]
 
 
-def _make_chunk(chunk_id: int, turn: int, role: str, text: str, start: int, end: int) -> Chunk:
+def _make_chunk(
+    chunk_id: int, turn: int, role: str, text: str, start: int, end: int, mid: str = ""
+) -> Chunk:
     body = _clean(text[start:end]).strip()
     return Chunk(
         chunk_id=chunk_id,
@@ -276,6 +295,7 @@ def _make_chunk(chunk_id: int, turn: int, role: str, text: str, start: int, end:
         char_start=start,
         char_end=end,
         signature=feature_hash_signature(body),
+        mid=mid,
     )
 
 
@@ -549,6 +569,7 @@ class ConversationSearch:
                         laya_probability=probability,
                         final_score=final,
                         scored_by_laya=scored,
+                        mid=chunk.mid,
                     ),
                     chunk,
                 )
@@ -594,6 +615,7 @@ class ConversationSearch:
                     laya_probability=row.laya_probability,
                     final_score=row.final_score,
                     scored_by_laya=row.scored_by_laya,
+                    mid=row.mid,
                 )
             )
             if len(rows) >= max(1, int(limit)):

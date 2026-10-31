@@ -273,7 +273,15 @@ def validate_messages_param(value: Any) -> list[dict] | None:
             raise ContractViolation(f"message {position} has neither role nor content")
         if content is not None and not isinstance(content, (str, list)):
             raise ContractViolation(f"message {position} has unsupported content type")
-        out.append({"role": str(role or "user"), "content": content if content is not None else ""})
+        entry = {"role": str(role or "user"), "content": content if content is not None else ""}
+        # ``id`` is optional and only used to point a result back at the message
+        # it came from. It is untrusted input like everything else here, so it
+        # must be a short string; anything else is dropped rather than rejected,
+        # because a chat without ids is still a searchable chat.
+        mid = item.get("id")
+        if isinstance(mid, str) and mid and len(mid) <= 128:
+            entry["id"] = mid
+        out.append(entry)
     total = 0
     for item in out:
         content = item["content"]

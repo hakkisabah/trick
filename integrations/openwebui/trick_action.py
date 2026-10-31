@@ -90,6 +90,14 @@ li { margin: 0 0 10px; }
 a { color: inherit; }
 .note { font-size: 12px; opacity: .75; margin-top: 10px; }
 .none { opacity: .7; }
+li.hit { cursor: pointer; border-radius: 6px; padding: 3px 6px; margin-left: -6px; outline: none; }
+li.hit:hover, li.hit:focus-visible { background: rgba(127,127,127,.15); }
+li.hit .hint { font-size: 11px; opacity: .55; margin-left: 6px; }
+li.hit details.full { margin-top: 4px; }
+li.hit details.full > summary { font-size: 11px; opacity: .65; cursor: pointer; }
+li.hit details.full .quote { margin-top: 4px; opacity: .9; }
+li.hit .jump-status { font-size: 11px; opacity: .65; margin-top: 4px; }
+li.hit .jump-status:empty { display: none; }
 """
 
 # Closing the card. Open WebUI renders an HTMLResponse embed in a sandboxed
@@ -115,6 +123,72 @@ SCRIPT = """
   });
   window.addEventListener('load', report);
   report();
+
+  // A result row jumps to the message it came from. Open WebUI renders this
+  // card in an iframe that keeps the page's origin (sandbox="allow-same-origin"
+  // is on by default), so the chat document is reachable and its own "jump to
+  // message" code can be reused verbatim: id "message-<chat>-<message>", then
+  // scrollIntoView plus a short highlight. When the origin is not shared (an
+  // admin turned the sandbox flag off, or the card is opened standalone) the
+  // row opens the full passage instead of doing nothing.
+  function messageElement(doc, chatId, messageId) {
+    if (!messageId) { return null; }
+    var candidates = [];
+    if (chatId) { candidates.push('message-' + chatId + '-' + messageId); }
+    candidates.push('message-' + messageId);
+    for (var i = 0; i < candidates.length; i++) {
+      var found = doc.getElementById(candidates[i]);
+      if (found) { return found; }
+    }
+    var all = doc.querySelectorAll('[id^="message-"]');
+    for (var j = 0; j < all.length; j++) {
+      var id = all[j].id || '';
+      if (id.slice(-(messageId.length + 1)) === '-' + messageId) { return all[j]; }
+    }
+    return null;
+  }
+  function jump(row) {
+    var messageId = row.getAttribute('data-mid') || '';
+    var chatId = row.getAttribute('data-cid') || '';
+    var status = row.querySelector('.jump-status');
+    var full = row.querySelector('details.full');
+    var target = null;
+    var doc = null;
+    try { doc = window.parent.document; } catch (error) { doc = null; }
+    if (doc) {
+      try { target = messageElement(doc, chatId, messageId); } catch (error) { target = null; }
+    }
+    if (target) {
+      try {
+        target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        if (target.animate) {
+          target.animate(
+            [{ backgroundColor: 'rgba(165,165,197,.28)' }, { backgroundColor: 'rgba(165,165,197,0)' }],
+            { duration: 1600 }
+          );
+        }
+        if (status) { status.textContent = 'jumped to the message in the chat'; }
+        return;
+      } catch (error) { target = null; }
+    }
+    if (full) { full.open = true; }
+    if (status) {
+      status.textContent = messageId
+        ? 'could not scroll the chat; the full passage is open below'
+        : 'this result has no message id; the passage is shown in full below';
+    }
+    report();
+  }
+  var rows = document.querySelectorAll('li.hit');
+  for (var r = 0; r < rows.length; r++) {
+    rows[r].addEventListener('click', function (event) {
+      if (event.target.closest('details, summary, a, button')) { return; }
+      jump(this);
+    });
+    rows[r].addEventListener('keydown', function (event) {
+      if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); jump(this); }
+    });
+  }
 })();
 </script>
 """
@@ -133,11 +207,12 @@ class Action:
         LIMIT: int = Field(default=8, description="How many catalogue sources to show (1-26).")
         LIVE: bool = Field(default=True, description="Query the live source APIs as well.")
         SOURCES: str = Field(
-            default="always",
+            default="never",
             description=(
-                "When to list catalogue sources beside the conversation hits. "
-                "'always' (default) lists every match; 'auto' is the optional quiet mode, "
-                "listing them only when the conversation had no match; 'never' hides them."
+                "Whether to list catalogue sources at all. 'never' (default) keeps this "
+                "button a find-in-conversation tool; 'auto' lists them only when the "
+                "conversation had no match; 'always' lists them beside the hits. "
+                "Catalogue search stays available in the CLI and the MCP server."
             ),
         )
         SEARCH_CHAT: bool = Field(
@@ -244,21 +319,25 @@ class Action:
         elif transcript and not chat:
             blocks.append((self._no_passage_block(query), ""))
         if chat:
-            blocks.append((self._chat_block(chat, dropped), ""))
+            blocks.append((self._chat_block(chat, dropped, str(body.get("chat_id") or "")), ""))
 
-        # A find in a long conversation must not bury the answer under eight
-        # near-random catalogue rows, but that judgement is the reader's: the
-        # default lists both blocks, and 'auto' is the optional quiet mode that
-        # hides the sources once the conversation answered.
-        mode = str(self.valves.SOURCES or "always").strip().lower()
+        # This button is a find for the conversation it sits in. The catalogues
+        # are a different product surface (CLI, MCP) and answering a chat
+        # question with eight R packages read as noise, so they are off by
+        # default and the reader opts in: 'auto' shows them only when the
+        # conversation had nothing, 'always' shows them beside every hit.
+        mode = str(self.valves.SOURCES or "never").strip().lower()
         show_rows = bool(rows) and (mode == "always" or (mode == "auto" and not chat))
         if show_rows:
             blocks.append((self._rows_block(rows), ""))
-        elif rows and chat and mode == "auto":
+        elif rows:
+            count = len(rows)
             blocks.append(
                 (
-                    f"<p class='note'>{len(rows)} catalogue sources matched too; "
-                    "set the SOURCES valve to 'always' to list them.</p>",
+                    f"<p class='note'>{count} catalogue source"
+                    f"{'s' if count != 1 else ''} matched outside this conversation and "
+                    f"{'is' if count == 1 else 'are'} hidden (SOURCES={html.escape(mode)}). "
+                    "Set the valve to 'always' to list them.</p>",
                     "",
                 )
             )
@@ -369,10 +448,10 @@ class Action:
     def _no_passage_block(query: str) -> str:
         return (
             f"<p class='none'>No passage in this conversation contains "
-            f"<b>{html.escape(query)}</b>. What follows is outside the chat.</p>"
+            f"<b>{html.escape(query)}</b>.</p>"
         )
 
-    def _chat_block(self, chat: list, dropped: int) -> str:
+    def _chat_block(self, chat: list, dropped: int, chat_id: str = "") -> str:
         shown = chat[: max(1, int(self.valves.CHAT_RESULTS))]
         head = f"<h3>Conversation ({len(chat)} match{'es' if len(chat) != 1 else ''}"
         if dropped:
@@ -382,15 +461,37 @@ class Action:
         for row in shown:
             role = "you" if row.get("role") == "user" else str(row.get("role") or "assistant")
             marker = "*" if row.get("scored_by_laya") else "-"
-            text = " ".join(str(row.get("text") or "").split())
+            full = " ".join(str(row.get("text") or "").split())
+            text = full
             if len(text) > 400:
                 text = text[:397].rstrip() + "..."
-            items.append(
-                "<li>"
-                f"<span class='turn'>turn {html.escape(str(row.get('turn', '?')))} - {html.escape(role)} {marker}</span>"
+            mid = str(row.get("message_id") or "")
+            attrs = ""
+            hint = ""
+            if mid:
+                # Clicking the row jumps to the message in the chat. The ids are
+                # quoted because they are only ever used as attribute values.
+                attrs = (
+                    " class='hit'"
+                    f" data-cid='{html.escape(chat_id, quote=True)}'"
+                    f" data-mid='{html.escape(mid, quote=True)}'"
+                    " tabindex='0' role='link'"
+                    " aria-label='Show this passage in the chat'"
+                )
+                hint = "<span class='hint'>click to show in chat</span>"
+            body = (
+                f"<span class='turn'>turn {html.escape(str(row.get('turn', '?')))} - "
+                f"{html.escape(role)} {marker}</span>{hint}"
                 f"<div class='quote'>{html.escape(text)}</div>"
-                "</li>"
             )
+            if full != text:
+                body += (
+                    "<details class='full'><summary>full passage</summary>"
+                    f"<div class='quote'>{html.escape(full)}</div></details>"
+                )
+            if mid:
+                body += "<div class='jump-status'></div>"
+            items.append(f"<li{attrs}>{body}</li>")
         return head + "<ol>" + "".join(items) + "</ol>"
 
     def _rows_block(self, rows: list) -> str:
@@ -570,7 +671,14 @@ class Action:
                 content = "\n".join(parts)
             if not isinstance(content, str) or not content.strip():
                 continue
-            cleaned.append({"role": role, "content": content})
+            # The id travels with the turn so a result can point back at it; the
+            # service ignores it when ranking. An empty id is left out entirely,
+            # so a client that sends none looks exactly like it did before.
+            turn = {"role": role, "content": content}
+            mid = str(item.get("id") or "")
+            if mid:
+                turn["id"] = mid
+            cleaned.append(turn)
         limit = max(1, int(self.valves.CHAT_TURNS))
         dropped = max(0, len(cleaned) - limit)
         if dropped:

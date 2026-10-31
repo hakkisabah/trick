@@ -151,6 +151,9 @@ def _action(module, url: str, token: str = TOKEN, limit: int = 2):
     action.valves.TRICK_URL = url
     action.valves.TRICK_TOKEN = token
     action.valves.LIMIT = limit
+    # These tests are about how catalogue rows render; the shipped default keeps
+    # them out of the card, so the valve is opened explicitly here.
+    action.valves.SOURCES = "always"
     return action
 
 
