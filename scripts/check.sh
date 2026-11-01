@@ -252,8 +252,9 @@ for bad in ("a string", 42, {"role": "user"}):
         raise AssertionError(f"messages accepted {bad!r}")
 
 assert 'payload["scope"] = "both"' in action_file, "the action must ask for both scopes when it sends a chat"
-assert "_results_html" in action_file and "CHAT_TURNS" in action_file, "the block must render and window the chat"
-assert "?message=" in action_file, "a row must link to the turn it came from"
+assert "_results_markdown" in action_file and "CHAT_TURNS" in action_file, "the block must render and window the chat"
+assert "#message-" in action_file, "a row must link to the turn it came from"
+assert 'MARKER = "**Trick** · "' in action_file, "the results block must be Markdown; raw HTML is shown as text"
 assert "iframeSandboxAllowSameOrigin" in action_file, "the card's sandbox limit must stay documented"
 
 # The installer must never accept the key as an argument (shell history, ps),

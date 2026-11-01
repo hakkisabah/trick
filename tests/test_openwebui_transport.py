@@ -380,7 +380,7 @@ def test_a_row_below_the_strong_coverage_says_partial(action_module):
                        [{"role": "user", "content": "x"}])
     finally:
         server.close()
-    rows = html.split("<ol>")[1].split("</ol>")[0].split("<li>")[1:]
+    rows = _rows(html)
     assert len(rows) == 2, rows
     assert "(partial)" in rows[0], rows[0]
     assert "(partial)" not in rows[1], rows[1]
@@ -397,4 +397,9 @@ def test_the_counter_says_how_many_rows_are_shown(action_module):
     finally:
         server.close()
     assert "5 passages match, showing the closest 3" in html
-    assert len(html.split("<ol>")[1].split("</ol>")[0].split("<li>")[1:]) == 3
+    assert len(_rows(html)) == 3
+
+
+def _rows(block: str) -> list[str]:
+    """The result rows of the Markdown block: lines of the form '1. ...'."""
+    return [line for line in block.splitlines() if line[:2].rstrip(".").isdigit() and ". " in line[:4]]

@@ -432,21 +432,26 @@ does not use a frame at all: it returns the pressed message back with the block
 appended (Open WebUI applies `res.messages` and saves it), and the block is
 rendered by the chat page itself.
 
-That makes every row an ordinary link to `?message=<id>` - the same parameter
-Open WebUI's own search uses to reveal a hit (`Chat.svelte` reads it and calls
-`scrollToMessage`). No script, no sandbox flag, no admin setting. The trade-off
-is that the results live in the message: they persist with the chat, and a
-second search on the same message replaces the block instead of stacking
-another one. Below `<!-- trick:results -->` is the only part the action ever
-rewrites; the text above it is never touched.
+That makes every row an ordinary Markdown link to `#message-<id>`, the anchor
+the chat page gives each message element (`id="message-<id>"`, the same id its
+own `scrollToMessage` looks up). A fragment is scrolled by the browser itself:
+no script, no sandbox flag, no admin setting, no router round-trip. The
+`?message=<id>` parameter is only read while the chat page mounts, so a
+same-page navigation to it can land without scrolling - the fragment cannot.
+The trade-off is that the results live in the message: they persist with the
+chat, and a second search on the same message replaces the block instead of
+stacking another one. Raw HTML is not used anywhere in the block: this build
+shows tags in a message body as their own text, which is why the block is
+Markdown only and has no collapsible element - it is capped at three rows
+instead. Below `**Trick** · ` is the only part the action ever rewrites; the
+text above it is never touched.
 
-`<details>` gives the block its collapse: click the header to fold it. With the
-default `SOURCES=never` the catalogues stay out of the way, and the block says
-in one line that `N catalogue sources matched outside this conversation and are
-hidden`; set the valve to `auto` to list them only when the conversation had no
-match, or `always` to list them beside every hit (each with `source/key`, a
-blended score and a short summary). Closing the input dialog without typing
-searches nothing.
+With the default `SOURCES=never` the catalogues stay out of the way, and the
+block says in one line that `N catalogue sources matched outside this
+conversation and are hidden`; set the valve to `auto` to list them only when
+the conversation had no match, or `always` to list them beside every hit (each
+with `source/key`, a blended score and a short summary). Closing the input
+dialog without typing searches nothing.
 
 The block states its own confidence. A row lists the query words it contains
 (`matched: ...`); when no passage contains the distinctive words of the

@@ -147,12 +147,15 @@ def test_the_action_sends_the_ids_and_renders_them_as_jump_targets():
     assert transcript[0]["id"] == "u-1"
     assert "id" not in transcript[2]
 
-    block = action._results_html(
+    block = action._results_markdown(
         "taper",
         [{"turn": 1, "role": "user", "text": "where did we put the taper", "message_id": "u-1"}],
         [],
     )
 
-    # The jump target is the "?message=" parameter Open WebUI's own search uses.
-    assert "href='?message=u-1'" in block
+    # The jump target is the message element's own id, which the chat page sets
+    # and its scrollToMessage looks up. A Markdown link, because HTML in a
+    # message body is shown as text.
+    assert "](#message-u-1)" in block
+    assert "<a " not in block and "<details" not in block
     assert "click to show in chat" not in block

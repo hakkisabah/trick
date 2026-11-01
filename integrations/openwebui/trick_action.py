@@ -3,7 +3,7 @@ title: Trick
 author: hakkisabah
 author_url: https://github.com/hakkisabah/trick
 funding_url: https://github.com/hakkisabah/trick
-version: 0.9.1
+version: 0.10.0
 required_open_webui_version: 0.5.0
 description: Find a passage in a long conversation; every hit links to its turn.
 """
@@ -84,16 +84,46 @@ DEGRADED_TEXT = {
 # for a card inside that frame to scroll the chat: any design that tries is
 # dead code that looks alive.
 #
-# What does work is the mechanism Open WebUI uses for its own search hits: a
-# link to "?message=<id>" on the chat route, which Chat.svelte turns into
-# ``messagesRef.scrollToMessage(target)``. Markdown written into a message is
-# rendered in the page itself, not in a frame, so those links are ordinary
-# anchors and need no privileges. The action therefore returns the message
-# back with the results appended, and every row is a real link.
-MARKER = "<!-- trick:results -->"
-# The block is rebuilt on every press: everything from MARKER to the end of the
-# message is replaced, so repeated searches do not stack up. The original text
-# above the marker is never touched.
+# What does work is the id the chat page puts on every message element:
+# ``id="message-<id>"``, the same one its own ``scrollToMessage`` looks up. A
+# Markdown link to ``#message-<id>`` is scrolled by the browser itself - no
+# script, no frame, no privilege, no router round-trip. Markdown is rendered in
+# the page, and raw HTML is not: this build shows a message body's tags as
+# their own text. The action therefore returns the message back with the
+# results appended, and every row is a real Markdown link.
+MARKER = "**Trick** · "
+# What the previous release wrote. Existing chats still carry it, so a new
+# search cuts the block at whichever of the two appears first - otherwise a
+# chat that was searched before would keep a dead copy above the new one.
+LEGACY_MARKER = "<!-- trick:results -->"
+
+
+def _md(text: str) -> str:
+    """Escape the characters that would break a Markdown block's structure.
+
+    A passage is arbitrary user text: a stray ``*`` or ``[`` would turn the rest
+    of the row into emphasis or a link that points somewhere it should not.
+    Quotes are left alone - Markdown needs no entity for them, and escaping them
+    is what made the previous block arrive on screen as ``&quot;``.
+    """
+    collapsed = " ".join(str(text).split())
+    out: list[str] = []
+    for char in collapsed:
+        if char in "\\`*_[]<>|":
+            out.append("\\" + char)
+        else:
+            out.append(char)
+    return "".join(out)
+
+
+def _cut_block(current: str) -> str:
+    """The message text above our block, whichever release wrote it."""
+    cut = len(current)
+    for token in (MARKER, LEGACY_MARKER):
+        at = current.find(token)
+        if at != -1:
+            cut = min(cut, at)
+    return current[:cut].rstrip()
 
 
 class Action:
@@ -223,7 +253,7 @@ class Action:
         # conversation had nothing, 'always' shows them beside every hit.
         mode = str(self.valves.SOURCES or "never").strip().lower()
         show_rows = bool(rows) and (mode == "always" or (mode == "auto" and not chat))
-        block = self._results_html(
+        block = self._results_markdown(
             query,
             chat,
             rows if show_rows else [],
@@ -242,11 +272,12 @@ class Action:
         if attached:
             return attached
         # No message id (an API call, not a browser): there is nothing to write
-        # the block into, so fall back to the embed.
-        return self._card(f"Trick: {query}", [(block, "")], degraded)
+        # the block into, so fall back to a plain framed copy. It cannot jump
+        # anywhere, so it does not pretend to: the Markdown is shown as text.
+        return self._text_card(f"Trick: {query}", block, degraded)
 
     # -- the results block --------------------------------------------------
-    def _results_html(
+    def _results_markdown(
         self,
         query: str,
         chat: list,
@@ -260,100 +291,131 @@ class Action:
         origin: str = "",
         dropped: int = 0,
     ) -> str:
-        """The block written into the message. Raw HTML, so the rows are links.
+        """The block written into the message, in Markdown only.
 
-        Every row links to ``?message=<id>`` on this chat route, which is how
-        Open WebUI reveals a search hit itself (Chat.svelte reads the ``message``
-        query parameter and calls ``scrollToMessage``). A message is rendered in
-        the page, not in a sandboxed frame, so the anchor needs no permission and
-        no script. ``<details>`` makes the block collapsible without any JS.
+        Raw HTML is not an option here. This Open WebUI build shows a message
+        body as text when it carries HTML tags, so ``<details>`` and ``<a>``
+        arrive on screen as their own source - measured on a real chat, not
+        assumed. Markdown is rendered, and a Markdown link becomes a real anchor
+        in the page itself, which is what a jump needs: the embed frame a card
+        would be drawn in is sandboxed without ``allow-same-origin`` and cannot
+        reach the chat at all.
+
+        Every row links to ``#message-<id>``, the anchor the chat page gives each
+        message element. That is the jump Open WebUI's own ``scrollToMessage``
+        performs, but done by the browser: a fragment needs no script, no frame,
+        and no router round-trip. Its ``?message=<id>`` parameter is only read
+        while the chat page mounts, so a same-page navigation to it can arrive
+        without scrolling.
+
+        The trade-off is kept visible rather than hidden: Markdown has no
+        collapsible element, so the block is capped at three rows with a short
+        quote, and a second search replaces it instead of stacking.
         """
-        parts: list[str] = ["<details open>"]
+        lines: list[str] = []
         count = len(chat)
         limit = max(1, int(self.valves.CHAT_RESULTS))
         shown = min(count, limit)
-        head = f"<b>Trick</b> · {html.escape(query)}"
+        head = f"{MARKER}{_md(query)}"
         if count:
             head += f" · {count} passage{'' if count == 1 else 's'} match"
             if count > shown:
                 # Saying "8 matches" above three rows reads as a bug; say both.
                 head += f", showing the closest {shown}"
-        parts.append(f"<summary>{head}</summary>")
+        lines.append(head)
+        lines.append("")
 
         if origin == "unavailable":
-            parts.append(
-                "<p>This conversation could not be read, so only the catalogues were "
-                "searched. Try again, or use <code>trick tui --transcript</code> with an "
-                "exported chat.</p>"
+            lines.append(
+                "This conversation could not be read, so only the catalogues were "
+                "searched. Try again, or use `trick tui --transcript` with an "
+                "exported chat."
             )
+            lines.append("")
         elif transcript and not chat:
-            parts.append(
-                "<p>No passage in this conversation contains the words that distinguish "
-                f"<b>{html.escape(query)}</b>.</p>"
-            )
+            lines.append(f"No passage in this conversation contains “{_md(query)}”.")
+            lines.append("")
         if weak:
-            parts.append(
-                "<p><i>Weak match: no passage carries the distinctive words of this "
+            lines.append(
+                "_Weak match: no passage carries the distinctive words of this "
                 "question, so these are the closest turns. Check the matched terms "
-                "before trusting a row.</i></p>"
+                "before trusting a row._"
             )
-        if chat:
-            parts.append("<ol>")
-            for row in chat[:limit]:
-                parts.append(self._row_html(row))
-            parts.append("</ol>")
-            if dropped:
-                parts.append(f"<p><small>The oldest {dropped} turns were not searched.</small></p>")
+            lines.append("")
+
+        for index, row in enumerate(chat[:limit], start=1):
+            lines.extend(self._row_markdown(index, row))
+        if dropped:
+            lines.append(f"_The oldest {dropped} turns were not searched._")
+            lines.append("")
         if catalogue:
-            parts.append(self._catalogue_html(catalogue))
+            lines.extend(self._catalogue_markdown(catalogue))
         elif hidden:
-            parts.append(
-                f"<p><small>{hidden} catalogue source{'s' if hidden != 1 else ''} matched "
-                f"outside this conversation and {'are' if hidden != 1 else 'is'} hidden "
-                f"(SOURCES={html.escape(sources_mode)}).</small></p>"
+            lines.append(
+                f"_{hidden} catalogue source{'s' if hidden != 1 else ''} matched "
+                f"outside this conversation and {'are' if hidden != 1 else 'is'} "
+                f"hidden (SOURCES={sources_mode})._"
             )
+            lines.append("")
         if not chat and not catalogue and origin != "unavailable" and not transcript:
-            parts.append(f"<p>Nothing matched <b>{html.escape(query)}</b>.</p>")
+            lines.append(f"Nothing matched “{_md(query)}”.")
+            lines.append("")
         note = "; ".join(str(item) for item in (degraded or []) if item)
         if note:
-            parts.append(f"<p><small>degraded: {html.escape(note)}</small></p>")
-        parts.append("</details>")
-        return "".join(parts)
+            lines.append(f"_degraded: {_md(note)}_")
+            lines.append("")
+        return "\n".join(lines).rstrip()
 
-    def _row_html(self, row: dict) -> str:
+    def _row_markdown(self, index: int, row: dict) -> list[str]:
+        """One result row: a Markdown link, then the passage it points at.
+
+        The link is the whole jump. ``#message-<id>`` is the id the chat page
+        gives the message element, so the browser scrolls to it natively: no
+        script, no frame, no permission, and no dependency on the router.
+        """
         role = "you" if str(row.get("role")) == "user" else str(row.get("role") or "assistant")
         label = f"turn {int(row.get('turn') or 0)} · {role}"
         mid = str(row.get("message_id") or "")
-        head = html.escape(label)
         if mid:
+            # "#message-<id>" is the id the chat page gives every message
+            # element, and the one its own scrollToMessage looks up. A plain
+            # fragment is scrolled by the browser itself: no script, no router
+            # round-trip, no permission. "?message=<id>" is only read while the
+            # chat page mounts, so a same-page navigation to it can land
+            # without scrolling - the fragment cannot.
             quoted = urllib.parse.quote(mid, safe="")
-            head = f"<a href='?message={quoted}'>{html.escape(label)}</a>"
-        terms = ""
+            head = f"[{_md(label)}](#message-{quoted})"
+        else:
+            # No id means no jump target. Say so on the row instead of drawing a
+            # link that does nothing: a dead anchor looks like a broken feature.
+            head = f"{_md(label)} (no jump target)"
+        detail = head
         matched = [str(term) for term in (row.get("matched") or []) if term]
         if matched:
-            terms = f" · matched: {html.escape(', '.join(matched))}"
+            detail += f" · matched: {_md(', '.join(matched))}"
             try:
                 # Coverage is the share of the question's distinctive weight this
                 # passage carries; below the strong threshold the row is the
                 # closest turn, not an answer. Say so on the row itself.
                 if 0.0 < float(row.get("coverage") or 0.0) < 0.5:
-                    terms += " (partial)"
+                    detail += " (partial)"
             except (TypeError, ValueError):
                 pass
         if self.valves.SHOW_SCORES:
             try:
-                terms += f" · {float(row.get('final_score') or 0.0):.2f}"
+                detail += f" · {float(row.get('final_score') or 0.0):.2f}"
             except (TypeError, ValueError):
                 pass
         text = " ".join(str(row.get("text") or "").split())
         if len(text) > 240:
             text = text[:237].rstrip() + "..."
-        return f"<li>{head}{terms}<br>{html.escape(text)}</li>"
+        # Three spaces indent the quote into the list item.
+        return [f"{index}. {detail}", f"   > {_md(text)}", ""]
 
     @staticmethod
-    def _catalogue_html(rows: list) -> str:
+    def _catalogue_markdown(rows: list) -> list[str]:
         """Catalogue hits, kept plain: they are a different corpus, not a passage."""
-        items = []
+        lines = ["_Catalogue sources (not from this conversation):_", ""]
         for row in rows[:26]:
             key = str(row.get("key") or row.get("id") or "")
             source = str(row.get("source") or "")
@@ -366,9 +428,12 @@ class Action:
             summary = " ".join(str(row.get("summary") or "").split())
             if len(summary) > 160:
                 summary = summary[:157].rstrip() + "..."
-            tail = f"<br>{html.escape(summary)}" if summary else ""
-            items.append(f"<li>{html.escape(label)}{score} — {html.escape(title)}{tail}</li>")
-        return "<p><small>Catalogue sources:</small></p><ul>" + "".join(items) + "</ul>"
+            line = f"- {_md(label)}{score} — {_md(title)}"
+            if summary:
+                line += f"\n  > {_md(summary)}"
+            lines.append(line)
+        lines.append("")
+        return lines
 
     @staticmethod
     def _attach(body, block: str) -> dict:
@@ -387,8 +452,8 @@ class Action:
             if isinstance(item, dict) and str(item.get("id")) == mid:
                 current = str(item.get("content") or "")
                 break
-        base = current.split(MARKER)[0].rstrip()
-        content = f"{base}\n\n{MARKER}\n{block}" if base else f"{MARKER}\n{block}"
+        base = _cut_block(current)
+        content = f"{base}\n\n{block}" if base else block
         return {"messages": [{"id": mid, "content": content}]}
 
     # -- dialog ------------------------------------------------------------
@@ -461,6 +526,27 @@ class Action:
             f"{html.escape(hint)}</p><p class='meta'>{html.escape(code)} {html.escape(str(message))}</p>"
         )
         return self._card("Trick", [(block, "")])
+
+    def _text_card(self, title: str, block: str, degraded: list | None = None) -> "_HTMLResponse":
+        """Fallback embed for a caller with no message to write into.
+
+        An API call has no chat message, so the results cannot be attached and
+        no row can jump. The Markdown is therefore shown as preformatted text
+        rather than dressed up as something clickable that is not.
+        """
+        note = "; ".join(str(item) for item in (degraded or []) if item)
+        body = block + (f"\n\ndegraded: {note}" if note else "")
+        return _HTMLResponse(
+            content=(
+                "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+                f"<title>{html.escape(title)}</title>"
+                "<style>body{font:14px/1.5 system-ui,sans-serif;margin:1rem;"
+                "color:#222}pre{white-space:pre-wrap;word-break:break-word}"
+                "</style></head><body>"
+                f"<pre>{html.escape(body)}</pre></body></html>"
+            ),
+            headers={"Content-Disposition": "inline"},
+        )
 
     # -- conversation scope ------------------------------------------------
     async def _conversation(self, body) -> tuple[list[dict], str]:

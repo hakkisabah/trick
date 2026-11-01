@@ -38,7 +38,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "integrations" / "openwebui"))
 
-ANCHOR = re.compile(r"<a href='([^']+)'>(.*?)</a>", re.S)
+ANCHOR = re.compile(r"\[([^\]]+)\]\(([^)]+)\)", re.S)
 
 
 def _module():
@@ -80,31 +80,31 @@ def main() -> int:
 
     ids = ["3f2a-0001", "3f2a-0002"]
     rows = [_row(ids[0], 1), _row(ids[1], 14, "assistant"), _row("", 26)]
-    block = action._results_html("i5 memory problem", rows, [], transcript=True)
+    block = action._results_markdown("i5 memory problem", rows, [], transcript=True)
 
-    # 1 and 3: every id-carrying row is an anchor whose id round-trips.
-    hrefs = [href for href, _ in ANCHOR.findall(block)]
+    # 1 and 3: every id-carrying row is a Markdown link whose id round-trips.
+    hrefs = [href for _, href in ANCHOR.findall(block)]
     if len(hrefs) != len(ids):
         problems.append(f"expected {len(ids)} anchors, found {len(hrefs)}")
     for href, mid in zip(hrefs, ids):
-        if not href.startswith("?message="):
+        if not href.startswith("#message-"):
             problems.append(f"anchor is not a message link: {href!r}")
             continue
-        carried = urllib.parse.unquote(href.split("=", 1)[1])
+        carried = urllib.parse.unquote(href.split("#message-", 1)[1])
         if carried != mid:
             problems.append(f"anchor for {mid!r} round-trips to {carried!r}")
 
     # 2: the row without an id must stay text. A dead link promises a jump that
     # cannot happen, which is worse than no link at all.
-    if "?message=')" in block or "?message=" + "')" in block:
+    if "#message-')" in block:
         problems.append("a row without a message id produced an empty anchor")
     if "turn 26" not in block:
         problems.append("the row without an id disappeared instead of printing as text")
 
-    # The reader on the other side scrolls only a message it can find in the
-    # loaded chat, so the id in the anchor is the whole contract.
+    # The browser scrolls only to an element that exists, so the id in the
+    # fragment is the whole contract.
     for mid in ids:
-        if f"?message={mid}" not in html.unescape(block):
+        if f"#message-{mid}" not in html.unescape(block):
             problems.append(f"row {mid!r} has no reachable anchor target")
 
     # 4: a second press replaces the block; the user's text is never rewritten.
@@ -140,14 +140,14 @@ def main() -> int:
     # that half (with a note) when it is not.
     note = _reader_note()
     print(
-        f"jump ok: {len(hrefs)} rows link to ?message=<id>, no dead links, "
+        f"jump ok: {len(hrefs)} rows link to #message-<id>, no dead links, "
         f"block replaced on re-press{note}"
     )
     return 0
 
 
 def _reader_note() -> str:
-    """Confirm Open WebUI still reads the query parameter, if it is installed."""
+    """Confirm Open WebUI still gives each message that element id."""
     try:
         found = subprocess.run(
             [
@@ -156,17 +156,17 @@ def _reader_note() -> str:
                 "open-webui",
                 "sh",
                 "-c",
-                'grep -rlo \'searchParams.get("message")\' /app/build/_app/immutable/chunks/*.js | head -1',
+                'grep -rlo \'id="message-\' /app/build/_app/immutable/chunks/*.js | head -1',
             ],
             capture_output=True,
             text=True,
             timeout=20,
         )
     except (OSError, subprocess.SubprocessError):
-        return " (reader not checked: no container access here)"
+        return " (anchor not checked: no container access here)"
     if found.returncode != 0 or not found.stdout.strip():
-        return " (reader not checked: open-webui container not available)"
-    return " (chat page still reads ?message=<id>)"
+        return " (anchor not checked: open-webui container not available)"
+    return " (chat page still gives each message id=message-<id>)"
 
 
 if __name__ == "__main__":

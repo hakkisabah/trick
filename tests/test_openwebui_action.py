@@ -180,9 +180,10 @@ def test_chat_rows_are_clickable_and_jump_to_the_message(monkeypatch):
 
     card = html_of(asyncio.run(dispatch_like_open_webui(module, body)))
 
-    # The jump is an anchor to "?message=<id>", the parameter Chat.svelte reads
-    # to call scrollToMessage. No script, no frame permission, no data-* hooks.
-    assert "href='?message=a-2'" in card
+    # The jump is a Markdown link to the message element's own anchor
+    # ("#message-<id>"), which the browser scrolls without any script. No frame
+    # permission, no data-* hooks, no router round-trip.
+    assert "](#message-a-2)" in card
     assert "turn 3 · assistant" in card
     assert "data-mid=" not in card
     assert "postMessage" not in card
@@ -199,7 +200,7 @@ def test_chat_row_without_an_id_is_not_offered_as_clickable(monkeypatch):
     card = html_of(asyncio.run(dispatch_like_open_webui(module, body)))
 
     assert "we settled on 0.15" in card
-    assert "?message=" not in card
+    assert "#message-" not in card
     assert "turn 3 · assistant" in card
 
 
@@ -347,9 +348,10 @@ def test_chat_text_is_escaped(monkeypatch):
     card = html_of(asyncio.run(dispatch_like_open_webui(module, body)))
 
     # Result text must arrive escaped, never as markup: the block is rendered
-    # by the chat itself now, so an unescaped payload would be live HTML.
-    assert "<script>alert(1)" not in card
-    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in card
+    # by the chat itself now, so an unescaped payload would be live HTML. In
+    # Markdown the escape is a backslash, which also survives being shown raw.
+    assert "<script>" not in card
+    assert "\\<script\\>" in card
 
 
 def test_bridge_failure_explains_the_fix(monkeypatch):
@@ -472,8 +474,13 @@ def test_no_passage_note_when_the_chat_has_no_hit(monkeypatch):
     assert "1 catalogue source matched outside this conversation" in card
 
 
-def test_the_block_collapses_without_any_script(monkeypatch):
-    """The results live in the message, so <details> is all the closing needs."""
+def test_the_block_carries_no_html_the_chat_would_show_as_text(monkeypatch):
+    """Raw HTML in a message body is displayed as its own source.
+
+    Measured on a real chat: ``<details>`` and ``<a>`` arrived on screen as
+    their own tags. The block is therefore Markdown only - which also means it
+    has no collapsible element, and is kept short instead.
+    """
     module = load_module()
     monkeypatch.setattr(module.Action, "_post", lambda self, p: RESULT)
 
@@ -483,9 +490,11 @@ def test_the_block_collapses_without_any_script(monkeypatch):
         )
     )
 
-    assert "<details open>" in card
-    assert "<summary>" in card
-    assert card.index("<summary>") < card.index("<li>")
+    assert "<details" not in card
+    assert "<summary" not in card
+    assert "<li>" not in card
+    assert "<br>" not in card
+    assert "**Trick**" in card
     # No script at all: nothing to be blocked by a sandbox, nothing to break.
     assert "<script" not in card
     assert "onclick" not in card
@@ -540,7 +549,7 @@ def test_every_row_says_why_it_matched(monkeypatch):
     card = html_of(asyncio.run(dispatch_like_open_webui(module, body)))
 
     assert "matched: settled, 0.15" in card
-    assert "href='?message=a-2'" in card
+    assert "](#message-a-2)" in card
 
 
 def test_weak_matches_are_labelled_not_hidden(monkeypatch):
