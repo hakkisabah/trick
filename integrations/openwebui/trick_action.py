@@ -3,7 +3,7 @@ title: Trick
 author: hakkisabah
 author_url: https://github.com/hakkisabah/trick
 funding_url: https://github.com/hakkisabah/trick
-version: 0.11.0
+version: 0.12.0
 required_open_webui_version: 0.5.0
 description: Find a passage in a long conversation; every hit links to its turn.
 """
@@ -84,12 +84,13 @@ DEGRADED_TEXT = {
 # for a card inside that frame to scroll the chat: any design that tries is
 # dead code that looks alive.
 #
-# What does work is the id the chat page puts on every message element:
-# ``id="message-<id>"`` (Message.svelte), the same one its own scroll code looks
-# up. A Markdown link to ``#message-<id>`` is scrolled by the browser itself - no
-# script, no frame, no privilege, no router round-trip. The action therefore
-# returns an assistant message with the block appended, and every row is a real
-# Markdown link.
+# What does work is the route Open WebUI itself uses for "jump to source":
+# ``/c/<chat-id>?message=<message-id>``. Its link handler intercepts ``/c/``
+# links, cancels the default navigation, and routes in place; the chat page
+# watches the ``message`` parameter and scrolls to that message. A bare
+# ``#message-<id>`` fragment would scroll natively, but Open WebUI hardcodes
+# ``target="_blank"`` on every Markdown link it renders, and the attribute is
+# not ours to remove - so the fragment opened a second tab instead.
 #
 # The block must land on an *assistant* message. Open WebUI renders that one
 # through its Markdown renderer (``renderMarkdownInAssistantMessages``, default
@@ -98,6 +99,19 @@ DEGRADED_TEXT = {
 # on the user's own question, so ``**bold**`` arrived as literal asterisks and
 # every link arrived as text.
 SUMMARY_PREFIX = "Trick · "
+# Open WebUI draws an action button as ``<img src={action.icon}>``, so the field
+# is a URL and an emoji renders as a broken image (measured: ``🔎`` was a broken
+# icon from the first release). An SVG data URI keeps it a magnifier with no
+# network request; the renderer inverts it in dark mode because the value
+# contains "data:image/svg".
+_ICON = (
+    "data:image/svg+xml;base64,"
+    "PHN2ZyB4bWxucz0naHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmcnIHZpZXdCb3g9JzAgMCAyNCAyNCcg"
+    "ZmlsbD0nbm9uZScgc3Ryb2tlPScjMDAwMDAwJyBzdHJva2Utd2lkdGg9JzIuMicgc3Ryb2tlLWxpbmVj"
+    "YXA9J3JvdW5kJz48Y2lyY2xlIGN4PScxMC41JyBjeT0nMTAuNScgcj0nNi42Jy8+PHBhdGggZD0nTTE1"
+    "LjQgMTUuNCAyMSAyMScvPjwvc3ZnPg=="
+)
+
 # The block is an HTML ``<details>`` element on purpose. Open WebUI's own marked
 # extension turns a block-level ``<details>``/``<summary>`` pair into a
 # ``details`` token, and that token is drawn by its Collapsible component: a real
@@ -195,9 +209,13 @@ class Action:
 
     def __init__(self) -> None:
         self.valves = self.Valves()
-        # The icon is a URL, not base64: icons are re-sent in every /api/models
-        # response, so an inline image would cost every page load.
-        self.icon = "🔎"
+        # Open WebUI draws an action icon as ``<img src={action.icon}>``
+        # (ResponseMessage.svelte), so the field is a URL, never an emoji: a
+        # glyph here renders as a broken image, which is exactly what "🔎" did.
+        # An inline SVG data URI keeps it a real magnifier without a network
+        # request, and the renderer inverts it in dark mode because the value
+        # contains "data:image/svg". 298 characters, sent once per page load.
+        self.icon = _ICON
 
     # -- transport ---------------------------------------------------------
     def _post(self, payload: dict) -> dict:
@@ -282,6 +300,11 @@ class Action:
         # conversation had nothing, 'always' shows them beside every hit.
         mode = str(self.valves.SOURCES or "never").strip().lower()
         show_rows = bool(rows) and (mode == "always" or (mode == "auto" and not chat))
+        # 'weak' is a property of the conversation ranking, so it lives in
+        # chat_report; reading 'report' silently hid the warning. term_df and
+        # chunk_count come from the same report: they let the block say how much
+        # of the transcript the searched words cover.
+        report = result.get("chat_report") or result.get("report") or {}
         block = self._results_markdown(
             query,
             chat,
@@ -289,9 +312,9 @@ class Action:
             chat_id=str((body or {}).get("chat_id") or ""),
             hidden=0 if show_rows else len(rows),
             sources_mode=mode,
-            # 'weak' is a property of the conversation ranking, so it lives in
-            # chat_report; reading 'report' silently hid the warning.
-            weak=bool((result.get("chat_report") or result.get("report") or {}).get("weak")) and bool(chat),
+            weak=bool(report.get("weak")) and bool(chat),
+            term_df=report.get("term_df") or {},
+            chunk_count=int(report.get("chunk_count") or 0),
             degraded=degraded,
             transcript=bool(transcript),
             origin=origin,
@@ -331,6 +354,8 @@ class Action:
         hidden: int = 0,
         sources_mode: str = "never",
         weak: bool = False,
+        term_df: dict | None = None,
+        chunk_count: int = 0,
         degraded: list | None = None,
         transcript: bool = False,
         origin: str = "",
@@ -392,6 +417,19 @@ class Action:
                 "before trusting a row._"
             )
             lines.append("")
+        # One word is a find, not a question: say how much of the transcript it
+        # covers, so a common token is not mistaken for an answer. Measured on a
+        # real chat: "false" occurs in 3 of 338 passages and the three rows were
+        # exactly those three, which is correct and still was read as noise.
+        if term_df and len(term_df) == 1 and chat:
+            term, df = next(iter(term_df.items()))
+            if chunk_count:
+                lines.append(
+                    f"_One word was searched: “{_md(term)}” occurs in {int(df)} of "
+                    f"{int(chunk_count)} passages. A find lists where a word appears; "
+                    "it does not answer a question. Add a second word to narrow._"
+                )
+                lines.append("")
 
         for index, row in enumerate(chat[:limit], start=1):
             lines.extend(self._row_markdown(index, row, chat_id))
@@ -545,7 +583,12 @@ class Action:
                     "type": "input",
                     "data": {
                         "title": "Trick: find in this conversation",
-                        "message": "Text to look for. Every turn is searched; laya re-orders the top hits.",
+                        "message": (
+                            "Text to look for. Every turn is searched and laya re-orders "
+                            "the top hits. This finds words, not answers: a rare word, an "
+                            "identifier or a phrase works best; a whole question usually "
+                            "does not."
+                        ),
                         "placeholder": "e.g. the threshold we settled on",
                     },
                 }

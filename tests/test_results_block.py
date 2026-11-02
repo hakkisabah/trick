@@ -196,3 +196,73 @@ def test_stored_messages_gain_their_id_from_the_key():
     }
     ordered = module.Action._order({"history": history}, "b")
     assert [item["id"] for item in ordered] == ["a", "b"]
+
+
+def test_the_icon_is_an_image_the_renderer_can_draw():
+    """Open WebUI draws an action icon as ``<img src={action.icon}>``.
+
+    The field is therefore a URL. It shipped as an emoji for four releases, so the
+    button drew a broken image: a glyph is not a source an ``<img>`` can load. The
+    data URI is checked by decoding it - it has to parse as an SVG document, carry
+    the substring the renderer looks for when it inverts for dark mode, and stay
+    small enough to sit in a function's metadata.
+    """
+    import base64
+    from xml.etree import ElementTree
+
+    module = load_module()
+    icon = module.Action().icon
+    assert icon.startswith("data:image/svg+xml;base64,"), icon[:40]
+    # The renderer adds ``dark:invert-[80%]`` when the value has this substring.
+    assert "data:image/svg" in icon
+    assert len(icon) < 600
+    payload = base64.b64decode(icon.split(",", 1)[1])
+    root = ElementTree.fromstring(payload.decode("utf-8"))
+    assert root.tag.endswith("}svg")
+    assert root.find(".//{http://www.w3.org/2000/svg}circle") is not None
+
+
+def test_a_single_word_says_how_much_it_covers():
+    """Searched "false": it occurs in 3 of 338 passages and the three rows were
+    exactly those three.
+
+    Correct, and read as noise - the block looked like an answer to a question
+    when it was a find. It now says what was searched and how far the word
+    reaches, so a bare token cannot pass for an answer.
+    """
+    module = load_module()
+    action = module.Action()
+    action.valves = action.Valves()
+    rows = [
+        {
+            "turn": 39,
+            "role": "assistant",
+            "message_id": "m-39",
+            "matched": ["false"],
+            "coverage": 1.0,
+            "final_score": 4.33,
+            "snippet": "the ACL-test false-green fix",
+        }
+    ]
+    block = action._results_markdown(
+        "False",
+        rows,
+        [],
+        chat_id="chat-1",
+        term_df={"false": 3},
+        chunk_count=338,
+    )
+    assert "One word was searched" in block
+    assert "occurs in 3 of 338 passages" in block
+    assert "does not answer a question" in block
+
+    # Two words are a query, not a bare token: no find disclaimer on top of it.
+    two = action._results_markdown(
+        "cloudwatch politikasi",
+        rows,
+        [],
+        chat_id="chat-1",
+        term_df={"cloudwatch": 4, "politikasi": 1},
+        chunk_count=338,
+    )
+    assert "One word was searched" not in two

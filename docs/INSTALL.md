@@ -21,6 +21,10 @@ Both are scored the same way: lexical retrieval narrows the candidates, laya's
 typed decision scoring breaks the ties, and every row says which of the two
 produced its score (`*` = scored by laya, `-` = retrieval only).
 
+It is a find, not an answer: it matches the words you type and does not infer the
+ones you did not. `docs/USAGE.md` shows the query shapes that work and what each
+label on a row means.
+
 ## Paths
 
 | Thing | Default path |

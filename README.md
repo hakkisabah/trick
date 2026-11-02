@@ -23,7 +23,7 @@ model, so the tool looked like a chat partner and its query arrived as a chat
 message. It is now an **Action**: a button in the message toolbar that opens an
 input dialog and returns the hits as a card. The search box is the point.
 
-344 tests pass and `scripts/check.sh` runs 14 repository checks.
+387 tests pass and `scripts/check.sh` runs 15 repository checks.
 
 Measured on 22 gold queries with the live model and live sources, no re-ranking
 shortcuts (see `scripts/eval_ranking.py`):
@@ -59,6 +59,10 @@ There is no `trick` console script: the package declares no entry point, so the
 and the documentation gate fails the build if a document forgets it. Full
 installation, verification and removal steps for every artifact (venv, store,
 bridge token, systemd unit, Open WebUI function) live in `docs/INSTALL.md`.
+
+What the tool does, what it does not do, and which query shapes work is
+`docs/USAGE.md` - read it before reporting a result as unrelated: the `matched:`
+line on each row names the words that put it there.
 
 The Open WebUI Action is a client of the same bridge, not a second implementation.
 See `integrations/README.md` for the two steps that actually bite: the bridge must

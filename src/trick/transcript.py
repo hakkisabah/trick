@@ -631,7 +631,7 @@ class ConversationSearch:
 
         model_weight, retrieval_weight = self.weights
         terms = _terms(query)
-        weights = self._coverage_weights(terms, index.chunks)
+        weights, term_df = self._coverage_weights(terms, index.chunks)
         total_weight = sum(weights.values())
         rows: list[ChatRow] = []
         blended: list[tuple[float, ChatRow, Chunk]] = []
@@ -739,27 +739,36 @@ class ConversationSearch:
             "weak": bool(rows) and max(kept_coverage or [0.0]) < STRONG_COVERAGE,
             "best_coverage": round(max(kept_coverage or [0.0]), 3),
             "terms": terms,
+            "term_df": term_df,
             "elapsed_ms": round((time.monotonic() - started) * 1000.0, 1),
             "timings": {"bm25_ms": round(bm25_ms, 1), "laya_ms": round(laya_ms, 1)},
             "degraded": sorted(set(degraded)),
         }
         return rows, report
 
-    def _coverage_weights(self, terms: Sequence[str], chunks: Sequence[Chunk]) -> dict[str, float]:
+    def _coverage_weights(
+        self, terms: Sequence[str], chunks: Sequence[Chunk]
+    ) -> tuple[dict[str, float], dict[str, int]]:
         """idf per query term, measured on this transcript's own passages.
 
         A word that occurs in every turn ("en", "cok", "the") says nothing about
         which turn answers the question, so its weight collapses to ~0 and a
         passage that shares only such words ends up with zero coverage.
+
+        The document frequency travels back with the weights: it is what lets the
+        caller say how much of the transcript a word covers, and a word that
+        covers a lot cannot narrow anything down.
         """
         if not terms:
-            return {}
+            return {}, {}
         total = max(1, len(chunks))
         weights: dict[str, float] = {}
+        document_frequency: dict[str, int] = {}
         for term in terms:
             df = sum(1 for chunk in chunks if term in chunk.text.lower())
+            document_frequency[term] = df
             weights[term] = math.log(1.0 + total / (1.0 + df))
-        return weights
+        return weights, document_frequency
 
     def _gate_closed(self, scores: dict[int, float]) -> bool:
         if self.gate_margin <= 0.0 or len(scores) < 2:
