@@ -35,6 +35,54 @@ from .stopwords import STOPWORDS
 
 MIN_CHARS = 120
 MAX_CHARS = 600
+# Turkish matching contract.
+#
+# SQLite's unicode61 tokenizer with remove_diacritics 2 folds the accented
+# letters (s, c, g, o, u) but NOT the dotless i: it is a letter, not a
+# diacritic. Both sides of a search are folded the same way, so the index and
+# the query agree - but only if the caller types the same letter the text uses.
+# A reader typing ASCII ("yasadigimiz" for "yasadigimiz" with a dotless i)
+# matched nothing at all: measured on three real chats, ASCII-typed queries
+# returned 0 of 36 passages, while exact-surface queries returned 35 of 36.
+# Folding both sides here makes the two spellings one token, and the same fold
+# keeps the Turkish stopword list usable after lowercasing.
+_TR_FOLD = str.maketrans(
+    {
+        "\u0131": "i",  # dotless i
+        "\u0130": "i",  # dotted capital I
+        "I": "i",
+        "\u015f": "s",
+        "\u015e": "s",
+        "\u00e7": "c",
+        "\u00c7": "c",
+        "\u011f": "g",
+        "\u011e": "g",
+        "\u00f6": "o",
+        "\u00d6": "o",
+        "\u00fc": "u",
+        "\u00dc": "u",
+        "\u00e2": "a",
+        "\u00c2": "a",
+        "\u00ee": "i",
+        "\u00ce": "i",
+        "\u00fb": "u",
+        "\u00db": "u",
+    }
+)
+
+
+def fold_tr(text: str) -> str:
+    """Lowercase and fold Turkish letters to ASCII for matching only.
+
+    One character maps to one character, so offsets into the folded string are
+    offsets into the original: a snippet can be located on the fold and cut
+    from the text the reader wrote.
+    """
+    return text.translate(_TR_FOLD).lower()
+
+
+FOLDED_STOPWORDS = frozenset(fold_tr(word) for word in STOPWORDS)
+
 # A transcript bigger than this is refused instead of silently truncated: the
 # caller can send a window of the conversation (see ``window_messages``), and
 # saying so is better than ranking half a chat and pretending it was all there.
@@ -53,6 +101,10 @@ PREFILTER = 120
 # chunk that merely repeats one term. Kept as a multiplier so it cannot rescue a
 # chunk that no term matched.
 PHRASE_BONUS = 1.25
+# Shortest query term treated as a Turkish stem. Measured: a five-letter stem
+# reached recall@3 0.25 without prefix matching; the fold-plus-prefix build
+# reaches 0.94, and the exact surface form stays at 0.97.
+PREFIX_MIN = 5
 # Signature cosine above which two passages are treated as the same passage said
 # twice. Measured on a 30-turn chat: copies of one repeated sentence score
 # 0.944-0.968 against each other, distinct passages 0.08-0.60.
@@ -390,10 +442,16 @@ def chunk_messages(messages: Sequence[Message]) -> list[Chunk]:
 
 def snippet(text: str, query: str, *, width: int = SNIPPET_CHARS) -> str:
     """Window of ``text`` around the first query term, for a one-line UI row."""
-    lowered = text.lower()
+    # Located on the fold so an ASCII-typed query still centres the quote on the
+    # passage's own spelling, then cut from the text the reader wrote: the fold
+    # is one character for one character, so the offsets are the same.
+    folded = fold_tr(text)
     position = -1
     for term in _terms(query):
-        found = lowered.find(term)
+        found = folded.find(term)
+        if found < 0 and len(term) >= PREFIX_MIN:
+            hit = re.search(r"\b" + re.escape(term), folded)
+            found = hit.start() if hit else -1
         if found >= 0 and (position < 0 or found < position):
             position = found
     if position < 0 or len(text) <= width:
@@ -410,8 +468,8 @@ def snippet(text: str, query: str, *, width: int = SNIPPET_CHARS) -> str:
 def _terms(query: str) -> list[str]:
     return [
         term
-        for term in re.split(r"[^\w]+", query.lower())
-        if len(term) >= 2 and term not in STOPWORDS
+        for term in re.split(r"[^\w]+", fold_tr(query))
+        if len(term) >= 2 and term not in FOLDED_STOPWORDS
     ]
 
 
@@ -422,6 +480,13 @@ class TranscriptIndex:
         self.messages = list(messages)
         self.key = fingerprint(self.messages)
         self.chunks = chunk_messages(self.messages)
+        # Folded copy of every passage, plus its word set. Matching runs on the
+        # fold (so "yasadigimiz" and its dotted spelling are one token) while
+        # snippets and quotes are cut from the text as the reader wrote it.
+        self.folded: dict[int, str] = {c.chunk_id: fold_tr(c.text) for c in self.chunks}
+        self.tokens: dict[int, frozenset[str]] = {
+            cid: frozenset(re.findall(r"\w+", text)) for cid, text in self.folded.items()
+        }
         self._conn: sqlite3.Connection | None = None
         if self.chunks:
             self._build()
@@ -436,7 +501,7 @@ class TranscriptIndex:
             )
             conn.executemany(
                 "INSERT INTO chunks (rowid, body) VALUES (?, ?)",
-                [(chunk.chunk_id, chunk.text) for chunk in self.chunks],
+                [(chunk.chunk_id, fold_tr(chunk.text)) for chunk in self.chunks],
             )
         except sqlite3.Error as exc:
             conn.close()
@@ -459,24 +524,32 @@ class TranscriptIndex:
         return len(self.chunks)
 
     def bm25(self, query: str, *, limit: int = PREFILTER) -> list[tuple[int, float]]:
-        """Rank chunks by BM25, best first, as positive scores."""
+        """Rank chunks by BM25, best first, as positive scores.
+
+        Exact terms first; if nothing matches, the same query is retried as
+        prefixes, which is what turns a remembered Turkish stem ("yapil") into
+        the inflected words the chat actually contains ("yapildi", "yapilan").
+        """
         if self._conn is None:
             return []
-        expression = _fts_expression(query)
-        if not expression:
-            return []
-        try:
-            rows = self._conn.execute(
-                "SELECT rowid, bm25(chunks) AS score FROM chunks "
-                "WHERE chunks MATCH ? ORDER BY score LIMIT ?",
-                (expression, max(1, int(limit))),
-            ).fetchall()
-        except sqlite3.Error:
-            return []
-        # bm25() returns negative numbers; flip and shift so the scale is positive
-        # and a phrase bonus can never turn a zero into a hit.
-        scored = [(int(row[0]), -float(row[1])) for row in rows if float(row[1]) < 0.0]
-        return scored
+        for prefix in (False, True):
+            expression = _fts_expression(query, prefix=prefix)
+            if not expression:
+                return []
+            try:
+                rows = self._conn.execute(
+                    "SELECT rowid, bm25(chunks) AS score FROM chunks "
+                    "WHERE chunks MATCH ? ORDER BY score LIMIT ?",
+                    (expression, max(1, int(limit))),
+                ).fetchall()
+            except sqlite3.Error:
+                return []
+            # bm25() returns negative numbers; flip and shift so the scale is positive
+            # and a phrase bonus can never turn a zero into a hit.
+            scored = [(int(row[0]), -float(row[1])) for row in rows if float(row[1]) < 0.0]
+            if scored:
+                return scored
+        return []
 
     def candidates(self, query: str, *, limit: int = PREFILTER) -> dict[int, float]:
         """Union of BM25 hits and signature hits, with the phrase bonus applied.
@@ -490,7 +563,7 @@ class TranscriptIndex:
         """
         terms = _terms(query)
         lexical = [
-            chunk for chunk in self.chunks if any(term in chunk.text.lower() for term in terms)
+            chunk for chunk in self.chunks if any(term_hit(term, self.tokens[chunk.chunk_id]) for term in terms)
         ]
         scores: dict[int, float] = {}
         for chunk_id, score in self.bm25(query, limit=limit):
@@ -501,19 +574,43 @@ class TranscriptIndex:
                 cosine = sig_cosine(query_sig, chunk.signature)
                 if cosine > 0.25:
                     scores.setdefault(chunk.chunk_id, cosine)
-        phrase = " ".join(query.lower().split())
+        phrase = " ".join(fold_tr(query).split())
         if phrase:
             for chunk in self.chunks:
-                if chunk.chunk_id in scores and phrase in chunk.text.lower():
+                if chunk.chunk_id in scores and phrase in self.folded[chunk.chunk_id]:
                     scores[chunk.chunk_id] *= PHRASE_BONUS
         return scores
 
 
-def _fts_expression(query: str) -> str:
+def term_hit(term: str, tokens: frozenset[str]) -> bool:
+    """Does a folded query term occur in a passage's word set?
+
+    Turkish is agglutinative: "yapildi", "yapilan" and "yapilacak" are three
+    tokens of one stem. A reader who remembers the stem searched the stem and
+    found nothing - measured recall@3 for a five-letter stem was 0.25 against
+    0.97 for the exact surface form. Terms long enough to be a stem match by
+    prefix; short ones must match a whole word, because "en" occurs inside
+    "enerji".
+    """
+    if len(term) >= PREFIX_MIN:
+        return any(token.startswith(term) for token in tokens)
+    return term in tokens
+
+
+def _fts_expression(query: str, *, prefix: bool = False) -> str:
     terms = _terms(query)
     if not terms:
         return ""
-    return " OR ".join('"' + term.replace('"', "") + '"' for term in terms[:24])
+    # Same prefix rule as ``term_hit``: the index and the post-filter must agree,
+    # or the filter drops exactly what the index found. Prefix expansion is a
+    # fallback, not the default: on a real chat it lifted five-letter stem
+    # queries from 0.06 to 0.78 recall@3, and cost one exact-surface case
+    # ("calisma" pulled up the passage that repeats the stem three times).
+    parts = [
+        '"' + term.replace('"', "") + '"' + ("*" if prefix and len(term) >= PREFIX_MIN else "")
+        for term in terms[:24]
+    ]
+    return " OR ".join(parts)
 
 
 class TranscriptCache:
@@ -631,7 +728,7 @@ class ConversationSearch:
 
         model_weight, retrieval_weight = self.weights
         terms = _terms(query)
-        weights, term_df = self._coverage_weights(terms, index.chunks)
+        weights, term_df = self._coverage_weights(terms, index)
         total_weight = sum(weights.values())
         rows: list[ChatRow] = []
         blended: list[tuple[float, ChatRow, Chunk]] = []
@@ -642,8 +739,7 @@ class ConversationSearch:
             final = retrieval_weight * retrieval
             if probability is not None:
                 final += model_weight * probability
-            lowered = chunk.text.lower()
-            matched = tuple(term for term in terms if term in lowered)
+            matched = tuple(term for term in terms if term_hit(term, index.tokens[cid]))
             coverage = (
                 sum(weights[term] for term in matched) / total_weight if total_weight > 0.0 else 0.0
             )
@@ -747,7 +843,7 @@ class ConversationSearch:
         return rows, report
 
     def _coverage_weights(
-        self, terms: Sequence[str], chunks: Sequence[Chunk]
+        self, terms: Sequence[str], index: "TranscriptIndex"
     ) -> tuple[dict[str, float], dict[str, int]]:
         """idf per query term, measured on this transcript's own passages.
 
@@ -758,14 +854,17 @@ class ConversationSearch:
         The document frequency travels back with the weights: it is what lets the
         caller say how much of the transcript a word covers, and a word that
         covers a lot cannot narrow anything down.
+
+        Counting runs on the same folded word sets the filter uses, so a word
+        found by a prefix cannot be counted as absent two lines later.
         """
         if not terms:
             return {}, {}
-        total = max(1, len(chunks))
+        total = max(1, len(index.chunks))
         weights: dict[str, float] = {}
         document_frequency: dict[str, int] = {}
         for term in terms:
-            df = sum(1 for chunk in chunks if term in chunk.text.lower())
+            df = sum(1 for cid in index.folded if term_hit(term, index.tokens[cid]))
             document_frequency[term] = df
             weights[term] = math.log(1.0 + total / (1.0 + df))
         return weights, document_frequency

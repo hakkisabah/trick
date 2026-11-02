@@ -147,18 +147,20 @@ def test_dispatches_with_body_only(monkeypatch):
 
     assert posted, "the action never reached the bridge"
     assert posted[0]["query"] == "differential expression for RNA-seq counts"
-    assert posted[0]["scope"] == "both"
+    # Default valve is 'never': this button finds in the conversation, so the
+    # catalogues are not queried at all. Asking for them and then reporting
+    # "8 matched but are hidden" was a note about work nobody asked for.
+    assert posted[0]["scope"] == "chat"
     assert posted[0]["messages"][0]["role"] == "user"
     # The message id travels with the turn so the card can point back at it.
     assert posted[0]["messages"][1]["id"] == "a-2"
     card = html_of(response)
     # Default ('never'): this button finds in the conversation. The catalogues
-    # answer a different question, so they are not mixed into the hits; the card
-    # still says that they matched, instead of pretending they do not exist.
+    # answer a different question, so they are neither shown nor mentioned.
     assert "we settled on 0.15" in card
     assert "turn 3" in card
     assert "DESeq2" not in card
-    assert "hidden (SOURCES=never)" in card
+    assert "catalogue" not in card
     # The results are written into an assistant message, because that is the one
     # Open WebUI draws through its Markdown renderer; a user message may be
     # drawn as plain text, where a link is not a link. Here the button was
@@ -232,10 +234,11 @@ def test_auto_quiet_mode_hides_sources_once_the_chat_answered(monkeypatch):
     assert "hidden (SOURCES=auto)" in card
 
 
-def test_never_hides_sources_but_says_they_matched(monkeypatch):
-    """'never' stays quiet about the rows themselves, not about their existence."""
+def test_never_does_not_query_the_catalogues_at_all(monkeypatch):
+    """'never' means the catalogues are out of scope, not hidden after the fact."""
     module = load_module()
-    monkeypatch.setattr(module.Action, "_post", lambda self, payload: RESULT)
+    posted: list[dict] = []
+    monkeypatch.setattr(module.Action, "_post", lambda self, payload: posted.append(payload) or RESULT)
     original = module.Action.__init__
 
     def init(self):
@@ -243,12 +246,20 @@ def test_never_hides_sources_but_says_they_matched(monkeypatch):
         self.valves.SOURCES = "never"
 
     monkeypatch.setattr(module.Action, "__init__", init)
-    body = {"id": "m1", "messages": [{"role": "user", "content": "differential expression"}]}
+    body = {
+        "id": "m1",
+        "chat_id": "c0ffee",
+        "messages": [
+            {"id": "u-1", "role": "user", "content": "differential expression"},
+            {"id": "a-2", "role": "assistant", "content": "we settled on 0.15"},
+        ],
+    }
 
     card = html_of(asyncio.run(dispatch_like_open_webui(module, body)))
 
+    assert posted[0]["scope"] == "chat", "a chat-only search must not call the catalogues"
     assert "DESeq2" not in card
-    assert "1 catalogue source matched outside this conversation" in card
+    assert "catalogue" not in card, "no note about rows nobody asked to see"
 
 
 def test_rows_are_listed_when_the_valve_asks_for_them(monkeypatch):
@@ -434,7 +445,7 @@ def test_chat_id_without_messages_reads_the_stored_chat(monkeypatch):
 
     card = html_of(asyncio.run(dispatch_like_open_webui(module, body)))
 
-    assert posted[0]["scope"] == "both"
+    assert posted[0]["scope"] == "chat"
     assert [m["content"] for m in posted[0]["messages"]][-1].startswith("the biggest mistake")
     assert "1 passage match" in card
 
@@ -485,9 +496,9 @@ def test_no_passage_note_when_the_chat_has_no_hit(monkeypatch):
     card = html_of(asyncio.run(dispatch_like_open_webui(module, body)))
 
     assert "No passage in this conversation contains" in card
-    # Still the conversation tool: the catalogue match is named, not listed.
+    # Still the conversation tool: the catalogues are neither listed nor named.
     assert "Sources (1)" not in card
-    assert "1 catalogue source matched outside this conversation" in card
+    assert "catalogue" not in card
 
 
 def test_the_block_carries_only_the_disclosure_as_html(monkeypatch):

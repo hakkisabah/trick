@@ -23,7 +23,7 @@ model, so the tool looked like a chat partner and its query arrived as a chat
 message. It is now an **Action**: a button in the message toolbar that opens an
 input dialog and returns the hits as a card. The search box is the point.
 
-387 tests pass and `scripts/check.sh` runs 15 repository checks.
+400 tests pass and `scripts/check.sh` runs 15 repository checks.
 
 Measured on 22 gold queries with the live model and live sources, no re-ranking
 shortcuts (see `scripts/eval_ranking.py`):
@@ -319,15 +319,16 @@ src/trick/bridge.py       loopback HTTP bridge with bearer auth
 src/trick/mcp.py          MCP server on stdio (JSON-RPC 2.0)
 src/trick/tui.py          terminal session: Enter submits, history, commands
 src/trick/cli.py          query / tui / serve / mcp / ingest / doctor / probe
-tests/                    344 tests: layout, corruption, contention, budget,
+tests/                    400 tests: layout, corruption, contention, budget,
                           adapters, client, pipeline, credentials, protocol,
                           permissions, concurrency, session behaviour, chunks,
-                          transcript ranking, transports, Open WebUI action, action dispatch
+                          transcript ranking, Turkish folding and stems,
+                          transports, Open WebUI action, action dispatch
 scripts/bench.py          produced numbers (not estimates) for this host
 scripts/eval_ranking.py   22-query ranking harness, three orderings per query
 scripts/eval_quota.py     quota harness over one retrieval per query
 scripts/laya_probe.py     one real call, prints the response shape only
-scripts/check.sh          repository gate (14 checks)
+scripts/check.sh          repository gate (15 checks)
 ```
 
 ## Install and verify

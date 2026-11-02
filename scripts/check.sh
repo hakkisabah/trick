@@ -251,7 +251,9 @@ for bad in ("a string", 42, {"role": "user"}):
     else:
         raise AssertionError(f"messages accepted {bad!r}")
 
-assert 'payload["scope"] = "both"' in action_file, "the action must ask for both scopes when it sends a chat"
+assert (
+    'payload["scope"] = "chat" if mode == "never" else "both"' in action_file
+), "a chat-only press must not query the catalogues; the scope follows the valve"
 assert "_results_markdown" in action_file and "CHAT_TURNS" in action_file, "the block must render and window the chat"
 assert "#message-" in action_file, "a row must link to the turn it came from"
 assert 'MARKER = "**Trick** · "' in action_file, "the results block must be Markdown; raw HTML is shown as text"

@@ -273,6 +273,9 @@ class Action:
 
         transcript, dropped = self._transcript(messages)
 
+        mode = str(self.valves.SOURCES or "never").strip().lower()
+        if mode not in ("never", "auto", "always"):
+            mode = "never"
         payload = {
             "query": query[:2000],
             "limit": max(1, min(int(self.valves.LIMIT), 26)),
@@ -280,7 +283,13 @@ class Action:
         }
         if transcript:
             payload["messages"] = transcript
-            payload["scope"] = "both"
+            # Why the scope depends on the valve: with SOURCES=never the
+            # catalogues are not shown, so querying them costs live network
+            # calls and then reports "8 catalogue sources matched but are
+            # hidden" - a line about work the reader did not ask for. Measured
+            # before this change: scope=both on every press, ~0.7 s of catalogue
+            # fetching whose only visible output was that note.
+            payload["scope"] = "chat" if mode == "never" else "both"
 
         answer = await asyncio.to_thread(self._post, payload)
         if not answer.get("ok"):
@@ -298,7 +307,6 @@ class Action:
         # question with eight R packages read as noise, so they are off by
         # default and the reader opts in: 'auto' shows them only when the
         # conversation had nothing, 'always' shows them beside every hit.
-        mode = str(self.valves.SOURCES or "never").strip().lower()
         show_rows = bool(rows) and (mode == "always" or (mode == "auto" and not chat))
         # 'weak' is a property of the conversation ranking, so it lives in
         # chat_report; reading 'report' silently hid the warning. term_df and
@@ -310,7 +318,7 @@ class Action:
             chat,
             rows if show_rows else [],
             chat_id=str((body or {}).get("chat_id") or ""),
-            hidden=0 if show_rows else len(rows),
+            hidden=0 if (show_rows or mode == "never") else len(rows),
             sources_mode=mode,
             weak=bool(report.get("weak")) and bool(chat),
             term_df=report.get("term_df") or {},

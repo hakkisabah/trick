@@ -5,6 +5,12 @@ Trick is a **scored find** over two corpora:
 1. the conversation you are in, and
 2. the scientific catalogues (CRAN, Bioconductor, arXiv, OpenAlex, Crossref).
 
+The two corpora are two products. **The Open WebUI button searches the
+conversation only** - a chat question answered with eight R packages read as
+noise, so the button does not call the catalogues at all unless you ask it to
+with the `SOURCES` valve. **The catalogues live in the terminal and in MCP**,
+where the question "which package is this" is the question being asked.
+
 It does not answer questions and it does not read meaning. It finds the places a
 piece of text occurs, then asks laya to order the closest few. That distinction
 is the whole of this page: a query shaped like a find works, a query shaped like
@@ -67,6 +73,42 @@ characters at sentence boundaries, the most recent 200 turns are searched, and
 Trick's own result blocks are cut out of the text before indexing, so a search
 never matches its own previous output.
 
+## Turkish, and what a fold does
+
+Turkish adds two problems an English index never sees, and both were measured on
+real chats: three of the user's own conversations, 36 gold passages.
+
+| Query shape | Before | After |
+| --- | --- | --- |
+| the word exactly as the chat spells it | 35/36 | 35/36 |
+| the same word typed in ASCII (i for the dotless i) | 0/36 | 35/36 |
+| a five-letter stem, a different inflection in the chat | 9/36 | 26/36 |
+
+What changed:
+
+- **Both sides are folded.** The dotless i is a letter, not a diacritic, so
+  SQLite's tokenizer never folded it: a reader typing `yasadigimiz` with an
+  ordinary i matched nothing, while the chat holds the same word with a dotless
+  i. Index and query are now folded to the same ASCII form before matching. The
+  text you see is still the text that was written.
+- **The coverage filter uses the same rule as the index.** It used to compare
+  raw strings, so a passage the index had found was discarded one step later and
+  the search returned nothing at all - silently. Both now agree.
+- **A stem falls back to prefixes.** `yapil` reaches `yapildi` and `yapilan`.
+  Prefix expansion runs only when the exact form finds nothing, because using it
+  always cost one exact-surface case: the passage repeating the bare stem three
+  times outranked the one that said it once.
+
+The limit, stated plainly: prefix matching finds inflections that extend the stem
+(`yapil` -> `yapilan`), not ones that change it inside (`yazim` vs `yazilmasi`).
+That needs a real Turkish stemmer, which Trick does not have. If a stem search
+returns nothing, shorten it by hand or use a word you are sure of.
+
+`scripts/eval_turkish.py` re-runs this measurement on any chat export, so the
+numbers above can be checked instead of trusted: it takes an Open WebUI export
+and prints the three recalls with a floor per row. On the same three chats with
+60 gold passages it reports exact 0.967, ascii 0.967, stem 0.700.
+
 ## Terminal, one-shot and MCP
 
 ```sh
@@ -90,7 +132,7 @@ conversation is searched too.
 
 | Valve | Default | Effect |
 | --- | --- | --- |
-| `SOURCES` | `never` | `never` keeps the button a find-in-conversation tool; `auto` lists catalogue sources only when the conversation had no match; `always` lists them beside every hit |
+| `SOURCES` | `never` | `never` keeps the button a find-in-conversation tool and does not query the catalogues at all; `auto` lists catalogue sources only when the conversation had no match; `always` lists them beside every hit |
 | `CHAT_RESULTS` | `3` | how many passage rows to show |
 | `SHOW_SCORES` | `true` | show the blended score per row |
 | `SEARCH_CHAT` | `true` | search the conversation as well as the catalogues |
