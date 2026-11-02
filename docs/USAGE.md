@@ -109,6 +109,14 @@ numbers above can be checked instead of trusted: it takes an Open WebUI export
 and prints the three recalls with a floor per row. On the same three chats with
 60 gold passages it reports exact 0.967, ascii 0.967, stem 0.700.
 
+What laya adds in Turkish, measured rather than assumed: on a single rare word
+it agreed with retrieval's top pick 14 of 15 times. On ambiguous two-word queries
+it is not the thing carrying the search - its own top-1 was 1 of 16 against
+retrieval's 14 of 16, and the confidence gate kept it out of 14 of those 16
+queries, so the shipped blend returned exactly what retrieval alone returned
+(14 of 16 top-1, 15 of 16 top-3). The conversation scope is lexical; laya is the
+tie-breaker, and the gate is what keeps a tie-breaker from becoming a tie-maker.
+
 ## Terminal, one-shot and MCP
 
 ```sh
