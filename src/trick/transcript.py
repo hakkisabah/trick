@@ -268,7 +268,11 @@ def _clean(text: str) -> str:
 # so cutting from the marker to the end removes exactly what was added. A marker
 # alone is not enough evidence - a user may type the same words - so the tail
 # must also look like a block before anything is cut.
-RESULT_MARKERS = ("**Trick** · ", "<!-- trick:results -->")
+RESULT_MARKERS = (
+    "<details>\n<summary>Trick · ",
+    "**Trick** · ",
+    "<!-- trick:results -->",
+)
 _BLOCK_SIGNALS = (
     "passage",
     "matched:",

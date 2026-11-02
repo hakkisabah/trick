@@ -168,7 +168,14 @@ def test_dispatches_with_body_only(monkeypatch):
 
 
 def test_chat_rows_are_clickable_and_jump_to_the_message(monkeypatch):
-    """Every hit links to the query parameter Open WebUI itself scrolls on."""
+    """Every hit links to the in-app route whose ``message`` parameter scrolls.
+
+    Open WebUI hardcodes ``target="_blank"`` on every Markdown link it renders,
+    so a plain ``#message-<id>`` fragment opened a second tab and the chat never
+    moved. A ``/c/<chat>?message=<id>`` link is intercepted by Open WebUI's own
+    click handler, which cancels the default navigation and routes in place; the
+    chat page then scrolls to that message.
+    """
     module = load_module()
     monkeypatch.setattr(module.Action, "_post", lambda self, payload: RESULT)
     body = {
@@ -182,11 +189,10 @@ def test_chat_rows_are_clickable_and_jump_to_the_message(monkeypatch):
 
     card = html_of(asyncio.run(dispatch_like_open_webui(module, body)))
 
-    # The jump is a Markdown link to the message element's own anchor
-    # ("#message-<id>"), which the browser scrolls without any script. No frame
-    # permission, no data-* hooks, no router round-trip.
-    assert "](#message-a-2)" in card
-    assert "turn 3 · assistant" in card
+    assert "[turn 3 · assistant](/c/c0ffee?message=a-2)" in card
+    # No fragment link: that is the one that opened a new tab.
+    assert "](#message-" not in card
+    assert "target=" not in card
     assert "data-mid=" not in card
     assert "postMessage" not in card
     assert "window.parent" not in card
@@ -484,27 +490,40 @@ def test_no_passage_note_when_the_chat_has_no_hit(monkeypatch):
     assert "1 catalogue source matched outside this conversation" in card
 
 
-def test_the_block_carries_no_html_the_chat_would_show_as_text(monkeypatch):
-    """Raw HTML in a message body is displayed as its own source.
+def test_the_block_carries_only_the_disclosure_as_html(monkeypatch):
+    """The one HTML element allowed is the disclosure Open WebUI itself parses.
 
-    Measured on a real chat: ``<details>`` and ``<a>`` arrived on screen as
-    their own tags. The block is therefore Markdown only - which also means it
-    has no collapsible element, and is kept short instead.
+    Every other tag arrives on screen as its own source, because a message is
+    drawn through the Markdown renderer and only ``<details>/<summary>`` is
+    claimed by Open WebUI's marked extension (drawn by its Collapsible
+    component). So the block must carry the disclosure and nothing else.
     """
     module = load_module()
     monkeypatch.setattr(module.Action, "_post", lambda self, p: RESULT)
 
     card = html_of(
         asyncio.run(
-            dispatch_like_open_webui(module, {"id": "m1"}, __event_call__=Recorder("threshold"))
+            dispatch_like_open_webui(
+                module,
+                {
+                    "id": "a-2",
+                    "chat_id": "c0ffee",
+                    "messages": [
+                        {"id": "u-1", "role": "user", "content": "where is the gate"},
+                        {"id": "a-2", "role": "assistant", "content": "at 0.15"},
+                    ],
+                },
+                __event_call__=Recorder("threshold"),
+            )
         )
     )
 
-    assert "<details" not in card
-    assert "<summary" not in card
-    assert "<li>" not in card
-    assert "<br>" not in card
-    assert "**Trick**" in card
+    assert card.lstrip().startswith("<details>") or "<details>" in card
+    assert "<summary>Trick · " in card
+    assert card.count("<details>") == 1
+    assert card.count("</details>") == 1
+    for tag in ("<a ", "<li>", "<br>", "<div", "<p>", "<ol"):
+        assert tag not in card
     # No script at all: nothing to be blocked by a sandbox, nothing to break.
     assert "<script" not in card
     assert "onclick" not in card
@@ -559,7 +578,7 @@ def test_every_row_says_why_it_matched(monkeypatch):
     card = html_of(asyncio.run(dispatch_like_open_webui(module, body)))
 
     assert "matched: settled, 0.15" in card
-    assert "](#message-a-2)" in card
+    assert "](/c/c0ffee?message=a-2)" in card
 
 
 def test_weak_matches_are_labelled_not_hidden(monkeypatch):

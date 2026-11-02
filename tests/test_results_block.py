@@ -28,13 +28,15 @@ MODULE_PATH = (
 )
 
 BLOCK = (
-    "**Trick** · mistake, made · 2 passages match\n"
+    "<details>\n"
+    "<summary>Trick · mistake, made · 2 passages match</summary>\n"
     "\n"
-    "1. [turn 45 · assistant](#message-m-45) · matched: mistake, made · 7.25\n"
+    "1. [turn 45 · assistant](/c/c0ffee?message=m-45) · matched: mistake, made · 7.25\n"
     "   > the answer that mentions the mistake\n"
     "\n"
     "_8 catalogue sources matched outside this conversation and are hidden "
-    "(SOURCES=never)._"
+    "(SOURCES=never)._\n"
+    "</details>"
 )
 
 
@@ -142,7 +144,7 @@ def test_a_second_search_replaces_the_block_instead_of_stacking_it():
     ]
     attached = module.Action._attach(messages, BLOCK, "u-1")
     content = attached["messages"][0]["content"]
-    assert content.count("**Trick** · ") == 1
+    assert content.count("<summary>Trick · ") == 1
 
 
 def test_a_chat_without_an_answer_gets_no_block_at_all():
@@ -151,8 +153,13 @@ def test_a_chat_without_an_answer_gets_no_block_at_all():
     assert module.Action._attach(messages, BLOCK, "u-1") == {}
 
 
-def test_rows_point_at_the_anchor_the_chat_page_renders():
-    """The id on a message element is ``message-<id>``; a row must use it."""
+def test_rows_point_at_the_in_app_route_that_scrolls():
+    """A row needs both ids: the chat to route into and the message to land on.
+
+    Open WebUI renders every Markdown link with ``target="_blank"``, so a
+    ``#message-<id>`` fragment opened a second tab. The in-app route is the one
+    its click handler intercepts and its chat page scrolls on.
+    """
     module = load_module()
     row = {
         "turn": 7,
@@ -165,10 +172,16 @@ def test_rows_point_at_the_anchor_the_chat_page_renders():
     }
     action = module.Action()
     action.valves = action.Valves()
-    block = action._row_markdown(1, row)
-    joined = "\n".join(block)
-    assert "(#message-m-7)" in joined
-    assert "?message=" not in joined
+
+    joined = "\n".join(action._row_markdown(1, row, "chat-9"))
+    assert "(/c/chat-9?message=m-7)" in joined
+    assert "](#message-" not in joined
+
+    # Without a chat id there is no route to scroll inside: say it, do not draw
+    # a link that lands at the top of some other page.
+    bare = "\n".join(action._row_markdown(1, row, ""))
+    assert "no jump target" in bare
+    assert "](/c/" not in bare
 
 
 def test_stored_messages_gain_their_id_from_the_key():

@@ -414,12 +414,19 @@ you press the button; that is why it comes second.
 
 Verify end to end: open a chat that has a few turns, press the Trick button (the
 magnifier) under any answer, type `differential expression for RNA-seq counts`,
-press Enter. Expected in about 1-2 s: a `Trick` block appended to that answer,
-with `<n> passages match, showing the closest <k>`, then one row per
-hit: `turn <n> · <role>` as a **link**, the query words that passage actually
-contains (`matched: ...`, plus `(partial)` when the passage carries less than
-half of the question's distinctive weight), and the passage. Clicking a row
-scrolls the chat to that turn.
+press Enter. Expected in about 1-2 s: a collapsed `Trick` disclosure appended to
+that answer, titled `Trick · <query> · <n> passages match, showing the closest
+<k> · best: turn <n> · <role>`. Click the title to open it: one row per hit,
+`turn <n> · <role>` as a **link**, the query words that passage actually contains
+(`matched: ...`, plus `(partial)` when the passage carries less than half of the
+question's distinctive weight), and the passage. Clicking a row scrolls the chat
+to that turn. Clicking the title again closes it.
+
+The disclosure is closed by default because Open WebUI draws every `details`
+block through a Collapsible that starts closed and takes its initial state from
+the `Always Expand Details` interface setting, not from the message content. If
+you would rather have Trick's results open on their own, turn that setting on:
+Settings → Interface → Always Expand Details.
 
 How the jump works, because it decides what to expect. Open WebUI renders an
 `HTMLResponse` embed in an iframe whose sandbox is `allow-scripts allow-popups
@@ -442,20 +449,25 @@ target is the pressed message when it is an answer, otherwise the closest answer
 above it, otherwise the closest one below. A chat that holds no answer yet gets a
 warning and no block, instead of plain text that looks broken.
 
-That makes every row an ordinary Markdown link to `#message-<id>`, the anchor
-the chat page gives each message element (`id="message-<id>"`, the same id its
-own `scrollToMessage` looks up). A fragment is scrolled by the browser itself:
-no script, no sandbox flag, no admin setting, no router round-trip. The
-`?message=<id>` parameter is only read while the chat page mounts, so a
-same-page navigation to it can land without scrolling - the fragment cannot.
-The trade-off is that the results live in the message: they persist with the
-chat, and a second search replaces the block instead of stacking another one.
-Raw HTML is not used anywhere in the block, so it has no collapsible element -
-it is capped at three rows instead. Below `**Trick** · ` is the only part the
-action ever rewrites; the text above it is never touched. The block itself is
-never indexed: it names the query and the turns it found, so searching its own
-output would rank a previous answer above the passage that holds the answer. The
-index is built from the messages as they were before the block was appended.
+That makes every row a link to `/c/<chat>?message=<id>`, and both halves of that
+are load-bearing. Open WebUI's renderer hardcodes `target="_blank"` on every
+Markdown link it emits, so a fragment link (`#message-<id>`) opens a second tab
+and the chat never moves - measured on a real chat, where the tab opened at the
+top of the chat. A `/c/` link is intercepted by Open WebUI's own click handler,
+which cancels that default navigation and routes in place; `Chat.svelte` then
+watches the `message` query parameter reactively and calls `scrollToMessage`.
+No script, no sandbox flag, no admin setting.
+
+The block is one `<details>`/`<summary>` pair, which the shipped marked extension
+parses into a token drawn by Open WebUI's Collapsible component: closed by
+default, opened and closed with a click, and no other HTML anywhere in the block
+(anything else would arrive on screen as its own source). The results live in the
+message, so they persist with the chat, and a second search replaces the block
+instead of stacking another one. `<summary>Trick · ` is the only part the action
+ever rewrites; the text above it is never touched. The block itself is never
+indexed: it names the query and the turns it found, so searching its own output
+would rank a previous answer above the passage that holds the answer. The index
+is built from the messages as they were before the block was appended.
 
 With the default `SOURCES=never` the catalogues stay out of the way, and the
 block says in one line that `N catalogue sources matched outside this

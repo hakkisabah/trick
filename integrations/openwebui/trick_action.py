@@ -3,7 +3,7 @@ title: Trick
 author: hakkisabah
 author_url: https://github.com/hakkisabah/trick
 funding_url: https://github.com/hakkisabah/trick
-version: 0.10.1
+version: 0.11.0
 required_open_webui_version: 0.5.0
 description: Find a passage in a long conversation; every hit links to its turn.
 """
@@ -97,11 +97,18 @@ DEGRADED_TEXT = {
 # ``renderMarkdownInUserMessages`` is off. Measured on a real chat: the block sat
 # on the user's own question, so ``**bold**`` arrived as literal asterisks and
 # every link arrived as text.
-MARKER = "**Trick** · "
-# What the previous release wrote. Existing chats still carry it, so a new
-# search cuts the block at whichever of the two appears first - otherwise a
-# chat that was searched before would keep a dead copy above the new one.
+SUMMARY_PREFIX = "Trick · "
+# The block is an HTML ``<details>`` element on purpose. Open WebUI's own marked
+# extension turns a block-level ``<details>``/``<summary>`` pair into a
+# ``details`` token, and that token is drawn by its Collapsible component: a real
+# disclosure widget, closed by default, no script. Measured against the shipped
+# extension source, not assumed.
+MARKER = "<details>\n<summary>" + SUMMARY_PREFIX
+# What the previous releases wrote: a raw HTML card, then a Markdown block with
+# a bold head. Existing chats still carry both, so a new search cuts at whichever
+# appears first - otherwise a searched chat keeps a dead copy above the new one.
 LEGACY_MARKER = "<!-- trick:results -->"
+LEGACY_TEXT_MARKER = "**Trick** · "
 
 
 def _md(text: str) -> str:
@@ -122,10 +129,26 @@ def _md(text: str) -> str:
     return "".join(out)
 
 
+def _summary_text(text: str) -> str:
+    """The one-line title of the disclosure.
+
+    ``<summary>`` is read as raw text by the extension: it is not lexed, so it
+    cannot carry escapes and a ``<`` in the question would close the element
+    early. Keep it plain, single-line and short.
+    """
+    collapsed = " ".join(str(text).split())
+    for char in "<>":
+        collapsed = collapsed.replace(char, " ")
+    collapsed = " ".join(collapsed.split())
+    if len(collapsed) > 120:
+        collapsed = collapsed[:117].rstrip() + "..."
+    return collapsed
+
+
 def _cut_block(current: str) -> str:
     """The message text above our block, whichever release wrote it."""
     cut = len(current)
-    for token in (MARKER, LEGACY_MARKER):
+    for token in (MARKER, LEGACY_MARKER, LEGACY_TEXT_MARKER):
         at = current.find(token)
         if at != -1:
             cut = min(cut, at)
@@ -263,6 +286,7 @@ class Action:
             query,
             chat,
             rows if show_rows else [],
+            chat_id=str((body or {}).get("chat_id") or ""),
             hidden=0 if show_rows else len(rows),
             sources_mode=mode,
             # 'weak' is a property of the conversation ranking, so it lives in
@@ -303,6 +327,7 @@ class Action:
         chat: list,
         catalogue: list,
         *,
+        chat_id: str = "",
         hidden: int = 0,
         sources_mode: str = "never",
         weak: bool = False,
@@ -311,38 +336,43 @@ class Action:
         origin: str = "",
         dropped: int = 0,
     ) -> str:
-        """The block written into the message, in Markdown only.
+        """The block written into the message: a collapsible, then Markdown rows.
 
-        Raw HTML is not an option here: the block has to be rendered by the chat
-        page, and a message that carries tags arrives on screen as their own
-        source when the page draws that message as plain text - measured on a
-        real chat, not assumed. Markdown is rendered for an assistant message,
-        and a Markdown link becomes a real anchor in the page itself, which is
-        what a jump needs: the embed frame a card would be drawn in is sandboxed
-        without ``allow-same-origin`` and cannot reach the chat at all.
+        Raw HTML is only used for the disclosure itself. Open WebUI's marked
+        extension parses a block-level ``<details>\\n<summary>…</summary>\\n``
+        pair into a ``details`` token and draws it with its Collapsible
+        component - a real open/close control, closed by default, no script and
+        no privileged frame. Every other tag is left out, because a message is
+        drawn through the Markdown renderer and any HTML that the extension does
+        not claim arrives on screen as its own source.
 
-        Every row links to ``#message-<id>``, the anchor the chat page gives each
-        message element. That is the jump Open WebUI's own ``scrollToMessage``
-        performs, but done by the browser: a fragment needs no script, no frame,
-        and no router round-trip. Its ``?message=<id>`` parameter is only read
-        while the chat page mounts, so a same-page navigation to it can arrive
-        without scrolling.
-
-        The trade-off is kept visible rather than hidden: Markdown has no
-        collapsible element, so the block is capped at three rows with a short
-        quote, and a second search replaces it instead of stacking.
+        Rows link to ``/c/<chat>?message=<id>``. That path is deliberately an
+        in-app route: Open WebUI's own link handler intercepts ``/c/`` links,
+        cancels the default navigation (which is what opened a second tab, since
+        its Markdown renderer hardcodes ``target="_blank"`` on every link) and
+        calls the client router instead. ``Chat.svelte`` watches the ``message``
+        query parameter reactively and scrolls to that message. A bare
+        ``#message-<id>`` fragment would scroll natively, but it cannot be
+        reached from here: the target attribute is not ours to remove.
         """
         lines: list[str] = []
         count = len(chat)
         limit = max(1, int(self.valves.CHAT_RESULTS))
         shown = min(count, limit)
-        head = f"{MARKER}{_md(query)}"
+        title = SUMMARY_PREFIX + _summary_text(query)
         if count:
-            head += f" · {count} passage{'' if count == 1 else 's'} match"
+            title += f" · {count} passage{'' if count == 1 else 's'} match"
             if count > shown:
                 # Saying "8 matches" above three rows reads as a bug; say both.
-                head += f", showing the closest {shown}"
-        lines.append(head)
+                title += f", showing the closest {shown}"
+            # The disclosure opens closed and the content cannot change that
+            # (Open WebUI passes its own ``expandDetails`` setting). So the title
+            # carries the best hit: the collapsed block still answers something.
+            best = chat[0] if chat else {}
+            role = "you" if str(best.get("role")) == "user" else "assistant"
+            title += f" · best: turn {int(best.get('turn') or 0)} · {role}"
+        lines.append("<details>")
+        lines.append(f"<summary>{title}</summary>")
         lines.append("")
 
         if origin == "unavailable":
@@ -364,7 +394,7 @@ class Action:
             lines.append("")
 
         for index, row in enumerate(chat[:limit], start=1):
-            lines.extend(self._row_markdown(index, row))
+            lines.extend(self._row_markdown(index, row, chat_id))
         if dropped:
             lines.append(f"_The oldest {dropped} turns were not searched._")
             lines.append("")
@@ -384,30 +414,34 @@ class Action:
         if note:
             lines.append(f"_degraded: {_md(note)}_")
             lines.append("")
+        lines.append("</details>")
         return "\n".join(lines).rstrip()
 
-    def _row_markdown(self, index: int, row: dict) -> list[str]:
-        """One result row: a Markdown link, then the passage it points at.
+    def _row_markdown(self, index: int, row: dict, chat_id: str = "") -> list[str]:
+        """One result row: a link into this chat, then the passage it points at.
 
-        The link is the whole jump. ``#message-<id>`` is the id the chat page
-        gives the message element, so the browser scrolls to it natively: no
-        script, no frame, no permission, and no dependency on the router.
+        The href is ``/c/<chat>?message=<id>``, an in-app route. Open WebUI
+        hardcodes ``target="_blank"`` on every Markdown link it renders, so a
+        plain fragment always opens a second tab - measured on a real chat. Its
+        own click handler cancels the default action for ``/c/`` links and routes
+        in place, and the chat page reacts to the ``message`` parameter by
+        scrolling to that message. Without a chat id there is nothing to route
+        to, and the row says so instead of drawing a dead link.
         """
         role = "you" if str(row.get("role")) == "user" else str(row.get("role") or "assistant")
         label = f"turn {int(row.get('turn') or 0)} · {role}"
         mid = str(row.get("message_id") or "")
-        if mid:
-            # "#message-<id>" is the id the chat page gives every message
-            # element, and the one its own scrollToMessage looks up. A plain
-            # fragment is scrolled by the browser itself: no script, no router
-            # round-trip, no permission. "?message=<id>" is only read while the
-            # chat page mounts, so a same-page navigation to it can land
-            # without scrolling - the fragment cannot.
-            quoted = urllib.parse.quote(mid, safe="")
-            head = f"[{_md(label)}](#message-{quoted})"
+        chat = str(chat_id or "")
+        if mid and chat:
+            # Both parts are quoted: an id that carries a character the URL
+            # grammar reserves would otherwise truncate the link silently.
+            href = f"/c/{urllib.parse.quote(chat, safe='')}?message={urllib.parse.quote(mid, safe='')}"
+            head = f"[{_md(label)}]({href})"
+        elif mid:
+            # No chat id: no route to scroll inside. Say it on the row rather
+            # than opening a tab that lands at the top of the chat.
+            head = f"{_md(label)} (no jump target)"
         else:
-            # No id means no jump target. Say so on the row instead of drawing a
-            # link that does nothing: a dead anchor looks like a broken feature.
             head = f"{_md(label)} (no jump target)"
         detail = head
         matched = [str(term) for term in (row.get("matched") or []) if term]

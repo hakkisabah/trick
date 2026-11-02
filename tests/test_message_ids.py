@@ -151,11 +151,12 @@ def test_the_action_sends_the_ids_and_renders_them_as_jump_targets():
         "taper",
         [{"turn": 1, "role": "user", "text": "where did we put the taper", "message_id": "u-1"}],
         [],
+        chat_id="chat-1",
     )
 
-    # The jump target is the message element's own id, which the chat page sets
-    # and its scrollToMessage looks up. A Markdown link, because HTML in a
-    # message body is shown as text.
-    assert "](#message-u-1)" in block
-    assert "<a " not in block and "<details" not in block
+    # The jump is the in-app route: Open WebUI cancels it and routes in place,
+    # and its chat page scrolls to the message named by the parameter.
+    assert "](/c/chat-1?message=u-1)" in block
+    assert "<details>" in block and "<summary>Trick · " in block
+    assert "<a " not in block
     assert "click to show in chat" not in block
