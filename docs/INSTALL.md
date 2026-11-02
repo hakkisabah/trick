@@ -137,15 +137,23 @@ Remove: delete that file, or `unset LAYA_API_KEY LAYA_BASE_URL`.
 ## 4. Fill the local catalogue
 
 First run only, or when you want fresher catalogue data. Downloads bulk metadata
-(CRAN ~2 MB, Bioconductor ~6 MB) plus the ranking priors. Takes about three
-minutes, mostly CRAN download counts fetched 120 package names per request.
+(CRAN descriptions ~45 MB, Bioconductor ~6 MB) plus the ranking priors, then
+writes the score matrix. Takes one to three minutes, mostly CRAN download counts
+fetched 120 package names per request.
 
 ```sh
 .venv/bin/python -m trick ingest --source cran,bioc
 ```
 
-Expected last lines: `cran: 25595 documents indexed`, `bioc: 2341 documents
-indexed`, `store now holds ... upserted rows`.
+Expected last lines: `cran: 25611 documents indexed`, `bioconductor: 2341
+documents indexed`, `store now holds ... upserted rows`, then `matrix: 28495
+records, 683928 bytes, ... at .../scores.trk`.
+
+CRAN comes from `crandb` `/-/latest`, not from the HTML index: 25,595 documents
+with titles and no descriptions could not answer
+`fast aggregation and joins for large tables`, because `data.table` is titled
+"Extension of data.frame" and only its description contains those words. The 45 MB
+payload is parsed entry by entry (73 MB peak RSS), not with `json.loads`.
 
 Verify:
 
@@ -153,10 +161,19 @@ Verify:
 .venv/bin/python -m trick doctor
 ```
 
-Expected: `"docs"` above 25000.
+Expected: `"docs"` above 25000 and `"matrix": {"count": ...}` not null.
 
-Remove: `rm -f "$HOME/.local/share/trick/trick.db"` (also deletes the FTS index and
-the decision cache; re-run this step to rebuild).
+Rebuild just the matrix (safe at any time; it is written to a temporary file and
+published with one rename):
+
+```sh
+.venv/bin/python -m trick matrix build
+.venv/bin/python -m trick matrix info
+```
+
+Remove: `rm -f "$HOME/.local/share/trick/trick.db" "$HOME/.local/share/trick/scores.trk"`
+(also deletes the FTS index, the decision cache and the matrix; re-run this step to
+rebuild both).
 
 ## 5. Terminal surface
 

@@ -23,7 +23,7 @@ model, so the tool looked like a chat partner and its query arrived as a chat
 message. It is now an **Action**: a button in the message toolbar that opens an
 input dialog and returns the hits as a card. The search box is the point.
 
-400 tests pass and `scripts/check.sh` runs 15 repository checks.
+415 tests pass and `scripts/check.sh` runs 16 repository checks.
 
 Measured on 22 gold queries with the live model and live sources, no re-ranking
 shortcuts (see `scripts/eval_ranking.py`):
@@ -214,11 +214,58 @@ The numbers are small-sample and the gold sets are two lists of 12 and 10 querie
 one biased towards popular tools, one towards niche exact matches. They are enough
 to catch a regression, not enough to claim a ranking is optimal.
 
-### Known limit
+### The `data.table` miss, and what actually fixed it
 
-`data.table` is still missed on `fast aggregation and joins for large tables`: its
-title is "Extension of data.frame" and no amount of popularity weighting fixes a
-lexical gap. That is query expansion's job, to be measured separately.
+`data.table` was missed on `fast aggregation and joins for large tables`: its title
+is "Extension of data.frame", and its description - which contains "Fast
+aggregation of large data ... fast ordered joins" - was not in the store at all.
+The cause was the ingest source, not the ranker: CRAN was read from the
+"available packages by date" HTML index, which has titles and no descriptions, so
+25,595 of 28,472 documents had an empty summary. Any hit on them could only come
+from the package name.
+
+Reading descriptions from `crandb` `/-/latest` fixed it at the source. End-to-end
+with the live model, same gold sets, same weights:
+
+| metric | before | after |
+| --- | --- | --- |
+| recall@12 | 0.955 | 1.000 |
+| MRR@10 | 0.777 | 0.895 |
+| nDCG@10 | 0.822 | 0.922 |
+
+### Query expansion was measured and rejected
+
+With descriptions in place, three rewriters were run through the identical
+pipeline (`scripts/eval_expansion.py`, retrieval-only, 22 gold queries):
+
+| variant | recall@12 | MRR@10 | nDCG@10 |
+| --- | --- | --- | --- |
+| baseline | 1.000 | 0.826 | 0.870 |
+| prefix (tokens >= 5 letters also matched as prefixes) | 1.000 | 0.777 | 0.820 |
+| dict (hand-written abbreviation table) | 1.000 | 0.776 | 0.820 |
+| prf (top-3 documents contribute their rarest terms) | 1.000 | 0.680 | 0.734 |
+
+None of them recovered a single extra document, and the two aggressive ones cost
+order. So expansion is not shipped: the seam exists (`SearchEngine(expand=...)`,
+optional, failures fall back to the plain expression, part of the cache identity),
+the measurements are reproducible, and the default is no rewriter.
+
+### The score matrix is an artefact, not a ranking channel
+
+Every document gets a 24-byte record (id, 16-byte int8 signature, prior as a
+16-bit score), built by `python -m trick ingest` and readable with
+`python -m trick matrix info`:
+28,495 records, 684 KB, build in 1.9 s, cold open 0.07 ms.
+
+Unioning its hits into the candidate set was measured and rejected: a hashed
+bag-of-words signature is not discriminative at 16 dimensions - every document
+scores 0.54..0.87 against any query - so the extra candidates carried their priors
+past weaker text scores and the ranking collapsed (niche recall@12 1.000 -> 0.500,
+nDCG@10 0.870 -> 0.497). It now runs only as an opt-in rescue
+(`matrix_rescue=True`) when the text index returns nothing at all, and a rescued
+shortlist is labelled `retrieval-only` and skips the model, because ranking noise
+with a model call would only make it cost more. The file is flagged synthetic in
+its header so no reader can mistake hashed signatures for embedding output.
 
 ### Source quota
 
@@ -319,7 +366,7 @@ src/trick/bridge.py       loopback HTTP bridge with bearer auth
 src/trick/mcp.py          MCP server on stdio (JSON-RPC 2.0)
 src/trick/tui.py          terminal session: Enter submits, history, commands
 src/trick/cli.py          query / tui / serve / mcp / ingest / doctor / probe
-tests/                    400 tests: layout, corruption, contention, budget,
+tests/                    415 tests: layout, corruption, contention, budget,
                           adapters, client, pipeline, credentials, protocol,
                           permissions, concurrency, session behaviour, chunks,
                           transcript ranking, Turkish folding and stems,
@@ -328,7 +375,7 @@ scripts/bench.py          produced numbers (not estimates) for this host
 scripts/eval_ranking.py   22-query ranking harness, three orderings per query
 scripts/eval_quota.py     quota harness over one retrieval per query
 scripts/laya_probe.py     one real call, prints the response shape only
-scripts/check.sh          repository gate (15 checks)
+scripts/check.sh          repository gate (16 checks)
 ```
 
 ## Install and verify

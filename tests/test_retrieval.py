@@ -10,12 +10,13 @@ from trick.errors import ContractViolation, SourceUnavailable
 from trick.retrieval import (
     ArxivAdapter,
     BioconductorAdapter,
-    CranAdapter,
+    CranCrandbAdapter,
     CrossrefAdapter,
     OpenAlexAdapter,
     SourceDoc,
     dedupe,
     invert_abstract,
+    iter_json_objects,
     search_live,
 )
 
@@ -64,16 +65,30 @@ CROSSREF = {
     },
 }
 
-CRAN_HTML = """<!DOCTYPE html><html><body><table>
-<tr><th>Date</th><th>Package</th><th>Title</th></tr>
-<tr>
-<td>2026-10-23</td><td><a href="../../web/packages/lme4/index.html"><span class="CRAN">lme4</span></a></td><td>Linear Mixed-Effects Models using 'Eigen' and S4</td></tr>
-<tr>
-<td>2026-10-22</td><td><a href="../../web/packages/sf/index.html"><span class="CRAN">sf</span></a></td><td>Simple Features for R &amp; spatial data</td></tr>
-<tr>
-<td>2026-10-22</td><td><a href="../../web/packages/lme4/index.html"><span class="CRAN">lme4</span></a></td><td>Duplicate row must be ignored</td></tr>
-</table></body></html>
-"""
+CRAN_JSON = json.dumps(
+    {
+        "lme4": {
+            "Package": "lme4",
+            "Version": "1.1-35.5",
+            "Title": "Linear Mixed-Effects Models using 'Eigen' and S4",
+            "Description": "Fit linear and generalized linear mixed-effects models.\\nThe models and their components are represented using S4 classes.",
+            "Date/Publication": "2026-10-23 08:12:04 UTC",
+        },
+        "data.table": {
+            "Package": "data.table",
+            "Version": "1.16.2",
+            "Title": "Extension of 'data.frame'",
+            "Description": "Fast aggregation of large data (e.g. 100GB in RAM), fast ordered joins, fast add/modify/delete of columns by group.",
+            "Date/Publication": "2026-10-22 10:00:00 UTC",
+        },
+        "lme4.duplicate": {
+            "Package": "lme4",
+            "Version": "0.0.0",
+            "Title": "Duplicate key must be ignored",
+            "Description": "",
+        },
+    }
+).encode()
 
 BIOC = {
     "DESeq2": {
@@ -101,18 +116,48 @@ def failing_transport(exc: Exception):
     return _get
 
 
-def test_cran_adapter_parses_the_html_index_and_dedupes():
-    docs = CranAdapter(transport(CRAN_HTML.encode())).fetch()
-    assert [d.key for d in docs] == ["lme4", "sf"]
+def test_cran_adapter_keeps_descriptions_and_dedupes():
+    docs = CranCrandbAdapter(transport(CRAN_JSON)).fetch()
+    assert [d.key for d in docs] == ["lme4", "data.table"]
     assert docs[0].title.startswith("lme4: Linear Mixed-Effects")
     assert docs[0].url.endswith("package=lme4")
-    assert docs[1].title.endswith("Simple Features for R & spatial data")
     assert docs[0].meta["published"] == "2026-10-23"
+    # The regression that mattered: a CRAN row without a description can only be
+    # found by its name, and "fast aggregation of large data" lives in this text.
+    assert "Fast aggregation of large data" in docs[1].summary
+    assert docs[0].summary.startswith("Fit linear and generalized linear")
 
 
-def test_cran_adapter_ignores_html_without_rows():
-    docs = CranAdapter(transport(b"<html><body>maintenance</body></html>")).fetch()
-    assert docs == []
+def test_cran_adapter_normalises_newlines_in_descriptions():
+    docs = CranCrandbAdapter(transport(CRAN_JSON)).fetch()
+    joined = " ".join(d.summary for d in docs)
+    assert "\n" not in joined
+
+
+def test_cran_adapter_ignores_payload_without_objects():
+    assert CranCrandbAdapter(transport(b"<html><body>maintenance</body></html>")).fetch() == []
+
+
+def test_iter_json_objects_streams_nested_and_escaped_values():
+    payload = (
+        b'{"a": {"Package": "a", "Description": "brace } and quote \\" inside"},'
+        b' "b": {"Package": "b", "Depends": {"R": ">= 4.0"}},'
+        b' "c": "not an object"}'
+    )
+    seen = list(iter_json_objects(payload))
+    assert [obj.get("Package") for obj in seen] == ["a", "b"]
+    assert "brace }" in seen[0]["Description"]
+
+
+def test_iter_json_objects_stops_on_truncated_payload():
+    payload = b'{"a": {"Package": "a"}, "b": {"Package": "b"'
+    seen = list(iter_json_objects(payload))
+    assert [obj["Package"] for obj in seen] == ["a"]
+
+
+def test_iter_json_objects_survives_garbage():
+    assert list(iter_json_objects(b"")) == []
+    assert list(iter_json_objects(b"[]")) == []
 
 
 def test_bioconductor_adapter_parses_json_snapshot():

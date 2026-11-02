@@ -17,9 +17,10 @@
 #     13. docs         every documented command and path actually exists
 #     14. chat quality conversation search still finds the planted passages
 #     15. jump         every result row links to the turn it came from
+#     16. matrix       the score matrix builds from the store and reads back
 set -eu
 
-TOTAL=15
+TOTAL=16
 
 cd "$(dirname "$0")/.."
 PY="${PY:-.venv/bin/python}"
@@ -316,5 +317,52 @@ PYCODE
 
 echo "== 15/$TOTAL result rows jump to their message"
 "$PY" scripts/jump_check.py
+
+echo "== 16/$TOTAL score matrix builds and reads back"
+TMPMATRIX=$(mktemp -d)
+"$PY" - "$TMPMATRIX" <<'PYCODE'
+import json
+import os
+import subprocess
+import sys
+
+root = sys.argv[1]
+sys.path.insert(0, "src")
+from trick.textindex import DocumentStore
+
+db = os.path.join(root, "trick.db")
+matrix = os.path.join(root, "scores.trk")
+store = DocumentStore(db)
+store.upsert_many(
+    [
+        {"source": "cran", "key": "alpha", "title": "alpha: Aggregation", "summary": "joins"},
+        {"source": "cran", "key": "beta", "title": "beta: Mixed models", "summary": "slopes"},
+    ]
+)
+store.close()
+
+env = dict(os.environ, PYTHONPATH="src", TRICK_HOME=root)
+built = subprocess.run(
+    [sys.executable, "-m", "trick", "matrix", "build", "--db", db, "--matrix", matrix],
+    capture_output=True,
+    text=True,
+    env=env,
+)
+if built.returncode != 0:
+    raise SystemExit(f"matrix build failed: {built.stderr.strip()}")
+info = subprocess.run(
+    [sys.executable, "-m", "trick", "matrix", "info", "--matrix", matrix],
+    capture_output=True,
+    text=True,
+    env=env,
+)
+if info.returncode != 0:
+    raise SystemExit(f"matrix info failed: {info.stderr.strip()}")
+payload = json.loads(info.stdout)
+if payload.get("records") != 2 or payload.get("synthetic") is not True:
+    raise SystemExit(f"matrix info is wrong: {payload}")
+print(f"matrix ok: {payload['records']} records, {payload['bytes']} bytes, synthetic={payload['synthetic']}")
+PYCODE
+rm -rf "$TMPMATRIX"
 
 echo "gate: all checks passed"

@@ -420,6 +420,16 @@ class DocumentStore:
     def bm25(self, query: str, *, limit: int = 50, doc_ids: Sequence[int] | None = None) -> list[tuple[int, float]]:
         """Return ``(doc_id, score)`` best-first, score normalised to 0..1."""
         expression = _fts_expression(query)
+        return self.bm25_expression(expression, limit=limit, doc_ids=doc_ids)
+
+    def bm25_expression(
+        self, expression: str, *, limit: int = 50, doc_ids: Sequence[int] | None = None
+    ) -> list[tuple[int, float]]:
+        """BM25 for a prepared FTS5 expression.
+
+        Query expansion and the plain path both end up here, so an expanded run
+        is scored by the same code as an unexpanded one.
+        """
         if not expression:
             return []
         raw = self._bm25_raw(expression, limit=limit, doc_ids=doc_ids)
@@ -477,6 +487,12 @@ class DocumentStore:
     def rescore(self, query: str, doc_ids: Sequence[int]) -> dict[int, float]:
         """BM25 over an explicit shortlist; missing ids simply get no score."""
         return dict(self.bm25(query, limit=max(len(doc_ids), 1), doc_ids=doc_ids))
+
+    def rescore_expression(self, expression: str, doc_ids: Sequence[int]) -> dict[int, float]:
+        """BM25 over an explicit shortlist, for an already prepared expression."""
+        return dict(
+            self.bm25_expression(expression, limit=max(len(doc_ids), 1), doc_ids=doc_ids)
+        )
 
     # -- decision cache ----------------------------------------------------
     def cache_get(self, query: str, scorer: str, *, extra: str = "", now: int | None = None) -> dict | None:

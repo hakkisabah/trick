@@ -33,7 +33,7 @@ import hashlib
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 from .errors import (
     ContractViolation,
@@ -47,7 +47,7 @@ from .laya import MockScorer, Scorer, ScorerStats, build_scorer
 from .matrix import MatrixIndex
 from .quant import feature_hash_signature
 from .retrieval import QueryAdapter, RetrievalReport, live_adapters, search_live
-from .textindex import DocumentStore
+from .textindex import DocumentStore, _fts_expression
 from .transcript import ChatRow, ConversationSearch, Message, fingerprint, normalise_messages, window_messages
 
 DEFAULT_SHORTLIST = 12
@@ -74,6 +74,12 @@ DEFAULT_WEIGHTS = (0.2, 0.8)
 # matches get evicted (niche recall@12 1.0 -> 0.6 at 0.62). The prior is a
 # tie-breaker for text relevance, not a ranking signal of its own.
 DEFAULT_PRIOR = 0.45
+# Floor for a signature hit that may enter the candidate set. Measured on the
+# live store: with 16-byte hashed signatures every document scores 0.54..0.87
+# against any query, so no floor separates signal from noise. The matrix is
+# therefore a last resort (text found nothing), not a ranking channel, and the
+# floor only rejects an exact zero.
+MATRIX_MIN_COSINE = 0.0
 # Blend the prior into the retrieval term shown to the ranker? Only useful when
 # there is no model score at all - see ``SearchEngine.blend_uses_prior``.
 DEFAULT_BLEND_PRIOR = False
@@ -229,6 +235,8 @@ class SearchEngine:
         use_cache: bool = True,
         local_floor: int = DEFAULT_LOCAL_FLOOR,
         live_cap: int = DEFAULT_LIVE_CAP,
+        expand: Callable[[str], str] | None = None,
+        matrix_rescue: bool = False,
     ) -> None:
         self.store = store
         self.scorer: Scorer = scorer if scorer is not None else MockScorer()
@@ -249,6 +257,17 @@ class SearchEngine:
         self.live_cap = max(0, int(live_cap))
         self.budget_s = budget_s
         self.use_cache = use_cache
+        # Optional query rewriter: query text in, FTS5 expression out. Absent
+        # means the plain token expression, so nothing changes for existing
+        # callers. The digest below folds it into the cache key by name, because
+        # a different rewriter must not answer from another one's payloads.
+        self.expand = expand
+        # Off by default. Measured: hashed signatures cannot separate documents
+        # (every cosine lands in 0.54..0.87), so a rescued shortlist is noise
+        # dressed as an answer. Kept as an explicit opt-in for hosts where an
+        # empty result is worse than an imperfect one.
+        self.matrix_rescue = bool(matrix_rescue)
+        self.expansion_name = getattr(expand, "__name__", "") or ("" if expand is None else "custom")
         # Same scorer, same blend weights, separate corpus: the conversation
         # index is in memory and per request, so it cannot share the store.
         self.conversation = ConversationSearch(
@@ -267,6 +286,23 @@ class SearchEngine:
         self._matrix: MatrixIndex | None = None
         self._matrix_error: str | None = None
         self._matrix_absent = False
+
+    # -- query expression --------------------------------------------------
+    def _expression(self, query: str) -> str:
+        """Turn the query into the FTS5 expression the store is scored with.
+
+        Without a rewriter this is the plain token expression. With one, the
+        rewriter may widen it (synonyms, prefixes, feedback terms); a rewriter
+        that raises or returns nothing falls back instead of failing a search,
+        because a broken expansion must never be worse than no expansion.
+        """
+        if self.expand is None:
+            return _fts_expression(query)
+        try:
+            expression = str(self.expand(query) or "")
+        except Exception:  # noqa: BLE001 - a rewriter is not allowed to break search
+            return _fts_expression(query)
+        return expression or _fts_expression(query)
 
     # -- matrix ------------------------------------------------------------
     def _open_matrix(self) -> MatrixIndex | None:
@@ -411,23 +447,34 @@ class SearchEngine:
 
         # Stage 2: local BM25 over the whole store (bulk catalogues live here).
         stage = time.monotonic()
+        expression = self._expression(query)
         candidates: dict[int, float] = {}
-        for doc_id, score in self.store.bm25(query, limit=self.prefilter):
+        for doc_id, score in self.store.bm25_expression(expression, limit=self.prefilter):
             candidates[doc_id] = score
         timings["bm25_ms"] = (time.monotonic() - stage) * 1000.0
 
         # Stage 3: matrix prefilter (remembered signatures).
+        #
+        # Only a rescue channel: it runs when the text index found fewer
+        # documents than the shortlist needs. Always unioning it was measured and
+        # rejected on the two gold sets - a hashed bag-of-words signature gives a
+        # positive cosine to almost every document, and mixing those in carried
+        # their priors past weaker text scores (niche recall@12 1.000 -> 0.500,
+        # nDCG@10 0.870 -> 0.497). A channel that cannot add recall must not be
+        # allowed to reorder a healthy result.
         stage = time.monotonic()
         matrix = self._open_matrix()
-        if matrix is not None and matrix.count:
+        matrix_used = 0
+        if self.matrix_rescue and matrix is not None and matrix.count and not candidates:
             try:
                 hits = matrix.scan(feature_hash_signature(query), k=self.prefilter)
             except TrickError as exc:
                 degraded.append(exc.s_code)
             else:
                 for hit in hits:
-                    if hit.cosine > 0:
+                    if hit.cosine >= MATRIX_MIN_COSINE:
                         candidates.setdefault(hit.record_id, max(hit.cosine, 0.0))
+                        matrix_used += 1
         elif self._matrix_error:
             degraded.append(self._matrix_error.split(":", 1)[0])
         timings["matrix_ms"] = (time.monotonic() - stage) * 1000.0
@@ -451,7 +498,9 @@ class SearchEngine:
         # Stage 4: rescore the union with BM25 restricted to those ids, then cut.
         stage = time.monotonic()
         priors = self.store.weights_for(list(candidates))
-        shortlist_ids, cut_scores, text_scores = self._shortlist(query, candidates, priors)
+        shortlist_ids, cut_scores, text_scores = self._shortlist(
+            expression, candidates, priors
+        )
         timings["shortlist_ms"] = (time.monotonic() - stage) * 1000.0
 
         # Stage 5: ask laya.
@@ -460,7 +509,11 @@ class SearchEngine:
         ordered_ids = [doc_id for doc_id in shortlist_ids if doc_id in docs]
         probabilities: dict[int, float] = {}
         scored = False
-        gated = self._gate_closed(text_scores)
+        # A rescued shortlist has no lexical overlap with the query at all, so
+        # asking the model to pick a winner would spend a call to rank noise.
+        # It is reported as retrieval-only instead.
+        rescued_only = bool(matrix_used) and not any(text_scores.values())
+        gated = self._gate_closed(text_scores) or rescued_only
         if len(ordered_ids) >= 2 and not gated:
             texts = [_text_for(docs[doc_id]) for doc_id in ordered_ids]
             try:
@@ -512,6 +565,9 @@ class SearchEngine:
                 "candidates": len(candidates),
                 "shortlist": len(ordered_ids),
                 "scored_by_laya": scored,
+                # Non-zero only when the text index found nothing and the
+                # signature matrix supplied the shortlist instead.
+                "matrix_rescued": matrix_used,
                 "gated": gated,
                 "scorer": getattr(self.scorer, "name", "unknown"),
                 # Shipped with every answer so a client can describe the number it
@@ -526,7 +582,7 @@ class SearchEngine:
         )
 
     def _shortlist(
-        self, query: str, candidates: dict[int, float], priors: dict[int, float]
+        self, expression: str, candidates: dict[int, float], priors: dict[int, float]
     ) -> tuple[list[int], dict[int, float], dict[int, float]]:
         """Cut the candidate union to the laya shortlist.
 
@@ -548,7 +604,7 @@ class SearchEngine:
         if len(ids) <= self.shortlist:
             return ids, cut, text
 
-        stage_scores = self.store.rescore(query, ids)
+        stage_scores = self.store.rescore_expression(expression, ids)
         for doc_id in ids:
             text[doc_id] = max(text[doc_id], stage_scores.get(doc_id, 0.0))
         if self.fusion == "rrf":
@@ -898,6 +954,8 @@ def _pipeline_digest(engine: SearchEngine) -> str:
         f"s{engine.shortlist}",
         f"lf{engine.local_floor}lc{engine.live_cap}",
         f"cw{engine.chat_window}",
+        f"x{engine.expansion_name or 'none'}",
+        f"mr{int(engine.matrix_rescue)}",
         f"nd{_transcript.NEAR_DUP_COSINE}",
         f"ch{_transcript.MIN_CHARS}-{_transcript.MAX_CHARS}",
         f"tw{_transcript.DEFAULT_WEIGHTS}",

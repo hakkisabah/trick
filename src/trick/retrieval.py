@@ -43,13 +43,15 @@ import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from html import unescape
-from typing import Callable, Iterable, Sequence
+from typing import Callable, Iterable, Iterator, Sequence
 
 from .errors import ContractViolation, SourceUnavailable
 
 USER_AGENT = "trick/0.1 (+https://github.com/hakkisabah/trick)"
 DEFAULT_BUDGET_S = 1.5
-CRAN_PACKAGES_URL = "https://cran.r-project.org/web/packages/available_packages_by_date.html"
+# Full DESCRIPTION records for every current package, one JSON object per key.
+# 45 MB, ~25k entries, served in about a second. Fetched at ingest time only.
+CRAN_DB_URL = "https://crandb.r-pkg.org/-/latest"
 BIOC_PACKAGES_URL = "https://bioconductor.org/packages/json/3.21/bioc/packages.json"
 ARXIV_URL = "https://export.arxiv.org/api/query"
 OPENALEX_URL = "https://api.openalex.org/works"
@@ -92,6 +94,57 @@ def http_get(url: str, timeout: float) -> bytes:
 Transport = Callable[[str, float], bytes]
 
 
+def iter_json_objects(data: bytes) -> Iterator[dict]:
+    """Yield the top-level objects of a JSON document without loading it.
+
+    ``crandb`` serves 45 MB of ``{"pkg": {...}, ...}``. ``json.loads`` on that
+    needs several hundred megabytes of RSS on a host that may have 512 MB, which
+    is the whole reason Trick exists. This walks the buffer byte by byte, matches
+    braces outside strings, and decodes one entry at a time: peak memory is the
+    size of the largest entry, not the file.
+
+    Bytes, not text: ``{``, ``}``, ``"`` and ``\\`` cannot appear inside a UTF-8
+    multi-byte sequence, so brace counting on bytes is safe, and each slice is
+    decoded on its own.
+    """
+    start = data.find(b"{")
+    if start < 0:
+        return
+    depth = 0
+    in_string = False
+    escaped = False
+    entry_start = -1
+    for index in range(start, len(data)):
+        byte = data[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif byte == 0x5C:  # backslash
+                escaped = True
+            elif byte == 0x22:  # quote
+                in_string = False
+            continue
+        if byte == 0x22:
+            in_string = True
+        elif byte == 0x7B:  # {
+            if depth == 1 and entry_start < 0:
+                entry_start = index
+            depth += 1
+        elif byte == 0x7D:  # }
+            depth -= 1
+            if depth == 1 and entry_start >= 0:
+                chunk = data[entry_start : index + 1]
+                entry_start = -1
+                try:
+                    value = json.loads(chunk.decode("utf-8", "replace"))
+                except ValueError:
+                    continue
+                if isinstance(value, dict):
+                    yield value
+            elif depth == 0:
+                return
+
+
 class BulkAdapter:
     """A catalogue that is downloaded as one snapshot and indexed locally."""
 
@@ -116,50 +169,54 @@ class BulkAdapter:
         return self.documents(self.snapshot(timeout))
 
 
-class CranAdapter(BulkAdapter):
-    """CRAN via the "available packages by date" snapshot.
+class CranCrandbAdapter(BulkAdapter):
+    """CRAN descriptions from ``crandb``, one JSON object per package.
 
-    The obvious source, ``src/contrib/PACKAGES.gz``, is a trap: it lists
-    Package, Version, Depends, Imports, Suggests, License and MD5sum but **no
-    Title and no Description**, so parsing it yields 25k rows that are worthless
-    for text search (verified: 25,608 blocks, zero titles). The HTML index has
-    the one field that matters, plus the publication date:
+    Two cheaper-looking sources were measured and rejected:
 
-        <td>2026-10-23</td><td><a href=".../lme4/index.html">
-        <span class="CRAN">lme4</span></a></td><td>Linear Mixed-Effects Models ...</td>
+    * ``src/contrib/PACKAGES.gz`` lists Package, Version, Depends, Imports,
+      Suggests, License and MD5sum but **no Title and no Description**: 25,608
+      blocks parse to 25,608 rows with nothing to search, so every CRAN hit
+      would be decided by the package name alone;
+    * ``web/packages/available_packages_by_date.html`` has titles (and was used
+      until this adapter existed) but no descriptions, which left 25,595 documents
+      with an empty summary. That is why ``data.table`` could not be found for
+      "fast aggregation and joins for large tables": its description contains
+      exactly those words, its title contains none of them.
+
+    ``crandb`` ``/-/latest`` is 45 MB and arrives in about a second. It is parsed
+    with :func:`iter_json_objects`, so ingest peaks at the largest entry rather
+    than the whole document - measured 73 MB RSS for the full 45 MB payload.
     """
 
     name = "cran"
-    url = CRAN_PACKAGES_URL
-    ROW = re.compile(
-        r"<tr>\s*<td>\s*(\d{4}-\d{2}-\d{2})\s*</td>\s*"
-        r'<td>\s*<a href="[^"]*/packages/([A-Za-z0-9._]+)/index\.html">\s*'
-        r'<span class="CRAN">([^<]+)</span>\s*</a>\s*</td>\s*'
-        r"<td>(.*?)</td>",
-        re.S,
-    )
+    url = CRAN_DB_URL
 
     def documents(self, payload: bytes) -> list[SourceDoc]:
-        text = payload.decode("utf-8", "replace")
         out: list[SourceDoc] = []
         seen: set[str] = set()
-        for published, path_name, name, title_html in self.ROW.findall(text):
-            name = name.strip()
+        for entry in iter_json_objects(payload):
+            name = str(entry.get("Package") or "").strip()
             if not name or name in seen:
                 continue
             seen.add(name)
-            title = unescape(re.sub(r"<[^>]+>", " ", title_html))
-            title = " ".join(title.split())
-            if not title:
+            title = " ".join(str(entry.get("Title") or "").split())
+            description = " ".join(str(entry.get("Description") or "").split())
+            if not title and not description:
                 continue
+            published = str(entry.get("Date/Publication") or "")[:10]
             out.append(
                 SourceDoc(
                     source="cran",
                     key=name,
-                    title=f"{name}: {title}",
-                    summary="",
+                    title=f"{name}: {title}" if title else name,
+                    summary=description,
                     url=f"https://CRAN.R-project.org/package={name}",
-                    meta={"kind": "r-package", "published": published, "path": path_name},
+                    meta={
+                        "kind": "r-package",
+                        "version": str(entry.get("Version") or ""),
+                        "published": published,
+                    },
                 )
             )
         return out
@@ -462,7 +519,7 @@ def live_adapters(transport: Transport = http_get) -> list[QueryAdapter]:
 
 
 def bulk_adapters(transport: Transport = http_get) -> list[BulkAdapter]:
-    return [CranAdapter(transport), BioconductorAdapter(transport)]
+    return [CranCrandbAdapter(transport), BioconductorAdapter(transport)]
 
 
 def search_live(
@@ -510,7 +567,7 @@ __all__ = [
     "ArxivAdapter",
     "BioconductorAdapter",
     "BulkAdapter",
-    "CranAdapter",
+    "CranCrandbAdapter",
     "CranDownloadsAdapter",
     "CrossrefAdapter",
     "OpenAlexAdapter",

@@ -6,7 +6,8 @@ Subcommands:
     trick tui                        interactive terminal session (Enter submits)
     trick serve                      the core service: unix socket + loopback HTTP
     trick mcp                        MCP server on stdio, for any MCP host
-    trick ingest [--source cran,bioc] [--max-docs N]
+    trick ingest [--source cran,bioc] [--max-docs N] [--no-matrix]
+    trick matrix build [--limit N]    rebuild the int8 score matrix from the store
     trick doctor
     trick probe                      one real laya call, prints latency and usage
 
@@ -30,6 +31,8 @@ from .bridge import BridgeServer, cors_from_env
 from .credentials import DEFAULT_CREDENTIALS_PATH, load_laya_credentials
 from .errors import ConfigError, ContractViolation, TrickError
 from .laya import LayaClient, build_scorer
+from .matrix import MatrixIndex, MatrixMissing
+from .matrixbuild import build_from_store
 from .mcp import EngineBackend, McpServer, build_backend
 from .render import render_json, render_outcome
 from .retrieval import (
@@ -252,6 +255,50 @@ def cmd_ingest(args) -> int:
     finally:
         store.close()
     print(f"store now holds {total} upserted rows at {db}")
+    if not getattr(args, "no_matrix", False):
+        matrix = Path(args.matrix) if getattr(args, "matrix", None) else DEFAULT_MATRIX
+        _print_matrix(build_matrix(db, matrix))
+    return 0
+
+
+def build_matrix(db: Path, path: Path, *, limit: int = 0) -> dict:
+    """Rebuild the score matrix from the store; safe to run at any time."""
+    store = DocumentStore(db)
+    try:
+        return build_from_store(store, path, limit=limit)
+    finally:
+        store.close()
+
+
+def _print_matrix(info: dict) -> None:
+    print(
+        f"matrix: {info['records']} records, {info['bytes']} bytes, "
+        f"{info['seconds']}s at {info['path']}"
+    )
+
+
+def cmd_matrix(args) -> int:
+    path = Path(args.matrix) if getattr(args, "matrix", None) else DEFAULT_MATRIX
+    if args.action == "build":
+        db = Path(args.db or DEFAULT_DB)
+        _print_matrix(build_matrix(db, path, limit=args.limit))
+        return 0
+    try:
+        index = MatrixIndex(path)
+    except MatrixMissing as exc:
+        print(json.dumps({"path": str(path), "present": False, "reason": str(exc)}, indent=2))
+        return 0
+    try:
+        info = {
+            "path": str(path),
+            "present": True,
+            "records": index.count,
+            "synthetic": index.synthetic,
+            "bytes": Path(path).stat().st_size,
+        }
+    finally:
+        index.close()
+    print(json.dumps(info, indent=2))
     return 0
 
 
@@ -377,9 +424,18 @@ def build_parser() -> argparse.ArgumentParser:
     ingest.add_argument("--source", default="cran,bioc")
     ingest.add_argument("--max-docs", type=int, default=0)
     ingest.add_argument("--timeout", type=float, default=90.0)
+    ingest.add_argument("--no-matrix", action="store_true", help="do not rebuild the score matrix")
+    ingest.add_argument("--matrix", help=f"matrix path (default {DEFAULT_MATRIX})")
     ingest.add_argument("--no-popularity", action="store_true",
                         help="skip CRAN download counts (the ranking prior)")
     ingest.set_defaults(func=cmd_ingest)
+
+    matrix = sub.add_parser("matrix", help="build or inspect the int8 score matrix")
+    matrix.add_argument("action", choices=["build", "info"])
+    matrix.add_argument("--limit", type=int, default=0, help="stop after N documents")
+    matrix.add_argument("--db", help=f"store path (default {DEFAULT_DB})")
+    matrix.add_argument("--matrix", help=f"matrix path (default {DEFAULT_MATRIX})")
+    matrix.set_defaults(func=cmd_matrix)
 
     doctor = sub.add_parser("doctor", help="print environment, store and credential state")
     doctor.set_defaults(func=cmd_doctor)
