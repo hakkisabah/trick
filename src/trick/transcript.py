@@ -181,7 +181,13 @@ def normalise_messages(raw: Iterable[object]) -> list[Message]:
     out: list[Message] = []
     for position, item in enumerate(raw):
         if isinstance(item, Message):
-            out.append(item)
+            out.append(
+                Message(
+                    role=item.role,
+                    content=strip_result_blocks(item.content),
+                    mid=item.mid,
+                )
+            )
             continue
         if isinstance(item, str):
             # A minimal client may send plain strings; treating one as a user
@@ -206,6 +212,9 @@ def normalise_messages(raw: Iterable[object]) -> list[Message]:
             raise ContractViolation(f"message {position} has unsupported content type")
         if len(content) > MAX_TOTAL_CHARS:
             raise ContractViolation(f"message {position} is larger than the transcript contract")
+        # A block this tool wrote is not evidence: index the message as it was
+        # before the block was appended, or the next search ranks its own output.
+        content = strip_result_blocks(content)
         out.append(Message(role=role, content=content, mid=str(item.get("id") or "")))
     if len(out) > MAX_MESSAGES:
         raise ResourceExhausted(f"transcript has {len(out)} messages, limit is {MAX_MESSAGES}")
@@ -247,6 +256,48 @@ def fingerprint(messages: Sequence[Message]) -> str:
 
 def _clean(text: str) -> str:
     return _WHITESPACE.sub(" ", text)
+
+
+# A results block this tool wrote into a message. It must never be indexed: the
+# text of the block names the query and the turns, so a second search would
+# match its own output and rank a previous answer above the passage that holds
+# the answer. Measured on a real chat: the row "turn 45 · assistant" matched
+# the words "mistake, made" only because that message carried the previous block.
+#
+# The block is always appended at the end of a message and always begins a line,
+# so cutting from the marker to the end removes exactly what was added. A marker
+# alone is not enough evidence - a user may type the same words - so the tail
+# must also look like a block before anything is cut.
+RESULT_MARKERS = ("**Trick** · ", "<!-- trick:results -->")
+_BLOCK_SIGNALS = (
+    "passage",
+    "matched:",
+    "catalogue source",
+    "no jump target",
+    "Weak match",
+    "degraded:",
+)
+
+
+def strip_result_blocks(text: str) -> str:
+    """Cut a results block this tool wrote earlier out of a message."""
+    if not text:
+        return text
+    cut = len(text)
+    for marker in RESULT_MARKERS:
+        start = 0
+        while True:
+            at = text.find(marker, start)
+            if at == -1 or at >= cut:
+                break
+            tail = text[at:]
+            if sum(1 for signal in _BLOCK_SIGNALS if signal in tail) >= 2:
+                cut = at
+                break
+            start = at + len(marker)
+    if cut == len(text):
+        return text
+    return text[:cut].rstrip()
 
 
 def split_message(message: Message, *, turn: int, next_id: int) -> list[Chunk]:

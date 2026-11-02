@@ -157,7 +157,16 @@ def _action(module, url: str, token: str = TOKEN, limit: int = 2):
     return action
 
 
-def _run(action, query, messages=()):
+DEFAULT_MESSAGES = (
+    {"id": "u-1", "role": "user", "content": "which package?"},
+    {"id": "a-1", "role": "assistant", "content": "the previous answer"},
+)
+
+
+def _run(action, query, messages=DEFAULT_MESSAGES):
+    # A press happens inside a chat that has an answer, and the block is written
+    # into that answer: an assistant message is the one Open WebUI renders as
+    # Markdown, so a body with no answer falls back to a framed text card.
     body = {"id": "m1", "model": "gpt", "messages": list(messages)}
     response = asyncio.run(action.action(body, __event_call__=Dialog(query)))
     if isinstance(response, dict):
@@ -188,7 +197,12 @@ def test_successful_search_renders_links_ranks_and_labels(action_module):
     assert "0.75" in html
     assert isinstance(response, dict), "the results are written into the message"
     assert server.seen[0]["auth"] == f"Bearer {TOKEN}"
-    assert server.seen[0]["body"] == {"query": "negative binomial", "limit": 2, "live": True}
+    assert server.seen[0]["body"]["query"] == "negative binomial"
+    assert server.seen[0]["body"]["limit"] == 2
+    assert server.seen[0]["body"]["scope"] == "both"
+    # The transcript that travelled with the question, with its ids, so a row
+    # can point back at the message it came from.
+    assert [item["id"] for item in server.seen[0]["body"]["messages"]] == ["u-1", "a-1"]
 
 
 def test_long_summary_is_truncated_not_dumped(action_module):
@@ -223,7 +237,9 @@ def test_empty_result_is_an_answer_not_an_error(action_module):
         html, _ = _run(_action(action_module, server.url), "nothing matches")
     finally:
         server.close()
-    assert "Nothing matched" in html
+    # A transcript travelled with the question, so the honest answer is
+    # "this conversation does not contain it", not "nothing matched".
+    assert "No passage in this conversation contains" in html
     assert "text for S4" in html
 
 

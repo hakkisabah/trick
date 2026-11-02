@@ -3,7 +3,7 @@ title: Trick
 author: hakkisabah
 author_url: https://github.com/hakkisabah/trick
 funding_url: https://github.com/hakkisabah/trick
-version: 0.10.0
+version: 0.10.1
 required_open_webui_version: 0.5.0
 description: Find a passage in a long conversation; every hit links to its turn.
 """
@@ -85,12 +85,18 @@ DEGRADED_TEXT = {
 # dead code that looks alive.
 #
 # What does work is the id the chat page puts on every message element:
-# ``id="message-<id>"``, the same one its own ``scrollToMessage`` looks up. A
-# Markdown link to ``#message-<id>`` is scrolled by the browser itself - no
-# script, no frame, no privilege, no router round-trip. Markdown is rendered in
-# the page, and raw HTML is not: this build shows a message body's tags as
-# their own text. The action therefore returns the message back with the
-# results appended, and every row is a real Markdown link.
+# ``id="message-<id>"`` (Message.svelte), the same one its own scroll code looks
+# up. A Markdown link to ``#message-<id>`` is scrolled by the browser itself - no
+# script, no frame, no privilege, no router round-trip. The action therefore
+# returns an assistant message with the block appended, and every row is a real
+# Markdown link.
+#
+# The block must land on an *assistant* message. Open WebUI renders that one
+# through its Markdown renderer (``renderMarkdownInAssistantMessages``, default
+# true), while a user message is drawn as plain text whenever
+# ``renderMarkdownInUserMessages`` is off. Measured on a real chat: the block sat
+# on the user's own question, so ``**bold**`` arrived as literal asterisks and
+# every link arrived as text.
 MARKER = "**Trick** · "
 # What the previous release wrote. Existing chats still carry it, so a new
 # search cuts the block at whichever of the two appears first - otherwise a
@@ -268,12 +274,26 @@ class Action:
             dropped=dropped,
         )
 
-        attached = self._attach(body, block)
+        attached = self._attach(messages, block, str((body or {}).get("id") or ""))
         if attached:
             return attached
-        # No message id (an API call, not a browser): there is nothing to write
-        # the block into, so fall back to a plain framed copy. It cannot jump
-        # anywhere, so it does not pretend to: the Markdown is shown as text.
+        # No assistant message to hold it (an answer-less chat, or an API call
+        # with no message id): there is nowhere a rendered Markdown block can go,
+        # so fall back to a plain framed copy. It cannot jump anywhere, so it
+        # does not pretend to: the Markdown is shown as text.
+        if __event_emitter__ is not None:
+            try:
+                await __event_emitter__(
+                    {
+                        "type": "notification",
+                        "data": {
+                            "type": "warning",
+                            "content": "Trick: no answer in this chat to attach the results to.",
+                        },
+                    }
+                )
+            except Exception:
+                pass
         return self._text_card(f"Trick: {query}", block, degraded)
 
     # -- the results block --------------------------------------------------
@@ -293,13 +313,13 @@ class Action:
     ) -> str:
         """The block written into the message, in Markdown only.
 
-        Raw HTML is not an option here. This Open WebUI build shows a message
-        body as text when it carries HTML tags, so ``<details>`` and ``<a>``
-        arrive on screen as their own source - measured on a real chat, not
-        assumed. Markdown is rendered, and a Markdown link becomes a real anchor
-        in the page itself, which is what a jump needs: the embed frame a card
-        would be drawn in is sandboxed without ``allow-same-origin`` and cannot
-        reach the chat at all.
+        Raw HTML is not an option here: the block has to be rendered by the chat
+        page, and a message that carries tags arrives on screen as their own
+        source when the page draws that message as plain text - measured on a
+        real chat, not assumed. Markdown is rendered for an assistant message,
+        and a Markdown link becomes a real anchor in the page itself, which is
+        what a jump needs: the embed frame a card would be drawn in is sandboxed
+        without ``allow-same-origin`` and cannot reach the chat at all.
 
         Every row links to ``#message-<id>``, the anchor the chat page gives each
         message element. That is the jump Open WebUI's own ``scrollToMessage``
@@ -436,25 +456,49 @@ class Action:
         return lines
 
     @staticmethod
-    def _attach(body, block: str) -> dict:
-        """Return the message back with the block appended, or {} when it cannot.
+    def _attach(messages, block: str, pressed_id: str = "") -> dict:
+        """Return the assistant message that should carry the block, updated.
 
-        Open WebUI applies ``res.messages`` to the chat and saves it, which is
-        the documented way for an action to update the message it ran on. Only
-        the message the button was pressed on is touched, and only below the
-        marker: a second search replaces the previous block instead of stacking.
+        Where the block lands decides whether it is readable at all. Open WebUI
+        draws an assistant message through its Markdown renderer, but a user
+        message is drawn as plain text whenever ``renderMarkdownInUserMessages``
+        is off - and then ``**bold**``, a blockquote and every link arrive on
+        screen as their own source. Measured on a real chat: the block had been
+        appended to the user's own question, which is why it looked like raw
+        text and why nothing was clickable.
+
+        So the target is an assistant message: the pressed one when the button
+        sits on an answer, otherwise the closest answer above it, otherwise the
+        closest one below. When the chat has no answer at all there is nowhere
+        to put a Markdown block, and saying nothing is better than writing plain
+        text that looks broken.
         """
-        mid = str((body or {}).get("id") or "").strip()
-        if not mid:
+        if not isinstance(messages, list) or not messages:
             return {}
-        current = ""
-        for item in (body.get("messages") or []):
-            if isinstance(item, dict) and str(item.get("id")) == mid:
-                current = str(item.get("content") or "")
-                break
-        base = _cut_block(current)
-        content = f"{base}\n\n{block}" if base else block
-        return {"messages": [{"id": mid, "content": content}]}
+        rows = [item for item in messages if isinstance(item, dict)]
+        if not rows:
+            return {}
+        pressed = 0
+        if pressed_id:
+            for position, item in enumerate(rows):
+                if str(item.get("id") or "") == pressed_id:
+                    pressed = position
+                    break
+        order = [pressed]
+        order.extend(range(pressed - 1, -1, -1))
+        order.extend(range(pressed + 1, len(rows)))
+        for position in order:
+            item = rows[position]
+            if str(item.get("role") or "") != "assistant":
+                continue
+            mid = str(item.get("id") or "").strip()
+            if not mid:
+                continue
+            current = item.get("content") if isinstance(item.get("content"), str) else ""
+            base = _cut_block(current)
+            content = f"{base}\n\n{block}" if base else block
+            return {"messages": [{"id": mid, "content": content}]}
+        return {}
 
     # -- dialog ------------------------------------------------------------
     async def _ask(self, event_call) -> tuple[str | None, bool]:
@@ -606,16 +650,25 @@ class Action:
         node = messages.get(anchor) if anchor else None
         if not isinstance(node, dict):
             # No anchor: the timestamps are the only ordering that cannot lie.
-            return sorted(
-                (item for item in messages.values() if isinstance(item, dict)),
-                key=lambda item: float(item.get("timestamp") or 0),
-            )
+            return [
+                {**item, "id": str(item.get("id") or key)}
+                for key, item in sorted(
+                    messages.items(),
+                    key=lambda pair: float((pair[1] or {}).get("timestamp") or 0),
+                )
+                if isinstance(item, dict)
+            ]
         chain: list[dict] = []
         seen: set[int] = set()
+        key = anchor
         while isinstance(node, dict) and id(node) not in seen:
             seen.add(id(node))
-            chain.append(node)
+            # Stored messages are keyed by id and do not repeat it inside the
+            # object on every schema; without this the result rows carry no
+            # anchor and every "jump to this turn" link is dead.
+            chain.append({**node, "id": str(node.get("id") or key)})
             parent = node.get("parentId")
+            key = str(parent) if parent else ""
             node = messages.get(parent) if parent else None
         chain.reverse()
         return chain

@@ -326,10 +326,10 @@ systemctl --user daemon-reload
 ## 8. Open WebUI
 
 Trick is an **Action**: a button in the message toolbar. Press it, an input dialog
-opens, type what you are looking for, press Enter, and a collapsible results block
-is appended under that message - every hit is a link to the turn it came from. It
-is not a model, so it never appears in the model selector and never answers a
-chat turn.
+opens, type what you are looking for, press Enter, and the results block is
+appended to the **answer** in that chat - every hit is a link to the turn it came
+from. It is not a model, so it never appears in the model selector and never
+answers a chat turn.
 
 Three things must be true: the bridge is running and reachable from the container,
 you have an **admin** Open WebUI session, and that session has produced an API key.
@@ -414,8 +414,8 @@ you press the button; that is why it comes second.
 
 Verify end to end: open a chat that has a few turns, press the Trick button (the
 magnifier) under any answer, type `differential expression for RNA-seq counts`,
-press Enter. Expected in about 1-2 s: a collapsible `Trick` block appended under
-that answer, with `<n> passages match, showing the closest <k>`, then one row per
+press Enter. Expected in about 1-2 s: a `Trick` block appended to that answer,
+with `<n> passages match, showing the closest <k>`, then one row per
 hit: `turn <n> · <role>` as a **link**, the query words that passage actually
 contains (`matched: ...`, plus `(partial)` when the passage carries less than
 half of the question's distinctive weight), and the passage. Clicking a row
@@ -428,9 +428,19 @@ allow-downloads`, and `iframeSandboxAllowSameOrigin` defaults to **false** in
 cannot be granted top-level navigation, and the page accepts only three message
 types from it (`input:prompt`, `input:prompt:submit`, `action:submit`). There is
 no supported way for a card inside that frame to scroll the chat, so this action
-does not use a frame at all: it returns the pressed message back with the block
+does not use a frame at all: it returns an **assistant** message with the block
 appended (Open WebUI applies `res.messages` and saves it), and the block is
-rendered by the chat page itself.
+rendered by the chat page's own Markdown renderer.
+
+Which message holds it matters. Open WebUI draws an assistant message through
+that renderer (`renderMarkdownInAssistantMessages`, default true), but a user
+message is drawn as plain text whenever `renderMarkdownInUserMessages` is off -
+and then `**bold**` arrives as literal asterisks and a link arrives as text.
+Measured on a real chat: the block had been written into the user's own question,
+which is exactly why it looked like source and nothing was clickable. So the
+target is the pressed message when it is an answer, otherwise the closest answer
+above it, otherwise the closest one below. A chat that holds no answer yet gets a
+warning and no block, instead of plain text that looks broken.
 
 That makes every row an ordinary Markdown link to `#message-<id>`, the anchor
 the chat page gives each message element (`id="message-<id>"`, the same id its
@@ -439,12 +449,13 @@ no script, no sandbox flag, no admin setting, no router round-trip. The
 `?message=<id>` parameter is only read while the chat page mounts, so a
 same-page navigation to it can land without scrolling - the fragment cannot.
 The trade-off is that the results live in the message: they persist with the
-chat, and a second search on the same message replaces the block instead of
-stacking another one. Raw HTML is not used anywhere in the block: this build
-shows tags in a message body as their own text, which is why the block is
-Markdown only and has no collapsible element - it is capped at three rows
-instead. Below `**Trick** · ` is the only part the action ever rewrites; the
-text above it is never touched.
+chat, and a second search replaces the block instead of stacking another one.
+Raw HTML is not used anywhere in the block, so it has no collapsible element -
+it is capped at three rows instead. Below `**Trick** · ` is the only part the
+action ever rewrites; the text above it is never touched. The block itself is
+never indexed: it names the query and the turns it found, so searching its own
+output would rank a previous answer above the passage that holds the answer. The
+index is built from the messages as they were before the block was appended.
 
 With the default `SOURCES=never` the catalogues stay out of the way, and the
 block says in one line that `N catalogue sources matched outside this

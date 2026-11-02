@@ -107,27 +107,41 @@ def main() -> int:
         if f"#message-{mid}" not in html.unescape(block):
             problems.append(f"row {mid!r} has no reachable anchor target")
 
-    # 4: a second press replaces the block; the user's text is never rewritten.
-    body = {"id": ids[1], "messages": [{"id": ids[1], "content": "my own question"}]}
-    first = module.Action._attach(body, block)
+    # 4: the block lands on an assistant message, never on the user's own
+    # question - a user message is drawn as plain text when Open WebUI's
+    # renderMarkdownInUserMessages is off, and then the block arrives as source
+    # with dead links. A second press replaces it instead of stacking it.
+    branch = [
+        {"id": "u-1", "role": "user", "content": "my own question"},
+        {"id": ids[1], "role": "assistant", "content": "the answer"},
+    ]
+    first = module.Action._attach(branch, block, "u-1")
     if not first:
-        problems.append("_attach returned nothing for a message that has an id")
+        problems.append("_attach returned nothing for a chat that has an answer")
     else:
-        content = first["messages"][0]["content"]
-        if not content.startswith("my own question"):
-            problems.append("_attach dropped the text the user wrote")
+        target = first["messages"][0]
+        if target["id"] != ids[1]:
+            problems.append("_attach wrote into the user's question instead of the answer")
+        content = target["content"]
+        if not content.startswith("the answer"):
+            problems.append("_attach dropped the text of the answer")
         if content.count(module.MARKER) != 1:
             problems.append("the marker does not appear exactly once")
-        again = module.Action._attach(
-            {"id": ids[1], "messages": [{"id": ids[1], "content": content}]}, block
+        second = module.Action._attach(
+            [
+                {"id": "u-1", "role": "user", "content": "my own question"},
+                {"id": ids[1], "role": "assistant", "content": content},
+            ],
+            block,
+            "u-1",
         )["messages"][0]["content"]
-        if again.count(module.MARKER) != 1:
+        if second.count(module.MARKER) != 1:
             problems.append("a second press stacked the block instead of replacing it")
-        if again.count("<details") > 1:
+        if second.count("<details") > 1:
             problems.append("a second press left two blocks in the message")
 
-    if module.Action._attach({"id": "", "messages": []}, block):
-        problems.append("_attach invented a target for a call with no message id")
+    if module.Action._attach([{"id": "u-1", "role": "user", "content": "q"}], block, "u-1"):
+        problems.append("_attach wrote a Markdown block into a chat that has no answer")
 
     if problems:
         print("jump check failed:", file=sys.stderr)

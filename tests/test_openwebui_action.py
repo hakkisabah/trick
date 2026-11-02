@@ -159,10 +159,12 @@ def test_dispatches_with_body_only(monkeypatch):
     assert "turn 3" in card
     assert "DESeq2" not in card
     assert "hidden (SOURCES=never)" in card
-    # The results are written into the pressed message, which is what lets the
-    # rows be ordinary links in the page instead of a sandboxed embed.
+    # The results are written into an assistant message, because that is the one
+    # Open WebUI draws through its Markdown renderer; a user message may be
+    # drawn as plain text, where a link is not a link. Here the button was
+    # pressed on "m1", which is not in the branch, so the nearest answer holds it.
     assert isinstance(response, dict)
-    assert response["messages"][0]["id"] == "m1"
+    assert response["messages"][0]["id"] == "a-2"
 
 
 def test_chat_rows_are_clickable_and_jump_to_the_message(monkeypatch):
@@ -343,9 +345,17 @@ def test_chat_text_is_escaped(monkeypatch):
     payload = json.loads(json.dumps(RESULT))
     payload["result"]["chat"][0]["text"] = "<script>alert(1)</script>"
     monkeypatch.setattr(module.Action, "_post", lambda self, p: payload)
-    body = {"id": "m1", "messages": [{"role": "user", "content": "x"}]}
+    body = {
+        "id": "m1",
+        "messages": [
+            {"id": "u-1", "role": "user", "content": "x"},
+            {"id": "a-2", "role": "assistant", "content": "an answer"},
+        ],
+    }
 
-    card = html_of(asyncio.run(dispatch_like_open_webui(module, body)))
+    response = asyncio.run(dispatch_like_open_webui(module, body))
+    assert isinstance(response, dict), "an assistant message should carry the block"
+    card = "\n".join(str(item.get("content") or "") for item in response["messages"])
 
     # Result text must arrive escaped, never as markup: the block is rendered
     # by the chat itself now, so an unescaped payload would be live HTML. In
