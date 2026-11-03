@@ -696,6 +696,26 @@ fingerprint is the server's identity: a different box on the same address is
 refused, which is why a self-signed certificate is enough. Quotas, the leak the
 store cannot avoid, and rotation are in `docs/REMOTE.md`.
 
+A backup that only happens when you remember it is not a backup, so there is a
+timer. It writes a systemd --user unit and an environment file, and it refuses to
+enable anything until the passphrase is in that file:
+
+```sh
+sh deploy/backup-timer.sh --remote=https://YOUR-STATIC-IP:8790 \
+    --fingerprint=THE-FINGERPRINT --start
+```
+
+`--start` also runs the service once, so a broken setup fails now instead of at
+03:30. What it runs is one command, and you can run the same one by hand:
+
+```sh
+.venv/bin/python -m trick backup run        # export, push, verify, clean up
+```
+
+Removal: `systemctl --user disable --now trick-backup.timer`, then delete
+`~/.config/systemd/user/trick-backup.service` and `trick-backup.timer`, then
+`systemctl --user daemon-reload`.
+
 ## 11. Everything this project creates
 
 | Artifact | Created by | Removed by |
@@ -711,6 +731,8 @@ store cannot avoid, and rotation are in `docs/REMOTE.md`.
 | `~/trick-memory.trk` | step 10, only if you asked for it | `rm -f` that file |
 | `$HOME/.local/share/trick/vault.token` | step 10b, only if you push | `rm -f vault.token` |
 | `$HOME/.local/share/trick/vault-store/` | only if you run a store here | `rm -rf vault-store/` |
+| `$HOME/.config/trick/backup.env` | step 10b timer | `rm -f backup.env` |
+| `$HOME/.config/systemd/user/trick-backup.timer` | step 10b timer | disable it, then delete the unit |
 | laya credentials file | step 3 | `rm -f` that file |
 
 No process survives a reboot except the systemd unit from step 7b, and that one

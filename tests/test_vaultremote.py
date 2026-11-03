@@ -424,6 +424,33 @@ def test_a_malformed_row_header_is_400_not_a_dropped_connection(tmp_path, server
     assert b"400" in answer.split(b"\r\n", 1)[0]
 
 
+def test_backup_run_exports_and_pushes_in_one_step(tmp_path, server, monkeypatch) -> None:
+    """What the systemd timer calls: no terminal, no argument, one command."""
+    from trick.cli import main
+
+    url, token, fingerprint = server
+    home = make_home(tmp_path / "src", [("h1", "remote", 1, "{}")])
+    monkeypatch.setenv("TRICK_BACKUP_PASSPHRASE", "pass phrase")
+    monkeypatch.setenv("TRICK_VAULT_TOKEN", token)
+    code = main(["backup", "run", "--home", str(home), "--remote", url, "--fingerprint", fingerprint])
+    assert code == 0
+    listing = RemoteVault(url, token, fingerprint=fingerprint).listing()
+    assert len(listing) == 1
+    assert listing[0]["rows"] == 1
+
+
+def test_backup_run_refuses_without_a_passphrase_in_the_environment(tmp_path, server, monkeypatch) -> None:
+    from trick.cli import main
+
+    url, token, fingerprint = server
+    home = make_home(tmp_path / "src", [("h1", "remote", 1, "{}")])
+    monkeypatch.delenv("TRICK_BACKUP_PASSPHRASE", raising=False)
+    monkeypatch.setenv("TRICK_VAULT_TOKEN", token)
+    code = main(["backup", "run", "--home", str(home), "--remote", url, "--fingerprint", fingerprint])
+    assert code == 1
+    assert RemoteVault(url, token, fingerprint=fingerprint).listing() == []
+
+
 def test_the_store_never_sees_the_passphrase(tmp_path, server) -> None:
     """What is on the server's disk must not contain the secret or the plaintext."""
     url, token, fingerprint = server

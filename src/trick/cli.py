@@ -329,12 +329,15 @@ def _remote(args):
     from .vaultremote import RemoteVault, read_token
 
     home = Path(args.home or DEFAULT_HOME)
-    if not args.remote:
-        raise ConfigError("--remote https://host:port is required for a remote action")
+    url = args.remote or os.environ.get("TRICK_VAULT_URL")
+    if not url:
+        raise ConfigError(
+            "--remote https://host:port is required, or set TRICK_VAULT_URL for a timer"
+        )
     return RemoteVault(
-        args.remote,
+        url,
         read_token(home),
-        fingerprint=args.fingerprint,
+        fingerprint=args.fingerprint or os.environ.get("TRICK_VAULT_FINGERPRINT"),
         ca_file=args.ca,
         timeout=args.timeout,
         allow_plaintext=args.allow_plaintext,
@@ -377,6 +380,47 @@ def cmd_backup(args) -> int:
             passphrase = read_passphrase()
             result = import_archive(Path(args.file), home, passphrase)
             print(json.dumps(result, indent=2))
+            return 0
+        if args.action == "run":
+            # What a timer calls: export, push, clean up, in one step. A backup
+            # that needs a human to remember it is not a backup.
+            import tempfile
+
+            remote = _remote(args)
+            if not os.environ.get("TRICK_BACKUP_PASSPHRASE"):
+                raise VaultError(
+                    "backup run needs TRICK_BACKUP_PASSPHRASE in the environment: a timer has "
+                    "no terminal to ask on, and a passphrase in an argument is a leaked one"
+                )
+            workdir = Path(tempfile.mkdtemp(prefix="trick-backup-"))
+            archive = Path(args.file) if args.file else workdir / "memory.trk"
+            try:
+                exported = export_archive(home, archive, read_passphrase())
+                payload = read_archive(archive, read_passphrase())
+                pushed = remote.put(
+                    archive.read_bytes(),
+                    rows=len(payload.get("decisions") or []),
+                    created_at=int(payload.get("created_at") or 0),
+                )
+            finally:
+                if archive.exists() and not args.file:
+                    archive.unlink()
+                if workdir.exists():
+                    for leftover in workdir.iterdir():
+                        leftover.unlink(missing_ok=True)
+                    workdir.rmdir()
+            print(
+                json.dumps(
+                    {
+                        "bytes": exported["bytes"],
+                        "decisions": exported["decisions"],
+                        "sha256": pushed["sha256"],
+                        "verified": pushed["verified"],
+                        "already_stored": pushed["already_stored"],
+                    },
+                    indent=2,
+                )
+            )
             return 0
         if args.action == "push":
             remote = _remote(args)
@@ -591,7 +635,7 @@ def build_parser() -> argparse.ArgumentParser:
     backup = sub.add_parser("backup", help="encrypted memory: export, inspect, merge, push or pull")
     backup.add_argument(
         "action",
-        choices=("export", "info", "import", "push", "pull", "list", "usage", "delete"),
+        choices=("export", "info", "import", "push", "pull", "list", "usage", "delete", "run"),
     )
     backup.add_argument("file", nargs="?", help="archive path (push), snapshot id (pull/delete)")
     backup.add_argument("--home", help=f"state directory (default {DEFAULT_HOME})")

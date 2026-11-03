@@ -32,7 +32,7 @@ question ("which package is this") and stay in the terminal and in MCP. Asking a
 chat question and receiving eight R packages was not a tuning problem, so the
 code that could do it was removed rather than defaulted off.
 
-467 tests pass and `scripts/check.sh` runs 19 repository checks.
+469 tests pass and `scripts/check.sh` runs 19 repository checks.
 
 The R package in `r/trick` is the same find reimplemented under CRAN's rules: no
 dependencies, no compiled code, no network call. Its parity with this engine is
@@ -399,7 +399,7 @@ src/trick/tui.py          terminal session: Enter submits, history, commands
 src/trick/vault.py        sealed archive: scrypt + AES-GCM, merge on restore
 src/trick/vaultremote.py  remote store: TLS server, pinned client, quotas
 src/trick/cli.py          query / tui / serve / mcp / ingest / doctor / probe
-tests/                    467 tests: layout, corruption, contention, budget,
+tests/                    469 tests: layout, corruption, contention, budget,
                           adapters, client, pipeline, credentials, protocol,
                           permissions, concurrency, session behaviour, chunks,
                           transcript ranking, Turkish folding and stems,

@@ -90,6 +90,22 @@ upload that was never read back is a hope, not a backup.
 `pull --verify` decrypts the pulled file and prints what is inside, so a restore
 is proven before it is merged.
 
+## Scheduling
+
+A manual push is a backup that happens when someone remembers. The timer runs one
+command, `.venv/bin/python -m trick backup run`, which exports into a temporary
+file, pushes it, verifies the read-back and deletes the local copy:
+
+```sh
+sh deploy/backup-timer.sh --remote=https://YOUR-STATIC-IP:8790 \
+    --fingerprint=THE-FINGERPRINT --start
+```
+
+The passphrase lives in `~/.config/trick/backup.env` at mode 600, not in the unit
+and not on the command line: an argument is visible in `ps` and in shell history.
+The script refuses to enable the timer while that file has no passphrase, because
+a timer that fails every night still looks scheduled.
+
 ## The token and the fingerprint are two different locks
 
 * the **token** proves the client may write to the account. It is 32 random
