@@ -367,6 +367,14 @@ def cmd_backup(args) -> int:
 
     home = Path(args.home or DEFAULT_HOME)
     try:
+        # `file` is a positional with nargs="?", so it is None when omitted. Passing
+        # None into Path() raises TypeError, which is not a Trick error code and would
+        # reach the user as a traceback; a missing path is a usage error, not a crash.
+        if args.action in {"export", "info", "import"} and not args.file:
+            raise VaultError(
+                f"backup {args.action} needs an archive path, for example: "
+                f"trick backup {args.action} memory.trk"
+            )
         if args.action == "export":
             passphrase = read_passphrase(confirm=not args.no_confirm)
             result = export_archive(home, Path(args.file), passphrase)

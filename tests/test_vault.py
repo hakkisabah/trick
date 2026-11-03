@@ -196,3 +196,21 @@ def test_without_the_optional_dependency_the_message_names_the_install(monkeypat
 def test_the_passphrase_can_come_from_the_environment(monkeypatch) -> None:
     monkeypatch.setenv("TRICK_BACKUP_PASSPHRASE", "from-env")
     assert vault.read_passphrase() == "from-env"
+
+
+@pytest.mark.parametrize("action", ["export", "info", "import"])
+def test_a_missing_archive_path_is_a_usage_error_not_a_traceback(action, tmp_path, monkeypatch, capsys) -> None:
+    """`file` is positional and optional, so it is None when omitted.
+
+    Passing None into Path() raises TypeError, which is not a Trick error code: the
+    user got a traceback instead of a sentence. A missing path is a usage error, and
+    the exit code has to be 1, not an unhandled exception.
+    """
+    from trick.cli import main
+
+    monkeypatch.setenv("TRICK_BACKUP_PASSPHRASE", "pass phrase")
+    code = main(["backup", action, "--home", str(tmp_path / "home")])
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "needs an archive path" in err
+    assert "Traceback" not in err
