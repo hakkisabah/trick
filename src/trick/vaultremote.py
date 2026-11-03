@@ -454,6 +454,18 @@ def _make_handler(server: VaultServer):
             line = format % args
             print(f"vault: {line}", file=sys.stderr, flush=True)
 
+        def handle_one_request(self) -> None:
+            """A client that hangs up is normal traffic, not a server error.
+
+            A store on a public address sees half-open connections and port
+            scanners all day. Without this, every one of them prints a traceback
+            and costs a thread; the connection is closed quietly instead.
+            """
+            try:
+                super().handle_one_request()
+            except (BrokenPipeError, ConnectionResetError, TimeoutError, ssl.SSLError):
+                self.close_connection = True
+
         # -- helpers -----------------------------------------------------
         def _send(self, status: int, payload: Mapping[str, Any]) -> None:
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -539,8 +551,12 @@ def _make_handler(server: VaultServer):
                 self._fail(413, "S8", f"object larger than {MAX_OBJECT_BYTES} bytes")
                 return
             blob = self.rfile.read(length)
-            rows = int(self.headers.get("X-Trick-Rows") or 0)
-            created = int(self.headers.get("X-Trick-Created") or 0)
+            try:
+                rows = int(self.headers.get("X-Trick-Rows") or 0)
+                created = int(self.headers.get("X-Trick-Created") or 0)
+            except (TypeError, ValueError):
+                self._fail(400, "S8", "X-Trick-Rows and X-Trick-Created must be integers")
+                return
             server.requests += 1
             try:
                 result = server.store.put(account, sha, blob, rows, created)

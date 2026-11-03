@@ -378,6 +378,52 @@ def test_a_token_file_readable_by_others_is_refused(tmp_path, monkeypatch) -> No
         read_token(tmp_path)
 
 
+def test_the_store_survives_a_client_that_hangs_up(tmp_path, server, capfd) -> None:
+    """Port scanners and half-open connections are normal traffic on a public box."""
+    import socket
+    import ssl as ssl_module
+
+    url, token, fingerprint = server
+    port = int(url.rsplit(":", 1)[1])
+    context = ssl_module.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl_module.CERT_NONE
+    for _ in range(5):
+        raw = socket.create_connection(("127.0.0.1", port), timeout=5)
+        wrapped = context.wrap_socket(raw, server_hostname="localhost")
+        wrapped.close()  # no request line, ever
+    captured = capfd.readouterr()
+    assert "Exception occurred" not in captured.err
+    assert "Traceback" not in captured.err
+    assert RemoteVault(url, token, fingerprint=fingerprint).ping()["ok"] is True
+
+
+def test_a_malformed_row_header_is_400_not_a_dropped_connection(tmp_path, server) -> None:
+    import socket
+    import ssl as ssl_module
+
+    url, token, fingerprint = server
+    port = int(url.rsplit(":", 1)[1])
+    context = ssl_module.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl_module.CERT_NONE
+    raw = socket.create_connection(("127.0.0.1", port), timeout=5)
+    wrapped = context.wrap_socket(raw, server_hostname="localhost")
+    body = b"TRICKV1\0payload"
+    sha = hashlib.sha256(body).hexdigest()
+    request = (
+        f"PUT /v1/objects/{sha} HTTP/1.1\r\n"
+        f"Host: localhost\r\n"
+        f"Authorization: Bearer {token}\r\n"
+        f"X-Trick-Rows: banana\r\n"
+        f"Content-Length: {len(body)}\r\n\r\n"
+    ).encode() + body
+    wrapped.sendall(request)
+    answer = wrapped.recv(4096)
+    wrapped.close()
+    assert b"400" in answer.split(b"\r\n", 1)[0]
+
+
 def test_the_store_never_sees_the_passphrase(tmp_path, server) -> None:
     """What is on the server's disk must not contain the secret or the plaintext."""
     url, token, fingerprint = server
