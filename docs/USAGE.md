@@ -166,6 +166,22 @@ conversation is searched too.
 There is no corpus valve, no row limit and no live toggle: the button searches
 the conversation, so those settings had nothing left to steer.
 
+## Memory, and what a backup contains
+
+Three things live in `$TRICK_HOME` and only one of them is worth carrying:
+
+| File | Size here | Re-derivable | In the backup |
+| --- | --- | --- | --- |
+| `trick.db` catalogue (28 495 rows) | 44 MB | yes, one ingest | no |
+| `trick.db` decision cache (77 rows) | - | no, it cost model calls | yes |
+| `scores.trk` int8 matrix | 668 KB | yes, one build | header only |
+
+That split is what makes a $5 cloud box enough for a few hundred users: the part
+you back up is hundreds of kilobytes, and the part that is large is public data
+you can rebuild anywhere. `python -m trick backup export` writes an encrypted
+archive of the middle row only; `import` merges it, newer rows winning, and never
+deletes anything you already have.
+
 ## What Trick does not do
 
 - It does not answer questions, summarise, or invent. There is no language model

@@ -66,6 +66,11 @@ def main() -> int:
     parser.add_argument("--token-file", default=str(Path.home() / ".local" / "share" / "trick" / "bridge.token"))
     parser.add_argument("--dry-run", action="store_true", help="print what would be sent, change nothing")
     parser.add_argument(
+        "--check",
+        action="store_true",
+        help="only compare the installed function with this file; exit 1 when the install is stale",
+    )
+    parser.add_argument(
         "--no-token",
         action="store_true",
         help="do not write the bridge token into the TRICK_TOKEN valve",
@@ -102,6 +107,36 @@ def main() -> int:
         return 1
     listed = body if isinstance(body, list) else []
     existing = next((item for item in listed if item.get("id") == FUNCTION_ID), None)
+
+    if args.check:
+        # The recurring failure on this project was a stale install: the button
+        # looked fine and behaved like an older release, because the file in the
+        # repository had moved on while the copy in Open WebUI's database had not.
+        # Comparing bytes and version here makes that impossible to miss.
+        if not existing:
+            print(f"not installed: function '{FUNCTION_ID}' is missing", file=sys.stderr)
+            return 1
+        status, stored = request(f"{base}/api/v1/functions/id/{FUNCTION_ID}", key)
+        if status != 200 or not isinstance(stored, dict):
+            print(f"cannot read the installed function: {status} {stored}", file=sys.stderr)
+            return 1
+        installed = stored.get("content") or ""
+        problems = []
+        if installed != content:
+            problems.append(f"content differs ({len(installed)} bytes installed, {len(content)} in this file)")
+        if stored.get("type") != EXPECTED_TYPE:
+            problems.append(f"type is {stored.get('type')!r}, expected {EXPECTED_TYPE!r}")
+        if not stored.get("is_global"):
+            problems.append("the action is not global, so no button appears under answers")
+        if not stored.get("is_active"):
+            problems.append("the action is disabled")
+        if problems:
+            for line in problems:
+                print(f"stale: {line}", file=sys.stderr)
+            print("re-run this script without --check to update the install", file=sys.stderr)
+            return 1
+        print(f"up to date: {len(installed)} bytes, type={stored.get('type')}, global, active")
+        return 0
     verb = "update" if existing else "create"
     if existing:
         print(f"function '{FUNCTION_ID}' exists as type={existing.get('type')}, updating to {EXPECTED_TYPE}")

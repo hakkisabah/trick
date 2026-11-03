@@ -13,7 +13,8 @@ dependencies = []
 
 [project.optional-dependencies]
 accel = ["numpy>=1.24"]
-dev = ["pytest>=8", "numpy>=1.24"]
+backup = ["cryptography>=42"]
+dev = ["pytest>=8", "numpy>=1.24", "cryptography>=42"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

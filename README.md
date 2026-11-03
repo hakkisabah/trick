@@ -36,7 +36,7 @@ code that could do it was removed rather than defaulted off.
 
 The R package in `r/trick` is the same find reimplemented under CRAN's rules: no
 dependencies, no compiled code, no network call. Its parity with this engine is
-measured, not asserted - `scripts/parity_r.py` (gate 17) runs one fixture through
+measured, not asserted - `scripts/parity_r.py` (gate 18) runs one fixture through
 both and compares passage boundaries, ranking order and the matrix bytes in both
 directions.
 

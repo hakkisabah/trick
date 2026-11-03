@@ -376,6 +376,10 @@ sh deploy/owui-first-run.sh --start          # or run the command step 6 printed
 # 3. the function itself (needs an admin key, see 8.2)
 TRICK_OPENWEBUI_API_KEY=paste-the-key-here \
   .venv/bin/python integrations/openwebui/install.py
+
+# 4. and confirm the installed copy is the one in this checkout
+TRICK_OPENWEBUI_API_KEY=paste-the-key-here \
+  .venv/bin/python integrations/openwebui/install.py --check
 ```
 
 Step 1 creates `.venv`, installs the package, downloads the catalogues if the
@@ -446,6 +450,19 @@ done: open a chat, press the Trick button under any answer, type what you are lo
 instance truncated or rewrote the content; do not use the button until this
 matches. `stored type='pipe'` → an old install is still in the database; delete it
 under `Admin Settings` → `Functions` and re-run the installer.
+
+After pulling a new version of this repository, ask whether the installed copy is
+still the one you built:
+
+```sh
+TRICK_OPENWEBUI_API_KEY=paste-the-key-here \
+  .venv/bin/python integrations/openwebui/install.py --check
+```
+
+`up to date: <n> bytes, type=action, global, active` means the button runs the
+code in this checkout. `stale: content differs (...)` means it does not - reinstall.
+This check exists because a stale install is indistinguishable from a working one
+from the outside: it looks right and behaves like an older release.
 
 ### 8.4 Fallback route (only if the installer cannot be used)
 
@@ -581,7 +598,7 @@ root access and no change to the host is needed.
 What is shared with the Python implementation is proven, not claimed. Two
 levels: `r/trick/inst/extdata/sample.trk` is a matrix written by the Python
 writer and the R test suite asserts that R reads it and reproduces it byte for
-byte; and `scripts/parity_r.py` (gate 17) runs one fixture through **both**
+byte; and `scripts/parity_r.py` (gate 18) runs one fixture through **both**
 engines, comparing passage boundaries, message ids, ranking order for three
 queries and the matrix bytes in both directions. Measured on this tree: 6
 passages identical, 3 rankings identical, byte-identical writes each way. The
@@ -602,7 +619,41 @@ name `trick` is free on CRAN, `r/check.sh` produces the tarball, and the two
 NOTEs it reports (`New submission`, `unable to verify current time`) are expected
 on a first submission and in a sandbox.
 
-## 10. Everything this project creates
+## 10. Encrypted memory backup (optional)
+
+The local install is complete without this section and stays free. What follows
+is only for carrying the small part that cannot be re-derived onto another
+machine.
+
+What is backed up: the decision cache (which query was answered, with which
+scorer, when) and a settings snapshot with every credential replaced by the name
+of the environment variable that holds it. What is **not** backed up: the
+catalogue. It is 44 MB of public data that one `python -m trick ingest` rebuilds,
+and a backup that carries it is both wasteful and pointless. On this tree the
+archive is 372 KB against a 44 MB store.
+
+```sh
+.venv/bin/pip install 'cryptography>=42'      # or: .venv/bin/pip install -e '.[backup]'
+
+# write an archive; the passphrase is asked for twice and never stored
+.venv/bin/python -m trick backup export ~/trick-memory.trk
+
+# inspect one (needs only the passphrase, not the local state)
+.venv/bin/python -m trick backup info ~/trick-memory.trk
+
+# merge one into this machine: newer rows win, nothing is deleted
+.venv/bin/python -m trick backup import ~/trick-memory.trk
+```
+
+The passphrase can come from `TRICK_BACKUP_PASSPHRASE` for scripted use; it is
+never written to disk, never printed, and never passed as an argument, because a
+passphrase in `ps` output is a leaked passphrase. The archive is
+`TRICKV1 | salt | nonce | AES-256-GCM`, key derived with scrypt (n=2^15, r=8,
+p=1). A wrong passphrase, a flipped byte and a truncated file all fail the same
+way - `cannot open the archive` - because GCM authenticates the whole payload
+before anything is written into the local cache.
+
+## 11. Everything this project creates
 
 | Artifact | Created by | Removed by |
 | --- | --- | --- |
@@ -614,12 +665,13 @@ on a first submission and in a sandbox.
 | `$HOME/.local/share/trick/scores.trk` | optional, when a matrix is written | `rm -f scores.trk` |
 | `$HOME/.config/systemd/user/trick-bridge.service` | step 7b | step 7b remove block |
 | Open WebUI function `trick` | step 8 | step 8 remove |
+| `~/trick-memory.trk` | step 10, only if you asked for it | `rm -f` that file |
 | laya credentials file | step 3 | `rm -f` that file |
 
 No process survives a reboot except the systemd unit from step 7b, and that one
 exists only if you installed it.
 
-## 11. When something is degraded
+## 12. When something is degraded
 
 Trick never hides a failure behind a plausible answer. Every degradation has a
 code, and it is the same code on every surface:
@@ -642,12 +694,18 @@ Run the repository gate before trusting a checkout:
 sh scripts/check.sh
 ```
 
-Fourteen checks: tests, byte-compile, on-disk layout, ranking constants, no network
-in tests, MCP and bridge surfaces, socket and token permissions, English-only
-repository, no credentials in tracked files, stdout purity, integration surfaces,
-integration secrets, documentation truth (every documented command and path must
-exist), and conversation-search quality against planted needles.
+Eighteen checks: tests, byte-compile, on-disk layout, ranking constants, no
+network in tests, MCP and bridge surfaces, socket and token permissions,
+English-only repository, no credentials in tracked files, stdout purity,
+integration surfaces, integration secrets, documentation truth (every documented
+command and path must exist), conversation-search quality against planted
+needles, conversation search on a real chat shape (identifiers, rare words and
+tokens that must return nothing), result rows that jump to their message, the
+score matrix build and read-back, and R parity with the Python engine.
 
-The last one is a floor, not a target: it fails the gate if `recall@3` drops below
-0.9, `MRR@10` below 0.8 or a decoy becomes the top hit more than 20% of the time,
-so a ranking change cannot silently make the tool worse at its primary job.
+Two of them are floors, not targets. Conversation quality fails the gate if
+`recall@3` drops below 0.9, `MRR@10` below 0.8 or a decoy becomes the top hit
+more than 20% of the time. The real-chat gate fails it if identifier `recall@3`
+drops below 0.9 or a query whose words occur nowhere returns a single row - that
+second one is the "confident wrong answer" class, and it is why an unrelated
+answer cannot come back unnoticed.

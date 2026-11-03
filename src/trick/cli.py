@@ -325,6 +325,39 @@ def self_weights(source: str, docs, *, popularity: bool) -> list[tuple[str, str,
     return []
 
 
+def cmd_backup(args) -> int:
+    """Encrypted memory: the decision cache, never the catalogue.
+
+    The catalogue is 44 MB of public data that one ingest rebuilds; the decision
+    cache is a few hundred rows that cost model calls to produce. That asymmetry
+    is what makes a 512 MB cloud box enough, and it is why this command refuses to
+    be a full-disk copy.
+    """
+    from .vault import VaultError, describe, export_archive, import_archive, read_archive, read_passphrase
+
+    home = Path(args.home or DEFAULT_HOME)
+    try:
+        if args.action == "export":
+            passphrase = read_passphrase(confirm=not args.no_confirm)
+            result = export_archive(home, Path(args.file), passphrase)
+            print(json.dumps(result, indent=2))
+            return 0
+        if args.action == "info":
+            payload = read_archive(Path(args.file), read_passphrase())
+            print(json.dumps(describe(payload), indent=2))
+            return 0
+        if args.action == "import":
+            passphrase = read_passphrase()
+            result = import_archive(Path(args.file), home, passphrase)
+            print(json.dumps(result, indent=2))
+            return 0
+    except VaultError as exc:
+        print(f"backup: {exc}", file=sys.stderr)
+        return 1
+    print(f"unknown backup action {args.action!r}", file=sys.stderr)
+    return 2
+
+
 def cmd_doctor(args) -> int:
     engine = _engine(args)
     info = engine.health()
@@ -443,6 +476,17 @@ def build_parser() -> argparse.ArgumentParser:
     probe = sub.add_parser("probe", help="one real laya call")
     probe.add_argument("text", nargs="?", default="mixed effects model does not converge")
     probe.set_defaults(func=cmd_probe)
+
+    backup = sub.add_parser("backup", help="encrypted memory: export, inspect or merge an archive")
+    backup.add_argument("action", choices=("export", "info", "import"))
+    backup.add_argument("file", help="archive path")
+    backup.add_argument("--home", help=f"state directory (default {DEFAULT_HOME})")
+    backup.add_argument(
+        "--no-confirm",
+        action="store_true",
+        help="do not ask for the passphrase twice when exporting",
+    )
+    backup.set_defaults(func=cmd_backup)
     return parser
 
 
