@@ -653,6 +653,49 @@ p=1). A wrong passphrase, a flipped byte and a truncated file all fail the same
 way - `cannot open the archive` - because GCM authenticates the whole payload
 before anything is written into the local cache.
 
+## 10b. Remote store (optional, $5/month)
+
+Only if you want the archive on another machine. The local install is unaffected:
+nothing in the terminal, MCP, Open WebUI or R surfaces talks to a store, and no
+local feature is paid.
+
+The store holds the sealed blob and has no key, so it cannot read a decision, a
+setting or the passphrase. One real archive from this tree is 380,781 bytes
+against a 64 MB default quota, which is why the cheapest instance is enough.
+
+Server side, on the instance (Ubuntu 24.04, the $5 plan, static IP, only the
+store port open):
+
+```sh
+sudo sh deploy/vault-server.sh /opt/trick-src
+sudo systemctl start trick-vault
+```
+
+It prints the account token once and the certificate fingerprint. Copy the token
+to the client, at mode 600:
+
+```sh
+install -m 600 /dev/null ~/.local/share/trick/vault.token
+printf '%s' 'THE-TOKEN-PRINTED-ON-THE-SERVER' > ~/.local/share/trick/vault.token
+```
+
+Client side:
+
+```sh
+.venv/bin/python -m trick backup export ~/trick-memory.trk
+.venv/bin/python -m trick backup push ~/trick-memory.trk \
+    --remote https://YOUR-STATIC-IP:8790 --fingerprint THE-FINGERPRINT
+.venv/bin/python -m trick backup list --remote https://YOUR-STATIC-IP:8790 --fingerprint THE-FINGERPRINT
+.venv/bin/python -m trick backup pull SNAPSHOT-ID --out ~/restored.trk --verify \
+    --remote https://YOUR-STATIC-IP:8790 --fingerprint THE-FINGERPRINT
+.venv/bin/python -m trick backup import ~/restored.trk
+```
+
+`push` reads the object back and compares the hash before it reports success. The
+fingerprint is the server's identity: a different box on the same address is
+refused, which is why a self-signed certificate is enough. Quotas, the leak the
+store cannot avoid, and rotation are in `docs/REMOTE.md`.
+
 ## 11. Everything this project creates
 
 | Artifact | Created by | Removed by |
@@ -666,6 +709,8 @@ before anything is written into the local cache.
 | `$HOME/.config/systemd/user/trick-bridge.service` | step 7b | step 7b remove block |
 | Open WebUI function `trick` | step 8 | step 8 remove |
 | `~/trick-memory.trk` | step 10, only if you asked for it | `rm -f` that file |
+| `$HOME/.local/share/trick/vault.token` | step 10b, only if you push | `rm -f vault.token` |
+| `$HOME/.local/share/trick/vault-store/` | only if you run a store here | `rm -rf vault-store/` |
 | laya credentials file | step 3 | `rm -f` that file |
 
 No process survives a reboot except the systemd unit from step 7b, and that one
@@ -694,14 +739,15 @@ Run the repository gate before trusting a checkout:
 sh scripts/check.sh
 ```
 
-Eighteen checks: tests, byte-compile, on-disk layout, ranking constants, no
+Nineteen checks: tests, byte-compile, on-disk layout, ranking constants, no
 network in tests, MCP and bridge surfaces, socket and token permissions,
 English-only repository, no credentials in tracked files, stdout purity,
 integration surfaces, integration secrets, documentation truth (every documented
 command and path must exist), conversation-search quality against planted
 needles, conversation search on a real chat shape (identifiers, rare words and
 tokens that must return nothing), result rows that jump to their message, the
-score matrix build and read-back, and R parity with the Python engine.
+score matrix build and read-back, R parity with the Python engine, and a real TLS
+memory store pushed, pulled and imported with byte, payload and row parity.
 
 Two of them are floors, not targets. Conversation quality fails the gate if
 `recall@3` drops below 0.9, `MRR@10` below 0.8 or a decoy becomes the top hit

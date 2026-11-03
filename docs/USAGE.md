@@ -182,6 +182,11 @@ you can rebuild anywhere. `python -m trick backup export` writes an encrypted
 archive of the middle row only; `import` merges it, newer rows winning, and never
 deletes anything you already have.
 
+`backup push` and `backup pull` move that same archive to a store you run, which
+holds the sealed blob and has no key. A real archive here is 380,781 bytes for 77
+decisions, so 100 accounts fit in the cheapest instance. The store is optional and
+the local build never contacts it; see `docs/REMOTE.md`.
+
 ## What Trick does not do
 
 - It does not answer questions, summarise, or invent. There is no language model

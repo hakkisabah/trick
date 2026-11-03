@@ -28,11 +28,13 @@ sys.path.insert(0, str(ROOT / "src"))
 from trick.cli import (  # noqa: E402
     DEFAULT_DB,
     DEFAULT_HISTORY,
+    DEFAULT_HOME,
     DEFAULT_MATRIX,
     DEFAULT_SOCKET,
     DEFAULT_TOKEN,
     build_parser,
 )
+from trick.vaultremote import token_for_home  # noqa: E402
 
 DOC_GLOBS = ("README.md", "docs/*.md", "integrations/*.md", "deploy/*.md")
 PATH_SUFFIXES = (".py", ".sh", ".md", ".json", ".toml", ".db", ".trk", ".token")
@@ -60,6 +62,8 @@ def known_state_paths() -> set[str]:
         str(DEFAULT_SOCKET),
         str(DEFAULT_TOKEN),
         str(DEFAULT_HISTORY),
+        str(token_for_home(Path.home())),
+        str(Path(DEFAULT_HOME) / "vault-store"),
     }
 
 

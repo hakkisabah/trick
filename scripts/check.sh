@@ -19,9 +19,10 @@
 #     15. jump         every result row links to the turn it came from
 #     16. matrix       the score matrix builds from the store and reads back
 #     17. R package    R sources parse; with R installed, both engines agree
+#     18. remote store a real TLS store pushed, pulled and imported with parity
 set -eu
 
-TOTAL=18
+TOTAL=19
 
 cd "$(dirname "$0")/.."
 PY="${PY:-.venv/bin/python}"
@@ -438,7 +439,7 @@ print(f"matrix ok: {payload['records']} records, {payload['bytes']} bytes, synth
 PYCODE
 rm -rf "$TMPMATRIX"
 
-echo "== $TOTAL/$TOTAL R package"
+echo "== 18/$TOTAL R package"
 # The R package is a separate deliverable. Two layers of checking:
 #   a. static, always: sources parse, man pages exist, fixture is ASCII
 #   b. parity, when Rscript is installed: one fixture through both engines,
@@ -474,5 +475,13 @@ for name in exports:
         raise SystemExit(f"exported {name} has no man page")
 print(f"R sources ok: {len(sources)} files, {len(man)} man pages, {len(exports)} exports")
 PYCODE
+
+echo "== $TOTAL/$TOTAL remote store"
+# The store is the only part of this product that runs on someone else's disk,
+# so it is the part where "it worked" has to be measured rather than assumed.
+# The script starts a real TLS server as its own process, pins the certificate,
+# exports a real archive, pushes it, pulls it back, imports it into an empty
+# cache and compares bytes, payload and rows.
+"$PY" scripts/verify_remote.py
 
 echo "gate: all checks passed"

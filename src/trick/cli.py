@@ -325,6 +325,22 @@ def self_weights(source: str, docs, *, popularity: bool) -> list[tuple[str, str,
     return []
 
 
+def _remote(args):
+    from .vaultremote import RemoteVault, read_token
+
+    home = Path(args.home or DEFAULT_HOME)
+    if not args.remote:
+        raise ConfigError("--remote https://host:port is required for a remote action")
+    return RemoteVault(
+        args.remote,
+        read_token(home),
+        fingerprint=args.fingerprint,
+        ca_file=args.ca,
+        timeout=args.timeout,
+        allow_plaintext=args.allow_plaintext,
+    )
+
+
 def cmd_backup(args) -> int:
     """Encrypted memory: the decision cache, never the catalogue.
 
@@ -332,8 +348,19 @@ def cmd_backup(args) -> int:
     cache is a few hundred rows that cost model calls to produce. That asymmetry
     is what makes a 512 MB cloud box enough, and it is why this command refuses to
     be a full-disk copy.
+
+    ``push`` and ``pull`` move the same archive to a store that cannot read it.
+    ``push`` reads the object back before it reports success, because an upload
+    nobody verified is not a backup.
     """
-    from .vault import VaultError, describe, export_archive, import_archive, read_archive, read_passphrase
+    from .vault import (
+        VaultError,
+        describe,
+        export_archive,
+        import_archive,
+        read_archive,
+        read_passphrase,
+    )
 
     home = Path(args.home or DEFAULT_HOME)
     try:
@@ -351,11 +378,95 @@ def cmd_backup(args) -> int:
             result = import_archive(Path(args.file), home, passphrase)
             print(json.dumps(result, indent=2))
             return 0
+        if args.action == "push":
+            remote = _remote(args)
+            archive = Path(args.file)
+            if not archive.exists():
+                raise VaultError(f"no such archive: {archive}")
+            payload = read_archive(archive, read_passphrase())
+            result = remote.put(
+                archive.read_bytes(),
+                rows=len(payload.get("decisions") or []),
+                created_at=int(payload.get("created_at") or 0),
+            )
+            result["account"] = remote.usage()["account"]
+            print(json.dumps(result, indent=2))
+            return 0
+        if args.action == "pull":
+            remote = _remote(args)
+            if not args.file:
+                raise VaultError("pull needs a snapshot id (see: trick backup list)")
+            out = Path(args.out or "memory.trk")
+            passphrase = read_passphrase() if args.verify else None
+            result = remote.pull(args.file, out, passphrase)
+            print(json.dumps(result, indent=2))
+            return 0
+        if args.action == "list":
+            print(json.dumps(_remote(args).listing(), indent=2))
+            return 0
+        if args.action == "usage":
+            print(json.dumps(_remote(args).usage(), indent=2))
+            return 0
+        if args.action == "delete":
+            if not args.file:
+                raise VaultError("delete needs a snapshot id")
+            print(json.dumps(_remote(args).delete(args.file), indent=2))
+            return 0
     except VaultError as exc:
         print(f"backup: {exc}", file=sys.stderr)
         return 1
+    except ConfigError as exc:
+        print(f"backup: {exc.s_code} {exc}", file=sys.stderr)
+        return 2
     print(f"unknown backup action {args.action!r}", file=sys.stderr)
     return 2
+
+
+def cmd_vault(args) -> int:
+    """The server half: what runs on the box that holds the ciphertext."""
+    from .vaultremote import (
+        VaultServer,
+        VaultStore,
+        init_store,
+        load_accounts,
+        server_ssl_context,
+    )
+
+    if args.action == "init":
+        result = init_store(Path(args.root), name=args.account)
+        print(json.dumps(result, indent=2))
+        print(
+            "keep this token in the client's TRICK_VAULT_TOKEN, or in "
+            f"{Path(args.home or DEFAULT_HOME) / 'vault.token'} with mode 600",
+            file=sys.stderr,
+        )
+        return 0
+    if args.action != "serve":
+        print(f"unknown vault action {args.action!r}", file=sys.stderr)
+        return 2
+    accounts = load_accounts(Path(args.accounts or (Path(args.root) / "accounts.json")))
+    store = VaultStore(Path(args.root), accounts)
+    tls = server_ssl_context(Path(args.cert), Path(args.key)) if args.cert and args.key else None
+    server = VaultServer(
+        store,
+        host=args.host,
+        port=args.port,
+        tls=tls,
+        allow_plaintext=args.allow_plaintext,
+        expose_public=args.expose_public,
+    )
+    scheme = "https" if tls is not None else "http"
+    print(
+        f"vault: listening on {scheme}://{args.host}:{args.port} "
+        f"root={args.root} accounts={len(accounts)}",
+        file=sys.stderr,
+        flush=True,
+    )
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        server.stop()
+    return 0
 
 
 def cmd_doctor(args) -> int:
@@ -477,16 +588,48 @@ def build_parser() -> argparse.ArgumentParser:
     probe.add_argument("text", nargs="?", default="mixed effects model does not converge")
     probe.set_defaults(func=cmd_probe)
 
-    backup = sub.add_parser("backup", help="encrypted memory: export, inspect or merge an archive")
-    backup.add_argument("action", choices=("export", "info", "import"))
-    backup.add_argument("file", help="archive path")
+    backup = sub.add_parser("backup", help="encrypted memory: export, inspect, merge, push or pull")
+    backup.add_argument(
+        "action",
+        choices=("export", "info", "import", "push", "pull", "list", "usage", "delete"),
+    )
+    backup.add_argument("file", nargs="?", help="archive path (push), snapshot id (pull/delete)")
     backup.add_argument("--home", help=f"state directory (default {DEFAULT_HOME})")
+    backup.add_argument("--out", help="where a pulled archive is written (default memory.trk)")
+    backup.add_argument("--remote", help="store base url, e.g. https://vault.example.com:8790")
+    backup.add_argument("--fingerprint", help="sha256 of the store's DER certificate (pinning)")
+    backup.add_argument("--ca", help="CA bundle to verify the store instead of pinning")
+    backup.add_argument("--timeout", type=float, default=30.0)
+    backup.add_argument("--verify", action="store_true", help="after pull, decrypt and print a summary")
+    backup.add_argument(
+        "--allow-plaintext",
+        action="store_true",
+        help="allow http:// on loopback only, for tests",
+    )
     backup.add_argument(
         "--no-confirm",
         action="store_true",
         help="do not ask for the passphrase twice when exporting",
     )
     backup.set_defaults(func=cmd_backup)
+
+    vault = sub.add_parser("vault", help="run or initialise the remote memory store")
+    vault.add_argument("action", choices=("init", "serve"))
+    vault.add_argument("--root", default=str(Path(DEFAULT_HOME) / "vault-store"))
+    vault.add_argument("--accounts", help="accounts file (default <root>/accounts.json)")
+    vault.add_argument("--account", default="owner", help="account name for init")
+    vault.add_argument("--host", default="127.0.0.1")
+    vault.add_argument("--port", type=int, default=8790)
+    vault.add_argument("--cert", help="TLS certificate (fullchain)")
+    vault.add_argument("--key", help="TLS private key")
+    vault.add_argument("--home", help=f"client state directory (default {DEFAULT_HOME})")
+    vault.add_argument("--allow-plaintext", action="store_true", help="loopback tests only")
+    vault.add_argument(
+        "--expose-public",
+        action="store_true",
+        help="permit a wildcard bind; requires TLS, meant for a store behind a firewall",
+    )
+    vault.set_defaults(func=cmd_vault)
     return parser
 
 

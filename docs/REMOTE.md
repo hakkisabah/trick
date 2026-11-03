@@ -1,0 +1,138 @@
+# Remote memory
+
+Optional. Nothing in Trick requires a server, and no local feature is paid. This
+document is only about the one thing a local installation cannot do for itself:
+keeping the decision cache somewhere else, so a dead disk is not a lost memory.
+
+## What leaves the machine, and what does not
+
+| thing | leaves? | why |
+| --- | --- | --- |
+| the catalogue (CRAN, Bioconductor, arXiv, OpenAlex) | no | 44 MB of public data; one ingest rebuilds it, and backing it up would be the only reason to need a bigger box |
+| the score matrix | header only | the file is re-derivable; the backup records its count, dimensions and hash so a restore can say whether it belongs to the catalogue you now have |
+| the decision cache | yes, sealed | a few hundred rows that cost model calls to produce; not re-derivable without paying again |
+| the settings | yes, credentials replaced | every secret-shaped name is replaced by the environment variable that holds it |
+| the passphrase | never | it is read from `TRICK_BACKUP_PASSPHRASE` or the terminal, and is not written to the archive or to any log |
+| the API keys | never | see above; an archive that carries a key is a liability, not a backup |
+
+The archive is `TRICKV1 | salt | nonce | AES-256-GCM(payload)`, keyed by
+scrypt over your passphrase. The store receives that blob and nothing else, so
+"the server can read my memory" is not a policy here, it is arithmetic: it has
+no key.
+
+## What the store learns anyway
+
+Refusing to pretend: an encrypted blob still has a size and a timestamp. A store
+operator can see that you backed up, when, and how large the archive was. That is
+the whole leak, and it is why the store is not asked to hold anything else.
+
+## Cost, with the arithmetic shown
+
+One real archive from this installation: **380,781 bytes, 77 decisions**. That
+number is the entire reason a $5 instance is enough.
+
+| line | value | measured or derived |
+| --- | --- | --- |
+| instance | 1 vCPU, 512 MB, 20 GB SSD, 1 TB transfer | Lightsail's cheapest plan, $5/month |
+| store process resident memory | ~30 MB | derived: one Python process, no index, no model |
+| one archive | 380,781 bytes | measured (`scripts/verify_remote.py`) |
+| requests per backup | 4 (ping, put, read-back, usage) | derived from the client code |
+| one account at the default quota | 64 MB, 200 snapshots | code default in `src/trick/vaultremote.py` |
+| users that fit comfortably | 100 | derived: 100 x 64 MB = 6.4 GB of 20 GB, 100 users x ~1.5 MB/day = 150 MB/day of 1 TB/month |
+| users at the edge | 400 | derived: 400 x 64 MB = 25.6 GB, above the 20 GB disk |
+| cost per user at 100 users | $0.05/month | $5 / 100 |
+
+These are arithmetic on a measured archive size, not a load test on a rented
+box. No Lightsail instance was created while building this: renting one costs
+money, and that is a decision for the person paying. When one exists, the same
+`scripts/verify_remote.py` points at it and the numbers become measurements.
+
+## Provisioning, in order
+
+1. Create a Lightsail instance, Ubuntu 24.04, the $5 plan, and attach a static
+   IP. Open only the store port in the instance firewall (Networking tab), for
+   example 8790.
+2. Copy this repository to the instance (any method: `scp`, `git clone`).
+3. On the instance, as root:
+
+   ```sh
+   sudo sh deploy/vault-server.sh /opt/trick-src
+   ```
+
+   It creates a system user, a virtualenv, a 0700 store root, one account,
+   a self-signed certificate valid ten years, a hardened systemd unit, and it
+   prints the account token once and the certificate fingerprint.
+4. Start it: `sudo systemctl start trick-vault`. It is enabled, not started, on
+   purpose: an install that starts a listener without being asked is a surprise.
+5. On the client, store the token where only you can read it:
+
+   ```sh
+   install -m 600 /dev/null ~/.local/share/trick/vault.token
+   printf '%s' 'THE-TOKEN-PRINTED-ON-THE-SERVER' > ~/.local/share/trick/vault.token
+   ```
+
+## Client use
+
+```sh
+.venv/bin/python -m trick backup export memory.trk
+.venv/bin/python -m trick backup push memory.trk \
+    --remote https://YOUR-STATIC-IP:8790 --fingerprint THE-FINGERPRINT
+.venv/bin/python -m trick backup list --remote https://YOUR-STATIC-IP:8790 --fingerprint THE-FINGERPRINT
+.venv/bin/python -m trick backup usage --remote https://YOUR-STATIC-IP:8790 --fingerprint THE-FINGERPRINT
+.venv/bin/python -m trick backup pull SNAPSHOT-ID --out restored.trk \
+    --remote https://YOUR-STATIC-IP:8790 --fingerprint THE-FINGERPRINT --verify
+.venv/bin/python -m trick backup import restored.trk
+```
+
+`push` reads the object back and compares the hash before it reports success. An
+upload that was never read back is a hope, not a backup.
+
+`pull --verify` decrypts the pulled file and prints what is inside, so a restore
+is proven before it is merged.
+
+## The token and the fingerprint are two different locks
+
+* the **token** proves the client may write to the account. It is 32 random
+  bytes, compared in constant time, stored on the server only as a SHA-256.
+* the **fingerprint** proves the server is the one you meant. The client pins
+  the SHA-256 of the server's DER certificate and refuses anything else, which is
+  why a self-signed certificate is enough: the identity is the hash, not a name
+  in a public CA's book. There is no renewal to forget and no CA to be tricked.
+
+Neither replaces the passphrase. The store cannot decrypt the archive even with
+both.
+
+## Quotas, stated as they are enforced
+
+| limit | enforced by | effect when exceeded |
+| --- | --- | --- |
+| `max_bytes` (default 64 MB) | server | 507, with the numbers in the message |
+| `max_objects` (default 200) | server | 507 |
+| `max_rows` (default 50000) | client | the client refuses to push |
+
+The row limit cannot be enforced by the server: it cannot count rows inside a
+payload it cannot decrypt. It is recorded for display and enforced on the client,
+and the `usage` output says so in the `rows_unit` field rather than implying an
+enforcement that does not exist.
+
+## When the box dies
+
+The archive is a file. If the instance is lost, the last snapshot is gone with
+it, so back up what you care about twice: keep a local export as well, or run the
+same store on two hosts and push to both. Trick does not pretend a single $5 box
+is durable storage; it makes the second copy cheap.
+
+## Loss of the passphrase
+
+There is no recovery. The store has no key, the archive has no key, and nobody
+can open it. That is the same property that makes the design safe: write the
+passphrase down somewhere that is not the disk being backed up.
+
+## Rotation
+
+* **token**: delete the account from the server's `accounts.json`, run
+  `python -m trick vault init` against a fresh root, and put the new token in
+  the client's `vault.token`.
+* **certificate**: regenerate the pair, restart the service, and update the
+  client's `--fingerprint`. The old fingerprint stops working immediately, which
+  is the point.

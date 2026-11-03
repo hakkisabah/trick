@@ -32,7 +32,7 @@ question ("which package is this") and stay in the terminal and in MCP. Asking a
 chat question and receiving eight R packages was not a tuning problem, so the
 code that could do it was removed rather than defaulted off.
 
-418 tests pass and `scripts/check.sh` runs 18 repository checks.
+465 tests pass and `scripts/check.sh` runs 19 repository checks.
 
 The R package in `r/trick` is the same find reimplemented under CRAN's rules: no
 dependencies, no compiled code, no network call. Its parity with this engine is
@@ -341,6 +341,22 @@ A 64-entry catalogue of real scientific sources is compiled into the package (un
 answers from it. Those rows are always flagged synthetic and unscored: the UI must
 present them as catalogue suggestions, never as scored results.
 
+## Remote memory
+
+The local product is complete and free. The one thing a laptop cannot do for
+itself is survive its own disk, so `python -m trick backup push` sends the sealed
+archive to a store you run: the nearest thing to a "cloud tier" this project has.
+
+The store is a single Python process holding opaque blobs. It has no key, so it
+cannot read a decision, a setting or a passphrase; it learns a size and a time.
+A real archive from this installation is 380,781 bytes and 77 decisions, which is
+why the cheapest instance is enough: 100 accounts fit in a $5/month box with room
+to spare. `scripts/check.sh` gate 19 starts a real TLS store, exports a real
+archive, pushes it, pulls it back, imports it into an empty cache and compares
+bytes, payload and rows - if any of the three differs, the gate fails.
+
+Details, quotas and the security model: `docs/REMOTE.md`.
+
 ## Sources
 
 Bulk catalogues are downloaded rarely and indexed locally in SQLite/FTS5. Live APIs
@@ -380,17 +396,21 @@ src/trick/service.py      core service: unix socket, worker queue, bridge token
 src/trick/bridge.py       loopback HTTP bridge with bearer auth
 src/trick/mcp.py          MCP server on stdio (JSON-RPC 2.0)
 src/trick/tui.py          terminal session: Enter submits, history, commands
+src/trick/vault.py        sealed archive: scrypt + AES-GCM, merge on restore
+src/trick/vaultremote.py  remote store: TLS server, pinned client, quotas
 src/trick/cli.py          query / tui / serve / mcp / ingest / doctor / probe
-tests/                    418 tests: layout, corruption, contention, budget,
+tests/                    465 tests: layout, corruption, contention, budget,
                           adapters, client, pipeline, credentials, protocol,
                           permissions, concurrency, session behaviour, chunks,
                           transcript ranking, Turkish folding and stems,
-                          transports, Open WebUI action, action dispatch
+                          transports, Open WebUI action, action dispatch,
+                          sealed archives, remote store parity and refusals
 scripts/bench.py          produced numbers (not estimates) for this host
 scripts/eval_ranking.py   22-query ranking harness, three orderings per query
 scripts/eval_quota.py     quota harness over one retrieval per query
 scripts/laya_probe.py     one real call, prints the response shape only
-scripts/check.sh          repository gate (16 checks)
+scripts/verify_remote.py  real TLS store: push, pull, import, compare bytes/rows
+scripts/check.sh          repository gate (19 checks)
 ```
 
 ## Install and verify
@@ -447,8 +467,14 @@ LAYA_TIMEOUT_MS=20000
 ```
 
 Data lives in `~/.local/share/trick/` (`trick.db`, `scores.trk`, `run/trick.sock`,
-`bridge.token`, `history`); override with `--db`, `--matrix`, `--socket` or
-`TRICK_HOME`.
+`bridge.token`, `vault.token`, `history`); override with `--db`, `--matrix`,
+`--socket` or `TRICK_HOME`.
+
+`TRICK_BACKUP_PASSPHRASE` supplies the archive passphrase (otherwise it is asked
+for on the terminal, never from an argument). `TRICK_VAULT_TOKEN` supplies the
+remote store token, whose file fallback is `~/.local/share/trick/vault.token` at
+mode 600 - a group-readable token file is refused, for the same reason a
+group-readable key file is.
 
 `TRICK_CONTACT_EMAIL` puts the caller in the scholarly APIs' polite pools (OpenAlex's
 anonymous bucket answers HTTP 429 after a handful of searches, which shows up as
