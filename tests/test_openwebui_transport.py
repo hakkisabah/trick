@@ -146,14 +146,10 @@ class Dialog:
         return self.answer
 
 
-def _action(module, url: str, token: str = TOKEN, limit: int = 2):
+def _action(module, url: str, token: str = TOKEN):
     action = module.Action()
     action.valves.TRICK_URL = url
     action.valves.TRICK_TOKEN = token
-    action.valves.LIMIT = limit
-    # These tests are about how catalogue rows render; the shipped default keeps
-    # them out of the card, so the valve is opened explicitly here.
-    action.valves.SOURCES = "always"
     return action
 
 
@@ -185,33 +181,64 @@ def test_manifest_fields_open_webui_reads(action_module):
     assert action.valves.priority < 0, "the button should not be buried on the right"
 
 
-def test_successful_search_renders_links_ranks_and_labels(action_module):
-    server = _Server(_search_payload())
+def test_a_press_asks_the_bridge_for_the_conversation_and_nothing_else(action_module):
+    """The contract that replaced the catalogue: one scope, the chat.
+
+    A find-in-chat used to send scope=both with an 8-row limit, so every press
+    paid for live catalogue calls whose rows the card never showed. The request
+    body is the whole contract here, so it is asserted field by field.
+    """
+    server = _Server(_chat_payload())
     try:
         html, response = _run(_action(action_module, server.url), "negative binomial")
     finally:
         server.close()
-    assert "Package 0" in html
-    assert "cran/pkg0" in html
-    assert "cran" in html and "bioconductor" in html
-    assert "0.75" in html
-    assert isinstance(response, dict), "the results are written into the message"
-    assert server.seen[0]["auth"] == f"Bearer {TOKEN}"
-    assert server.seen[0]["body"]["query"] == "negative binomial"
-    assert server.seen[0]["body"]["limit"] == 2
-    assert server.seen[0]["body"]["scope"] == "both"
+    sent = server.seen[0]
+    assert sent["auth"] == f"Bearer {TOKEN}"
+    assert sent["path"] == "/v1/search"
+    assert sent["body"]["query"] == "negative binomial"
+    assert sent["body"]["scope"] == "chat"
+    assert "limit" not in sent["body"], "there are no catalogue rows to limit"
+    assert "live" not in sent["body"], "the catalogues must not be queried at all"
     # The transcript that travelled with the question, with its ids, so a row
     # can point back at the message it came from.
-    assert [item["id"] for item in server.seen[0]["body"]["messages"]] == ["u-1", "a-1"]
+    assert [item["id"] for item in sent["body"]["messages"]] == ["u-1", "a-1"]
+    assert isinstance(response, dict), "the results are written into the message"
+    assert "passage 0" in html
 
 
-def test_long_summary_is_truncated_not_dumped(action_module):
-    server = _Server(_search_payload(rows=1))
+def test_a_catalogue_row_can_no_longer_reach_the_card(action_module):
+    """A stale bridge that still answers with rows must not paint them.
+
+    The service keeps catalogue search for the CLI and the MCP server, so a
+    payload can still carry ``rows``. The card shows passages of the chat; an
+    R package listed under a chat question is exactly the noise this button was
+    told to stop producing.
+    """
+    payload = _chat_payload(chat=1)
+    payload["result"]["rows"] = _search_payload(rows=2)["result"]["rows"]
+    server = _Server(payload)
     try:
-        html, _ = _run(_action(action_module, server.url), "q")
+        html, _ = _run(_action(action_module, server.url), "spatial join", [{"role": "user", "content": "x"}])
     finally:
         server.close()
-    assert html.count("A description that is long enough") < 8
+    assert "passage 0" in html
+    assert "Package 0" not in html
+    assert "cran/pkg0" not in html
+    assert "catalogue" not in html.lower()
+
+
+def test_a_long_passage_is_truncated_not_dumped(action_module):
+    payload = _chat_payload(chat=1)
+    payload["result"]["chat"][0]["text"] = "the spatial join detail " * 40
+    server = _Server(payload)
+    try:
+        html, _ = _run(_action(action_module, server.url), "spatial join", [{"role": "user", "content": "x"}])
+    finally:
+        server.close()
+    assert "the spatial join detail" in html
+    longest = max(len(line) for line in html.splitlines() if "spatial join detail" in line)
+    assert longest < 320, "a passage is quoted short, not dumped in full"
     assert "..." in html
 
 
@@ -249,13 +276,15 @@ def test_empty_message_does_not_call_the_service(action_module):
     assert "No question was entered" in html
 
 
-def test_limit_is_clamped_to_the_service_contract(action_module):
-    server = _Server(_search_payload())
+def test_an_empty_conversation_is_answered_without_calling_the_service(action_module):
+    """Nothing to search is not a search: say so instead of asking the bridge."""
+    server = _Server(_chat_payload())
     try:
-        _run(_action(action_module, server.url, limit=999), "q")
+        html, _ = _run(_action(action_module, server.url), "q", [{"role": "user", "content": "   "}])
     finally:
         server.close()
-    assert server.seen[0]["body"]["limit"] == 26
+    assert not server.seen, "an empty chat must not become a network call"
+    assert "no conversation here to search" in html.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -293,7 +322,7 @@ def test_the_chat_is_sent_with_the_messages_it_was_given(action_module):
     finally:
         server.close()
     body = server.seen[0]["body"]
-    assert body["scope"] == "both"
+    assert body["scope"] == "chat"
     assert body["messages"][0] == {
         "role": "user",
         "content": "where did we discuss the spatial join?",
@@ -330,18 +359,6 @@ def test_the_character_budget_stops_at_the_newest_turns(action_module):
     assert dropped == 10 - len(kept)
 
 
-def test_search_chat_off_sends_no_transcript(action_module):
-    server = _Server(_chat_payload(chat=0, rows=1))
-    action = _action(action_module, server.url)
-    action.valves.SEARCH_CHAT = False
-    try:
-        _run(action, "q", [{"role": "user", "content": "hello"}])
-    finally:
-        server.close()
-    assert "messages" not in server.seen[0]["body"]
-    assert "scope" not in server.seen[0]["body"]
-
-
 def test_a_chat_only_answer_does_not_claim_a_catalogue_miss(action_module):
     server = _Server(_chat_payload(chat=1, rows=0))
     try:
@@ -355,10 +372,11 @@ def test_a_chat_only_answer_does_not_claim_a_catalogue_miss(action_module):
 def test_an_empty_conversation_list_sends_nothing(action_module):
     server = _Server(_search_payload(rows=1))
     try:
-        _run(_action(action_module, server.url), "q", [{"role": "user", "content": "  "}])
+        html, _ = _run(_action(action_module, server.url), "q", [{"role": "user", "content": "  "}])
     finally:
         server.close()
-    assert "messages" not in server.seen[0]["body"]
+    assert not server.seen, "an empty transcript is not a question"
+    assert "no conversation here to search" in html.lower()
 
 
 # ---------------------------------------------------------------------------

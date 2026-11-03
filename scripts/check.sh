@@ -18,9 +18,10 @@
 #     14. chat quality conversation search still finds the planted passages
 #     15. jump         every result row links to the turn it came from
 #     16. matrix       the score matrix builds from the store and reads back
+#     17. R package    R sources parse; with R installed, both engines agree
 set -eu
 
-TOTAL=16
+TOTAL=17
 
 cd "$(dirname "$0")/.."
 PY="${PY:-.venv/bin/python}"
@@ -252,12 +253,37 @@ for bad in ("a string", 42, {"role": "user"}):
     else:
         raise AssertionError(f"messages accepted {bad!r}")
 
-assert (
-    'payload["scope"] = "chat" if mode == "never" else "both"' in action_file
-), "a chat-only press must not query the catalogues; the scope follows the valve"
+# The scope is not a setting: this button answers from the conversation it sits
+# in. A valve that makes a find-in-chat return R packages was the exact defect
+# that reached a user, so its absence is asserted rather than its default.
+assert '"scope": "chat"' in action_file, "the press must ask for the conversation"
+assert '"scope": "both"' not in action_file, "a press must never query the catalogues"
+assert "SOURCES" not in action_file, "the catalogue valve must stay gone"
 assert "_results_markdown" in action_file and "CHAT_TURNS" in action_file, "the block must render and window the chat"
-assert "#message-" in action_file, "a row must link to the turn it came from"
-assert 'MARKER = "**Trick** · "' in action_file, "the results block must be Markdown; raw HTML is shown as text"
+assert "?message=" in action_file, "a row must link to the turn it came from"
+assert 'MARKER = "<details>\\n<summary>"' in action_file, (
+    "the results block must be the details element Open WebUI turns into a collapsible"
+)
+assert "</summary>" in action_file and "</details>" in action_file
+class _RowValves:
+    SHOW_SCORES = True
+
+
+class _RowStub:
+    valves = _RowValves()
+
+
+_probe_rows = trick_action.Action._row_markdown(
+    _RowStub(),
+    1,
+    {"turn": 1, "role": "assistant", "message_id": "m1", "text": "hello", "matched": ["hello"]},
+    "chat-1",
+)
+_probe = "\n".join(_probe_rows)
+assert "?message=m1" in _probe, _probe
+assert "target=" not in _probe, (
+    "Open WebUI hardcodes target=_blank; the route must be one its click handler intercepts"
+)
 assert "iframeSandboxAllowSameOrigin" in action_file, "the card's sandbox limit must stay documented"
 
 # The installer must never accept the key as an argument (shell history, ps),
@@ -364,5 +390,42 @@ if payload.get("records") != 2 or payload.get("synthetic") is not True:
 print(f"matrix ok: {payload['records']} records, {payload['bytes']} bytes, synthetic={payload['synthetic']}")
 PYCODE
 rm -rf "$TMPMATRIX"
+
+echo "== $TOTAL/$TOTAL R package"
+# The R package is a separate deliverable. Two layers of checking:
+#   a. static, always: sources parse, man pages exist, fixture is ASCII
+#   b. parity, when Rscript is installed: one fixture through both engines,
+#      comparing passage boundaries, ranking order and matrix bytes. A claim of
+#      "same find, reimplemented" is worth nothing until it is measured.
+"$PY" scripts/parity_r.py
+"$PY" - <<'PYCODE'
+import sys
+from pathlib import Path
+
+root = Path("r/trick")
+if not root.exists():
+    raise SystemExit("r/trick is missing")
+for name in ("DESCRIPTION", "NAMESPACE", "LICENSE"):
+    if not (root / name).exists():
+        raise SystemExit(f"r/trick/{name} is missing")
+sources = list((root / "R").glob("*.R"))
+if len(sources) < 4:
+    raise SystemExit("r/trick/R holds fewer files than expected")
+for path in sources + list((root / "tests").glob("*.R")):
+    text = path.read_text(encoding="utf-8")
+    if any(ord(ch) > 127 for ch in text):
+        raise SystemExit(f"{path}: non-ASCII source; use \\u escapes")
+    for opener, closer in (("(", ")"), ("{", "}")):
+        if text.count(opener) != text.count(closer):
+            raise SystemExit(f"{path}: unbalanced {opener}{closer}")
+man = sorted(p.name for p in (root / "man").glob("*.Rd"))
+if len(man) < len(sources):
+    raise SystemExit(f"r/trick/man holds {len(man)} pages for {len(sources)} files")
+exports = [line.split("(")[1].rstrip(")") for line in (root / "NAMESPACE").read_text().splitlines() if line.startswith("export(")]
+for name in exports:
+    if not any(f"\\alias{{{name}}}" in (root / "man" / page).read_text() for page in man):
+        raise SystemExit(f"exported {name} has no man page")
+print(f"R sources ok: {len(sources)} files, {len(man)} man pages, {len(exports)} exports")
+PYCODE
 
 echo "gate: all checks passed"

@@ -214,38 +214,43 @@ def test_chat_row_without_an_id_is_not_offered_as_clickable(monkeypatch):
     assert "turn 3 · assistant" in card
 
 
-def test_auto_quiet_mode_hides_sources_once_the_chat_answered(monkeypatch):
-    """'auto' is the optional mode, not the default: it must stay reachable."""
+def test_the_card_shows_passages_and_no_catalogue_row(monkeypatch):
+    """The complaint, as a contract: an R package is not a passage of the chat.
+
+    A press used to answer a chat question with eight catalogue rows. The card
+    now paints only passages; the payload still carrying ``rows`` is the exact
+    shape a stale bridge returns, so it is what the test feeds in.
+    """
     module = load_module()
     monkeypatch.setattr(module.Action, "_post", lambda self, payload: RESULT)
-    original = module.Action.__init__
-
-    def init(self):
-        original(self)
-        self.valves.SOURCES = "auto"
-
-    monkeypatch.setattr(module.Action, "__init__", init)
-    body = {"id": "m1", "messages": [{"role": "user", "content": "differential expression"}]}
+    body = {"id": "m1", "chat_id": "c0ffee", "messages": [{"id": "m1", "role": "user", "content": "x"}]}
 
     card = html_of(asyncio.run(dispatch_like_open_webui(module, body)))
 
     assert "we settled on 0.15" in card
     assert "DESeq2" not in card
-    assert "hidden (SOURCES=auto)" in card
+    assert "catalogue" not in card.lower()
 
 
-def test_never_does_not_query_the_catalogues_at_all(monkeypatch):
-    """'never' means the catalogues are out of scope, not hidden after the fact."""
+def test_the_catalogue_valves_are_gone(monkeypatch):
+    """A valve that makes a find-in-chat return packages is a trap, not a choice.
+
+    Removing the behaviour while leaving SOURCES/LIMIT/LIVE in the settings
+    panel would keep the trap: a reader turns one on and the button starts
+    answering with R packages again.
+    """
+    module = load_module()
+    valves = module.Action()
+
+    for name in ("SOURCES", "LIMIT", "LIVE", "SEARCH_CHAT"):
+        assert not hasattr(valves.valves, name), f"{name} still steers the chat button"
+
+
+def test_every_press_is_scoped_to_the_chat(monkeypatch):
+    """One scope, the conversation: nothing else is asked for, ever."""
     module = load_module()
     posted: list[dict] = []
     monkeypatch.setattr(module.Action, "_post", lambda self, payload: posted.append(payload) or RESULT)
-    original = module.Action.__init__
-
-    def init(self):
-        original(self)
-        self.valves.SOURCES = "never"
-
-    monkeypatch.setattr(module.Action, "__init__", init)
     body = {
         "id": "m1",
         "chat_id": "c0ffee",
@@ -255,48 +260,27 @@ def test_never_does_not_query_the_catalogues_at_all(monkeypatch):
         ],
     }
 
-    card = html_of(asyncio.run(dispatch_like_open_webui(module, body)))
+    asyncio.run(dispatch_like_open_webui(module, body))
 
-    assert posted[0]["scope"] == "chat", "a chat-only search must not call the catalogues"
-    assert "DESeq2" not in card
-    assert "catalogue" not in card, "no note about rows nobody asked to see"
+    assert posted[0]["scope"] == "chat"
+    assert "limit" not in posted[0] and "live" not in posted[0]
+    assert posted[0]["messages"]
 
 
-def test_rows_are_listed_when_the_valve_asks_for_them(monkeypatch):
+def test_a_chat_with_nothing_in_it_is_not_sent_to_the_bridge(monkeypatch):
     module = load_module()
-    monkeypatch.setattr(module.Action, "_post", lambda self, payload: RESULT)
-    original = module.Action.__init__
+    posted: list[dict] = []
+    monkeypatch.setattr(module.Action, "_post", lambda self, payload: posted.append(payload) or RESULT)
+    body = {"id": "m1", "chat_id": "c0ffee", "messages": [{"role": "user", "content": "   "}]}
 
-    def init(self):
-        original(self)
-        self.valves.SOURCES = "always"
+    card = html_of(
+        asyncio.run(
+            dispatch_like_open_webui(module, body, __event_call__=Recorder("differential expression"))
+        )
+    )
 
-    monkeypatch.setattr(module.Action, "__init__", init)
-    body = {"id": "m1", "messages": [{"role": "user", "content": "differential expression"}]}
-
-    card = html_of(asyncio.run(dispatch_like_open_webui(module, body)))
-
-    assert "DESeq2" in card
-    assert "we settled on 0.15" in card
-
-
-def test_sources_are_shown_when_the_conversation_has_no_match(monkeypatch):
-    module = load_module()
-    empty_chat = {"ok": True, "result": {**RESULT["result"], "chat": []}}
-    monkeypatch.setattr(module.Action, "_post", lambda self, payload: empty_chat)
-    original = module.Action.__init__
-
-    def init(self):
-        original(self)
-        self.valves.SOURCES = "auto"
-
-    monkeypatch.setattr(module.Action, "__init__", init)
-    body = {"id": "m1", "messages": [{"role": "user", "content": "differential expression"}]}
-
-    card = html_of(asyncio.run(dispatch_like_open_webui(module, body)))
-
-    assert "DESeq2" in card
-    assert "no passage in this conversation contains" in card.lower()
+    assert not posted, "an empty chat is not a search"
+    assert "no conversation here to search" in card.lower()
 
 
 def test_input_dialog_is_used_when_available(monkeypatch):

@@ -179,21 +179,13 @@ class Action:
             default="",
             description="Bearer token from $TRICK_HOME/bridge.token (0600 file).",
         )
-        LIMIT: int = Field(default=8, description="How many catalogue sources to show (1-26).")
-        LIVE: bool = Field(default=True, description="Query the live source APIs as well.")
-        SOURCES: str = Field(
-            default="never",
-            description=(
-                "Whether to list catalogue sources at all. 'never' (default) keeps this "
-                "button a find-in-conversation tool; 'auto' lists them only when the "
-                "conversation had no match; 'always' lists them beside the hits. "
-                "Catalogue search stays available in the CLI and the MCP server."
-            ),
-        )
-        SEARCH_CHAT: bool = Field(
-            default=True,
-            description="Also search inside the conversation itself, not only the catalogues.",
-        )
+        # This button searches the conversation it sits in, and nothing else.
+        # The catalogues (CRAN, Bioconductor, arXiv, OpenAlex) are a different
+        # corpus with a different question - "which package solves this" - and
+        # they live in the CLI and the MCP server. Querying them here produced
+        # rows that were not passages of the chat, which reads as an unrelated
+        # answer. There is no valve for it: a setting that makes a find-in-chat
+        # return R packages is a trap, not an option.
         CHAT_TURNS: int = Field(
             default=200,
             description="How many of the most recent turns to search (the oldest are dropped).",
@@ -273,41 +265,37 @@ class Action:
 
         transcript, dropped = self._transcript(messages)
 
-        mode = str(self.valves.SOURCES or "never").strip().lower()
-        if mode not in ("never", "auto", "always"):
-            mode = "never"
+        # Scope is always the conversation. Sending scope=both here would spend
+        # about 0.7 s on live catalogue calls whose rows this button never shows:
+        # a find-in-chat must not read the network to answer a question about
+        # the chat in front of it.
+        if not transcript:
+            # An unreadable chat and an empty one are different repairs: one is a
+            # storage/dispatch problem, the other is simply a chat with nothing
+            # in it yet. Saying "nothing to search" for a chat that exists and
+            # could not be read hides the fault.
+            message = (
+                "This conversation could not be read, so there was nothing to search."
+                if origin == "unavailable"
+                else "There is no conversation here to search yet."
+            )
+            return self._card("Trick", [(f"<p class='none'>{message}</p>", "")])
         payload = {
             "query": query[:2000],
-            "limit": max(1, min(int(self.valves.LIMIT), 26)),
-            "live": bool(self.valves.LIVE),
+            "messages": transcript,
+            "scope": "chat",
         }
-        if transcript:
-            payload["messages"] = transcript
-            # Why the scope depends on the valve: with SOURCES=never the
-            # catalogues are not shown, so querying them costs live network
-            # calls and then reports "8 catalogue sources matched but are
-            # hidden" - a line about work the reader did not ask for. Measured
-            # before this change: scope=both on every press, ~0.7 s of catalogue
-            # fetching whose only visible output was that note.
-            payload["scope"] = "chat" if mode == "never" else "both"
 
         answer = await asyncio.to_thread(self._post, payload)
         if not answer.get("ok"):
             return self._failure_card(answer)
 
         result = answer.get("result") or {}
-        rows = result.get("rows") or []
         chat = result.get("chat") or []
         degraded = result.get("degraded_text") or [
             DEGRADED_TEXT.get(str(code), str(code)) for code in (result.get("degraded") or [])
         ]
 
-        # This button is a find for the conversation it sits in. The catalogues
-        # are a different product surface (CLI, MCP) and answering a chat
-        # question with eight R packages read as noise, so they are off by
-        # default and the reader opts in: 'auto' shows them only when the
-        # conversation had nothing, 'always' shows them beside every hit.
-        show_rows = bool(rows) and (mode == "always" or (mode == "auto" and not chat))
         # 'weak' is a property of the conversation ranking, so it lives in
         # chat_report; reading 'report' silently hid the warning. term_df and
         # chunk_count come from the same report: they let the block say how much
@@ -316,10 +304,7 @@ class Action:
         block = self._results_markdown(
             query,
             chat,
-            rows if show_rows else [],
             chat_id=str((body or {}).get("chat_id") or ""),
-            hidden=0 if (show_rows or mode == "never") else len(rows),
-            sources_mode=mode,
             weak=bool(report.get("weak")) and bool(chat),
             term_df=report.get("term_df") or {},
             chunk_count=int(report.get("chunk_count") or 0),
@@ -356,11 +341,8 @@ class Action:
         self,
         query: str,
         chat: list,
-        catalogue: list,
         *,
         chat_id: str = "",
-        hidden: int = 0,
-        sources_mode: str = "never",
         weak: bool = False,
         term_df: dict | None = None,
         chunk_count: int = 0,
@@ -410,8 +392,8 @@ class Action:
 
         if origin == "unavailable":
             lines.append(
-                "This conversation could not be read, so only the catalogues were "
-                "searched. Try again, or use `trick tui --transcript` with an "
+                "This conversation could not be read, so there was nothing to "
+                "search. Try again, or use `trick tui --transcript` with an "
                 "exported chat."
             )
             lines.append("")
@@ -444,16 +426,7 @@ class Action:
         if dropped:
             lines.append(f"_The oldest {dropped} turns were not searched._")
             lines.append("")
-        if catalogue:
-            lines.extend(self._catalogue_markdown(catalogue))
-        elif hidden:
-            lines.append(
-                f"_{hidden} catalogue source{'s' if hidden != 1 else ''} matched "
-                f"outside this conversation and {'are' if hidden != 1 else 'is'} "
-                f"hidden (SOURCES={sources_mode})._"
-            )
-            lines.append("")
-        if not chat and not catalogue and origin != "unavailable" and not transcript:
+        if not chat and origin != "unavailable" and not transcript:
             lines.append(f"Nothing matched “{_md(query)}”.")
             lines.append("")
         note = "; ".join(str(item) for item in (degraded or []) if item)
@@ -511,29 +484,6 @@ class Action:
             text = text[:237].rstrip() + "..."
         # Three spaces indent the quote into the list item.
         return [f"{index}. {detail}", f"   > {_md(text)}", ""]
-
-    @staticmethod
-    def _catalogue_markdown(rows: list) -> list[str]:
-        """Catalogue hits, kept plain: they are a different corpus, not a passage."""
-        lines = ["_Catalogue sources (not from this conversation):_", ""]
-        for row in rows[:26]:
-            key = str(row.get("key") or row.get("id") or "")
-            source = str(row.get("source") or "")
-            title = str(row.get("title") or "")
-            label = f"{source}/{key}" if source else key
-            try:
-                score = f" · {float(row.get('final_score') or 0.0):.2f}"
-            except (TypeError, ValueError):
-                score = ""
-            summary = " ".join(str(row.get("summary") or "").split())
-            if len(summary) > 160:
-                summary = summary[:157].rstrip() + "..."
-            line = f"- {_md(label)}{score} — {_md(title)}"
-            if summary:
-                line += f"\n  > {_md(summary)}"
-            lines.append(line)
-        lines.append("")
-        return lines
 
     @staticmethod
     def _attach(messages, block: str, pressed_id: str = "") -> dict:
@@ -698,7 +648,7 @@ class Action:
         Ownership is not re-checked here: ``verify_chat_ownership`` runs in
         ``main.py`` before the action is dispatched, on the same ``chat_id``.
         """
-        if not isinstance(body, dict) or not self.valves.SEARCH_CHAT:
+        if not isinstance(body, dict):
             return [], ""
         inline = body.get("messages")
         if isinstance(inline, list) and inline:
@@ -796,7 +746,7 @@ class Action:
         dropped turns can be shown to the reader. Text is taken as-is: a chat
         message is evidence, so rewriting it would change what is searched.
         """
-        if not self.valves.SEARCH_CHAT or not isinstance(messages, list):
+        if not isinstance(messages, list):
             return [], 0
         cleaned: list[dict] = []
         for item in messages:

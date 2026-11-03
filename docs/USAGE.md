@@ -5,11 +5,11 @@ Trick is a **scored find** over two corpora:
 1. the conversation you are in, and
 2. the scientific catalogues (CRAN, Bioconductor, arXiv, OpenAlex, Crossref).
 
-The two corpora are two products. **The Open WebUI button searches the
-conversation only** - a chat question answered with eight R packages read as
-noise, so the button does not call the catalogues at all unless you ask it to
-with the `SOURCES` valve. **The catalogues live in the terminal and in MCP**,
-where the question "which package is this" is the question being asked.
+The two corpora are two products, and they never share a screen. **The Open WebUI
+button searches the conversation only.** A chat question answered with eight R
+packages read as noise, so that is no longer even a setting: the button has one
+corpus. **The catalogues live in the terminal and in MCP**, where the question
+"which package is this" is the question being asked.
 
 It does not answer questions and it does not read meaning. It finds the places a
 piece of text occurs, then asks laya to order the closest few. That distinction
@@ -140,21 +140,23 @@ conversation is searched too.
 
 | Valve | Default | Effect |
 | --- | --- | --- |
-| `SOURCES` | `never` | `never` keeps the button a find-in-conversation tool and does not query the catalogues at all; `auto` lists catalogue sources only when the conversation had no match; `always` lists them beside every hit |
 | `CHAT_RESULTS` | `3` | how many passage rows to show |
 | `SHOW_SCORES` | `true` | show the blended score per row |
-| `SEARCH_CHAT` | `true` | search the conversation as well as the catalogues |
 | `CHAT_TURNS` | `200` | how many recent turns to index; older ones are dropped and counted |
-| `LIMIT` | `8` | catalogue sources to show when `SOURCES` is not `never` |
-| `LIVE` | `true` | query the live source APIs, not only the local catalogue |
+| `CHAT_MAX_CHARS` | `150000` | transcript budget sent to the service |
 | `TRICK_URL` | `http://host.docker.internal:8765/v1/search` | bridge address as seen from inside the container |
 | `TRICK_TOKEN` | empty | contents of `$TRICK_HOME/bridge.token` |
+| `TIMEOUT_S` | `25` | bridge timeout |
+
+There is no corpus valve, no row limit and no live toggle: the button searches
+the conversation, so those settings had nothing left to steer.
 
 ## What Trick does not do
 
 - It does not answer questions, summarise, or invent. There is no language model
   in the answer path; laya orders candidates and nothing else.
-- It does not search the web. It searches the conversation and the catalogues.
+- It does not search the web. In a chat it searches that conversation; in the
+  terminal and over MCP it searches the scientific catalogues.
 - It does not search other chats. The button reads the chat it sits in, through
   the message branch the button was pressed on.
 - It does not run a cloud fallback in the local build. Every surface above works

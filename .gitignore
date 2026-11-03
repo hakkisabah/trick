@@ -11,3 +11,12 @@ data/
 *.trk
 *.trk.tmp
 *.trk.lock
+# The R test suite compares against a matrix written by the Python writer, so
+# this one fixture is tracked on purpose.
+!r/trick/inst/extdata/sample.trk
+# R build artifacts
+*.Rcheck/
+*.tar.gz
+.Rhistory
+.RData
+.Rproj.user/

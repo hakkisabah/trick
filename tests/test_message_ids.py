@@ -150,7 +150,6 @@ def test_the_action_sends_the_ids_and_renders_them_as_jump_targets():
     block = action._results_markdown(
         "taper",
         [{"turn": 1, "role": "user", "text": "where did we put the taper", "message_id": "u-1"}],
-        [],
         chat_id="chat-1",
     )
 

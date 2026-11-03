@@ -175,18 +175,29 @@ def main() -> int:
     else:
         print(f"next: paste the contents of {token_path} into the action's TRICK_TOKEN valve")
 
-    # Valves are stored in Open WebUI's database, so a value written by an older
-    # release outlives the code that defaulted it. Report what is actually stored
-    # instead of assuming the new default took effect.
+    # Valves live in Open WebUI's database, so a value written by an older
+    # release outlives the code that defaulted it. Two things are checked here:
+    # the catalogue valves must be gone from the installed file (this button
+    # searches the conversation only), and the settings panel must not still
+    # advertise them.
+    for stale in ("SOURCES", "SEARCH_CHAT"):
+        if f"{stale}: " in content:
+            print(
+                f"the installed file still declares a {stale} valve; that release "
+                "answered chat questions with catalogue rows. Re-run this script "
+                "after updating the repository.",
+                file=sys.stderr,
+            )
+            return 1
     status, valves = request(f"{base}/api/v1/functions/id/{FUNCTION_ID}/valves", key)
     if status == 200 and isinstance(valves, dict):
-        sources = str(valves.get("SOURCES") or "always")
-        print(f"SOURCES valve: {sources}")
-        if sources.strip().lower() == "auto":
+        leftover = sorted(key for key in ("SOURCES", "SEARCH_CHAT", "LIMIT", "LIVE") if key in valves)
+        if leftover:
             print(
-                "  note: 'auto' is the optional quiet mode (sources hidden when the chat "
-                "matched). Set SOURCES to 'always' in Admin Settings -> Functions -> Trick "
-                "to list them beside the conversation hits."
+                f"note: {', '.join(leftover)} are still stored in this function's valve "
+                "record from an older release. They are inert - the code no longer "
+                "reads them - and they will disappear when the function is deleted "
+                "and reinstalled (Admin -> Functions -> Trick -> delete, then re-run)."
             )
 
     print("done: open a chat, press the Trick button under any answer, type what you are looking for")

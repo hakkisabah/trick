@@ -352,13 +352,39 @@ appended to the **answer** in that chat - every hit is a link to the turn it cam
 from. It is not a model, so it never appears in the model selector and never
 answers a chat turn.
 
-Three things must be true: the bridge is running and reachable from the container,
-you have an **admin** Open WebUI session, and that session has produced an API key.
-Installing a function is admin-only; a key from a normal account gets `401` even
-when the key is valid. This repository never asks for your Open WebUI password.
+**What it searches: this conversation, and nothing else.** The catalogues (CRAN,
+Bioconductor, arXiv, OpenAlex) are a different corpus answering a different
+question - "which package solves this" - and they are reachable from
+`python -m trick query` and from the MCP server. There is no valve that adds them
+to this button: an R package listed under a chat question is the noise this
+surface is meant to avoid.
 
-The UI listens on `http://localhost:3000`; the container's own port 8080 is not
-published on the host, so `http://localhost:8080` fails by design.
+### 8.0 The whole path, in order
+
+For a machine that has never run Trick. Each command is copy-paste; each step
+prints something you can check before moving on.
+
+```sh
+cd "$HOME/evrim_otonom/trick"
+
+# 1. environment, catalogues, score matrix, doctor - all in one idempotent script
+sh deploy/owui-first-run.sh
+
+# 2. bridge: reachable from the Open WebUI container, not from the LAN
+sh deploy/owui-first-run.sh --start          # or run the command step 6 printed
+
+# 3. the function itself (needs an admin key, see 8.2)
+TRICK_OPENWEBUI_API_KEY=paste-the-key-here \
+  .venv/bin/python integrations/openwebui/install.py
+```
+
+Step 1 creates `.venv`, installs the package, downloads the catalogues if the
+store is empty, builds the score matrix and prints `python -m trick doctor`. It
+starts nothing unless you pass `--start`, and it skips work that is already done,
+so running it twice is safe.
+
+Then open a chat, press the magnifier under any answer, type
+`differential expression`, press Enter.
 
 ### 8.1 Bridge address
 
@@ -374,12 +400,25 @@ Inside a container that maps `host.docker.internal` to the host, the Action can 
 that hostname instead and survive an address change. If Open WebUI runs natively,
 skip this and keep the loopback default.
 
-### 8.2 Install the function (canonical route)
+Only one bridge can run per `TRICK_HOME`: the unix socket is exclusive, so a
+second `python -m trick serve` exits with `S7 another trick service is listening`.
+That is not a defect - it means the bridge you wanted is already up. `--start`
+detects a listener on the port and leaves it alone.
 
-1. Open `http://localhost:3000` and sign in as an admin.
+### 8.2 Get an admin API key
+
+Installing a function is admin-only; a key from a normal account gets `401` even
+when the key is valid. This repository never asks for your Open WebUI password.
+
+1. Open `http://localhost:3000` and sign in as an admin. The UI listens on 3000;
+   the container's own port 8080 is not published, so `http://localhost:8080`
+   fails by design.
 2. Avatar, bottom left → `Settings` → `Account` → `API Keys` → `Create`. Copy the
    key; the UI shows it once.
-3. Run the installer in a shell **on the host**, not inside the container:
+
+### 8.3 Install the function (canonical route)
+
+Run the installer in a shell **on the host**, not inside the container:
 
 ```sh
 cd "$HOME/evrim_otonom/trick"
@@ -389,11 +428,13 @@ TRICK_OPENWEBUI_API_KEY=paste-the-key-here \
 
 Add `--dry-run` to see what would be written without writing it.
 
-The installer does five things and checks each one: creates or updates the
+The installer does six things and checks each one: creates or updates the
 function, reads it back and compares the stored byte count with the file, asserts
 Open WebUI derived `type=action` (a Pipe would show up as a model), switches the
-global toggle on so the button appears on every model, and writes the bridge token
-into the `TRICK_TOKEN` valve. The token is never printed. Expected last lines:
+global toggle on so the button appears on every model, writes the bridge token
+into the `TRICK_TOKEN` valve, and refuses to finish if the installed file still
+declares a catalogue valve (`SOURCES`, `SEARCH_CHAT`) - that release answered chat
+questions with R packages. The token is never printed. Expected last lines:
 
 ```
 installed and verified: 16384 bytes, type=action, is_global=True, is_active=True
@@ -406,7 +447,7 @@ instance truncated or rewrote the content; do not use the button until this
 matches. `stored type='pipe'` → an old install is still in the database; delete it
 under `Admin Settings` → `Functions` and re-run the installer.
 
-### 8.3 Fallback route (only if the installer cannot be used)
+### 8.4 Fallback route (only if the installer cannot be used)
 
 `Admin Settings` → `Functions` → `+` → paste the whole content of
 `integrations/openwebui/trick_action.py` → `Save`, then enable the global toggle
@@ -414,7 +455,7 @@ and paste the token into the `TRICK_TOKEN` valve by hand. This route has no
 read-back, so a truncated paste is indistinguishable from a working install until
 you press the button; that is why it comes second.
 
-### 8.4 Valves
+### 8.5 Valves
 
 `Admin Settings` → `Functions` → `Trick` → gear icon:
 
@@ -422,16 +463,16 @@ you press the button; that is why it comes second.
 | --- | --- | --- |
 | `TRICK_URL` | `http://host.docker.internal:8765/v1/search` | Docker default; native Open WebUI uses `http://127.0.0.1:8765/v1/search` |
 | `TRICK_TOKEN` | contents of `$HOME/.local/share/trick/bridge.token` | written by the installer; no quotes |
-| `LIMIT` | `8` | 1-26 |
-| `LIVE` | `true` | `false` = local catalogue only |
-| `SOURCES` | `never` | `never` (default) = this button finds in the conversation only; `auto` = also list catalogue matches, but only when the conversation had none; `always` = list them beside every hit |
 | `TIMEOUT_S` | `25` | raise only on a slow network |
 | `SHOW_SCORES` | `true` | blended score per row |
-| `SEARCH_CHAT` | `true` | also search inside the conversation |
 | `CHAT_TURNS` | `200` | how many recent turns are searched |
 | `CHAT_MAX_CHARS` | `150000` | transcript budget sent to the service |
 | `CHAT_RESULTS` | `3` | how many passages are shown |
 | `priority` | `-5` | button order in the toolbar; lower is further left |
+
+There is no valve for the catalogues, for a row limit or for a live query: the
+button has one corpus and one scope, so a setting that changed either would only
+reintroduce the wrong answers this release removed.
 
 Verify end to end: open a chat that has a few turns, press the Trick button (the
 magnifier) under any answer, type `differential expression for RNA-seq counts`,
@@ -490,12 +531,10 @@ indexed: it names the query and the turns it found, so searching its own output
 would rank a previous answer above the passage that holds the answer. The index
 is built from the messages as they were before the block was appended.
 
-With the default `SOURCES=never` the catalogues stay out of the way, and the
-block says in one line that `N catalogue sources matched outside this
-conversation and are hidden`; set the valve to `auto` to list them only when
-the conversation had no match, or `always` to list them beside every hit (each
-with `source/key`, a blended score and a short summary). Closing the input
-dialog without typing searches nothing.
+The block never mixes corpora: every row is a passage of this conversation. A
+catalogue row cannot appear here even if the bridge still returns one, because
+the card does not read that field. Closing the input dialog without typing
+searches nothing.
 
 The block states its own confidence. A row lists the query words it contains
 (`matched: ...`); when no passage contains the distinctive words of the
@@ -504,9 +543,10 @@ block says `Weak match` and shows the closest turns instead of presenting them
 as answers. Function words are dropped from the query before scoring, for both
 Turkish and English.
 
-The catalogue itself is not gone: `python -m trick query` and the MCP
-`trick_search` tool still search CRAN, Bioconductor, arXiv and the live sources,
-which is where a package lookup belongs.
+The catalogue is a separate surface, not a hidden half of this one:
+`python -m trick query` and the MCP `trick_search` tool search CRAN,
+Bioconductor, arXiv and the live sources, which is where a package lookup
+belongs.
 
 Failure text is intentional and names the fix:
 
@@ -515,13 +555,54 @@ Failure text is intentional and names the fix:
 | `TRICK_TOKEN` in the card | empty or stale valve | re-run the installer |
 | `cannot reach ...` / `transport error` | bridge down or wrong URL | start the bridge, check `TRICK_URL` |
 | `401` from the bridge | valve token differs from the file | re-run the installer |
-| `Nothing matched` with `S4`/`S5` | sources or scorer did not answer | check the network, `LIVE` |
+| `Nothing matched` with `S4`/`S5` | a live source or the scorer did not answer (CLI/MCP surfaces) | check the network and the laya credentials |
 | no button in the toolbar | function not global, or not active | `Admin Settings` → `Functions` → global toggle |
 
 Remove: `Admin Settings` → `Functions` → `Trick` → trash icon. Nothing on the host
 changes.
 
-## 9. Everything this project creates
+## 9. The R package
+
+`r/trick` is the same find in R: same matching contract, same on-disk score
+matrix, no compiled code and no dependencies. It is a separate package on
+purpose - the corpora this tool cares about are R corpora, and a reader who works
+in R should not have to leave the language to search their own material.
+
+```sh
+R CMD INSTALL r/trick          # install it
+sh r/check.sh                  # build and check the way CRAN does
+```
+
+`r/check.sh` runs `R CMD build` and `R CMD check --as-cran --no-manual`. On a
+host where R cannot find `which` (some builds hardcode `/usr/bin/which`), the
+script reruns the check inside an unprivileged user namespace with a shim, so no
+root access and no change to the host is needed.
+
+What is shared with the Python implementation is proven, not claimed. Two
+levels: `r/trick/inst/extdata/sample.trk` is a matrix written by the Python
+writer and the R test suite asserts that R reads it and reproduces it byte for
+byte; and `scripts/parity_r.py` (gate 17) runs one fixture through **both**
+engines, comparing passage boundaries, message ids, ranking order for three
+queries and the matrix bytes in both directions. Measured on this tree: 6
+passages identical, 3 rankings identical, byte-identical writes each way. The
+step is skipped, not failed, on a host without `Rscript`.
+
+```r
+library(trick)
+index <- trick_index(list(
+  list(id = "u1", role = "user", content = "Where did we set the threshold?"),
+  list(id = "a1", role = "assistant", content = "At 0.15, after the second run.")
+))
+trick_search(index, "threshold 0.15", limit = 2)
+```
+
+The R package makes no network call and reads no credential; the model score is
+an optional argument. Submitting it to CRAN is the maintainer's step: the package
+name `trick` is free on CRAN, `r/check.sh` produces the tarball, and the two
+NOTEs it reports (`New submission`, `unable to verify current time`) are expected
+on a first submission and in a sandbox.
+
+## 10. Everything this project creates
 
 | Artifact | Created by | Removed by |
 | --- | --- | --- |
@@ -538,7 +619,7 @@ changes.
 No process survives a reboot except the systemd unit from step 7b, and that one
 exists only if you installed it.
 
-## 10. When something is degraded
+## 11. When something is degraded
 
 Trick never hides a failure behind a plausible answer. Every degradation has a
 code, and it is the same code on every surface:

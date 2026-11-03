@@ -34,8 +34,6 @@ BLOCK = (
     "1. [turn 45 · assistant](/c/c0ffee?message=m-45) · matched: mistake, made · 7.25\n"
     "   > the answer that mentions the mistake\n"
     "\n"
-    "_8 catalogue sources matched outside this conversation and are hidden "
-    "(SOURCES=never)._\n"
     "</details>"
 )
 
@@ -247,7 +245,6 @@ def test_a_single_word_says_how_much_it_covers():
     block = action._results_markdown(
         "False",
         rows,
-        [],
         chat_id="chat-1",
         term_df={"false": 3},
         chunk_count=338,
@@ -260,7 +257,6 @@ def test_a_single_word_says_how_much_it_covers():
     two = action._results_markdown(
         "cloudwatch politikasi",
         rows,
-        [],
         chat_id="chat-1",
         term_df={"cloudwatch": 4, "politikasi": 1},
         chunk_count=338,

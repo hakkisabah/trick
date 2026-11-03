@@ -10,18 +10,27 @@ match it, plus the packages and papers that solve it, ranked with laya's typed
 decision scoring. The local build is free, works offline, and sends your text
 nowhere except the sources and the scorer you configured.
 
+The same find ships as an R package in `r/trick`: no compiled code, no
+dependencies, a matching contract that folds Turkish letters on both sides, and a
+score matrix that is byte-compatible with the Python writer. `sh r/check.sh` runs
+the check CRAN runs.
+
 ## Status
 
 Phase 5 of 7 is complete. Phase 1-2: storage, catalogues, ranking. Phase 3: the
 core service, the terminal UI, MCP. Phase 4: the per-source quota. Phase 5:
 **conversation scope** - the whole chat is chunked, indexed in memory and
-searched alongside the catalogues, so "where did we say that" is answerable from
-every surface, not just from the catalogue side.
+searched, so "where did we say that" is answerable from the chat itself.
 
 Phase 6 fixed the Open WebUI surface. It was a Pipe, which Open WebUI lists as a
 model, so the tool looked like a chat partner and its query arrived as a chat
 message. It is now an **Action**: a button in the message toolbar that opens an
 input dialog and returns the hits as a card. The search box is the point.
+
+That surface has one corpus: the conversation. The catalogues answer a different
+question ("which package is this") and stay in the terminal and in MCP. Asking a
+chat question and receiving eight R packages was not a tuning problem, so the
+code that could do it was removed rather than defaulted off.
 
 415 tests pass and `scripts/check.sh` runs 16 repository checks.
 
@@ -137,9 +146,9 @@ Decisions that came from measurement or from the failure modes, not from taste:
   turns. Over the transport budget the oldest turns are dropped *at the caller*,
   where the count can be shown ("oldest 7 turns not searched"); the service refuses
   a transcript it cannot hold rather than silently searching half of it (`S8`).
-* **The two result blocks are never merged into one numbered list.** Chat passages
-  and catalogue rows come from different corpora; interleaving them would claim a
-  score comparison that was never measured.
+* **The chat card holds one corpus.** Passages of this conversation, nothing else:
+  a catalogue row is a different product with a different question, and mixing
+  them made an unrelated answer look like a broken one.
 
 Conversation search is now measured, and the result shapes the design. Ten needles
 were planted in a 150-turn chat, each with two decoys that reuse its rare

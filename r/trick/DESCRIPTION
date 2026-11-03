@@ -1,0 +1,20 @@
+Package: trick
+Type: Package
+Title: Scored Text Find over Conversations and Scientific Catalogues
+Version: 0.1.0
+Authors@R: c(
+    person("Hakki", "Sabah", role = c("aut", "cre"),
+           email = "hakkisabah@users.noreply.github.com")
+    )
+Description: A deterministic find with scoring. It splits a conversation into
+    sentence-aligned passages, indexes them in memory, and ranks them against a
+    query with Okapi BM25, an optional phrase bonus, and an optional external
+    probability supplied by the 'laya' decision engine. It also reads and writes
+    the fixed-record score matrix used by the companion Python implementation, so
+    the same on-disk index serves both languages. No model is embedded and no
+    network call is made: every score is computed from data the caller passes in.
+License: MIT + file LICENSE
+Encoding: UTF-8
+Depends: R (>= 4.0.0)
+LazyData: false
+NeedsCompilation: no

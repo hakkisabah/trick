@@ -121,7 +121,7 @@ def main() -> int:
 
     ids = ["3f2a-0001", "3f2a-0002"]
     rows = [_row(ids[0], 1), _row(ids[1], 14, "assistant"), _row("", 26)]
-    block = action._results_markdown("i5 memory problem", rows, [], chat_id=CHAT, transcript=True)
+    block = action._results_markdown("i5 memory problem", rows, chat_id=CHAT, transcript=True)
     anchors = _check_block(block, ids, problems)
 
     # A row without an id must stay text: a dead link promises a jump that
@@ -132,7 +132,7 @@ def main() -> int:
         problems.append("the row without an id was drawn as a link")
 
     # Without a chat id there is no route to scroll inside.
-    chatless = action._results_markdown("i5", [_row(ids[0], 1)], [], transcript=True)
+    chatless = action._results_markdown("i5", [_row(ids[0], 1)], transcript=True)
     if "](/c/" in chatless:
         problems.append("a block without a chat id drew a link into the chat route")
     if "no jump target" not in chatless:
