@@ -83,6 +83,9 @@ Type=simple
 User=$USER_NAME
 Group=$USER_NAME
 WorkingDirectory=$APP
+# Optional: the shared secret a payment provider signs plan changes with.
+# Absent by default, and with it absent /v1/admin/entitlement answers 401.
+EnvironmentFile=-$ETC/admin.env
 ExecStart=$APP/venv/bin/python -m trick vault serve \\
     --root $STORE --host 0.0.0.0 --port $PORT --expose-public \\
     --cert $ETC/tls/cert.pem --key $ETC/tls/key.pem

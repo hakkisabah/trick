@@ -20,9 +20,10 @@
 #     16. matrix       the score matrix builds from the store and reads back
 #     17. R package    R sources parse; with R installed, both engines agree
 #     18. remote store a real TLS store pushed, pulled and imported with parity
+#     19. plans        price table == docs == enforcement, entitlement applies once
 set -eu
 
-TOTAL=19
+TOTAL=20
 
 cd "$(dirname "$0")/.."
 PY="${PY:-.venv/bin/python}"
@@ -476,12 +477,20 @@ for name in exports:
 print(f"R sources ok: {len(sources)} files, {len(man)} man pages, {len(exports)} exports")
 PYCODE
 
-echo "== $TOTAL/$TOTAL remote store"
+echo "== $((TOTAL-1))/$TOTAL remote store"
 # The store is the only part of this product that runs on someone else's disk,
 # so it is the part where "it worked" has to be measured rather than assumed.
 # The script starts a real TLS server as its own process, pins the certificate,
 # exports a real archive, pushes it, pulls it back, imports it into an empty
 # cache and compares bytes, payload and rows.
 "$PY" scripts/verify_remote.py
+
+echo "== $TOTAL/$TOTAL plans"
+# The commercial layer is the easiest place in this project to lie, because a
+# price table is prose and prose is not checked. This gate parses the table in
+# docs/PLANS.md, compares it cell by cell with src/trick/plans.py, then posts a
+# signed entitlement to a real store and reads the applied limits back: unsigned
+# and stale are refused, a replay is a no-op.
+"$PY" scripts/check_plans.py
 
 echo "gate: all checks passed"

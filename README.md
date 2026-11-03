@@ -32,7 +32,7 @@ question ("which package is this") and stay in the terminal and in MCP. Asking a
 chat question and receiving eight R packages was not a tuning problem, so the
 code that could do it was removed rather than defaulted off.
 
-469 tests pass and `scripts/check.sh` runs 19 repository checks.
+493 tests pass and `scripts/check.sh` runs 20 repository checks.
 
 The R package in `r/trick` is the same find reimplemented under CRAN's rules: no
 dependencies, no compiled code, no network call. Its parity with this engine is
@@ -357,6 +357,24 @@ bytes, payload and rows - if any of the three differs, the gate fails.
 
 Details, quotas and the security model: `docs/REMOTE.md`.
 
+## Plans and entitlement
+
+The store is also the only part of the product that can be sold, so its limits
+are a price table rather than a paragraph: `local` (free, no server at all),
+`backup` ($1/month), `backup_plus` ($3/month) and `owner` (self-hosted). A plan
+buys space for a sealed archive and nothing else - search quality is identical on
+every plan, including the free one, because search never asks the server anything.
+
+What is automated is the part that can be: a payment provider posts a
+HMAC-signed webhook to `/v1/admin/entitlement`, the store verifies it, checks the
+timestamp, records the event id so a retry is a no-op, and rewrites the account's
+limits in one atomic write. What is not automated is the invoice, because AWS has
+no metering API for resale. Gate 20 parses the table in `docs/PLANS.md`, compares
+it cell by cell with `src/trick/plans.py`, posts a real signed entitlement and
+reads the applied limits back over HTTP.
+
+Price table, enforced limits and the resale split: `docs/PLANS.md`.
+
 ## Sources
 
 Bulk catalogues are downloaded rarely and indexed locally in SQLite/FTS5. Live APIs
@@ -410,7 +428,7 @@ scripts/eval_ranking.py   22-query ranking harness, three orderings per query
 scripts/eval_quota.py     quota harness over one retrieval per query
 scripts/laya_probe.py     one real call, prints the response shape only
 scripts/verify_remote.py  real TLS store: push, pull, import, compare bytes/rows
-scripts/check.sh          repository gate (19 checks)
+scripts/check.sh          repository gate (20 checks)
 ```
 
 ## Install and verify

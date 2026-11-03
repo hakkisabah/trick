@@ -63,22 +63,36 @@ LOOPBACK_HOSTS = ("127.0.0.1", "::1", "localhost")
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class Account:
-    """One token, one directory, one quota."""
+    """One directory, one quota, and one token per device."""
 
     name: str
     token_sha256: str
     max_bytes: int = DEFAULT_MAX_BYTES
     max_objects: int = DEFAULT_MAX_OBJECTS
     max_rows: int = DEFAULT_MAX_ROWS
+    plan: str = "owner"
+    max_devices: int = 3
+    retention_days: int = 0
+    tokens: tuple[str, ...] = ()
+
+    def token_digests(self) -> tuple[str, ...]:
+        """Every digest this account accepts: the primary plus added devices."""
+        return (self.token_sha256,) + tuple(self.tokens)
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "name": self.name,
             "token_sha256": self.token_sha256,
             "max_bytes": self.max_bytes,
             "max_objects": self.max_objects,
             "max_rows": self.max_rows,
+            "plan": self.plan,
+            "max_devices": self.max_devices,
+            "retention_days": self.retention_days,
         }
+        if self.tokens:
+            payload["tokens"] = list(self.tokens)
+        return payload
 
 
 def token_digest(token: str) -> str:
@@ -116,6 +130,12 @@ def load_accounts(path: Path) -> list[Account]:
         digest = str(entry["token_sha256"])
         if not SHA_RE.match(digest):
             raise ConfigError(f"account {entry['name']!r}: token_sha256 must be 64 hex characters")
+        extra = entry.get("tokens") or []
+        if not isinstance(extra, list):
+            raise ConfigError(f"account {entry['name']!r}: tokens must be a list of digests")
+        for value in extra:
+            if not isinstance(value, str) or not SHA_RE.match(value):
+                raise ConfigError(f"account {entry['name']!r}: every token must be 64 hex characters")
         accounts.append(
             Account(
                 name=str(entry["name"]),
@@ -123,6 +143,10 @@ def load_accounts(path: Path) -> list[Account]:
                 max_bytes=int(entry.get("max_bytes", DEFAULT_MAX_BYTES)),
                 max_objects=int(entry.get("max_objects", DEFAULT_MAX_OBJECTS)),
                 max_rows=int(entry.get("max_rows", DEFAULT_MAX_ROWS)),
+                plan=str(entry.get("plan", "owner")),
+                max_devices=int(entry.get("max_devices", 3)),
+                retention_days=int(entry.get("retention_days", 0)),
+                tokens=tuple(str(v) for v in extra),
             )
         )
     return accounts
@@ -146,7 +170,21 @@ def init_store(root: Path, name: str = "owner") -> dict[str, Any]:
     if accounts_path.exists():
         raise ConfigError(f"{accounts_path} already exists; refusing to overwrite an account list")
     token = new_token()
-    accounts = [Account(name=name, token_sha256=token_digest(token))]
+    from .plans import limits_for
+
+    limits = limits_for("owner")
+    accounts = [
+        Account(
+            name=name,
+            token_sha256=token_digest(token),
+            plan="owner",
+            max_bytes=int(limits["max_bytes"]),
+            max_objects=int(limits["max_objects"]),
+            max_rows=int(limits["max_rows"]),
+            max_devices=int(limits["max_devices"]),
+            retention_days=int(limits["retention_days"]),
+        )
+    ]
     write_accounts(accounts_path, accounts)
     return {
         "root": str(root),
@@ -163,9 +201,10 @@ def init_store(root: Path, name: str = "owner") -> dict[str, Any]:
 class VaultStore:
     """A directory of opaque objects, one subdirectory per account."""
 
-    def __init__(self, root: Path, accounts: list[Account]) -> None:
+    def __init__(self, root: Path, accounts: list[Account], accounts_path: Path | None = None) -> None:
         self.root = Path(root)
         self.accounts = {a.name: a for a in accounts}
+        self.accounts_path = Path(accounts_path) if accounts_path else Path(root) / "accounts.json"
         self._lock = threading.RLock()
         self.root.mkdir(parents=True, exist_ok=True)
         (self.root / OBJECTS_DIR).mkdir(parents=True, exist_ok=True)
@@ -207,15 +246,122 @@ class VaultStore:
 
     # -- auth --------------------------------------------------------------
     def authenticate(self, token: str) -> Account | None:
-        """Constant-time over every account, so a wrong token reveals nothing."""
+        """Constant-time over every account and device, so a wrong token reveals nothing."""
         if not token:
             return None
         digest = token_digest(token)
         found = None
         for account in self.accounts.values():
-            if hmac.compare_digest(digest, account.token_sha256):
-                found = account
+            for candidate in account.token_digests():
+                if hmac.compare_digest(digest, candidate):
+                    found = account
         return found
+
+    # -- plans and devices -------------------------------------------------
+    def account(self, name: str) -> Account:
+        account = self.accounts.get(name)
+        if account is None:
+            raise ConfigError(f"no such account: {name}")
+        return account
+
+    def _reload(self, accounts: list[Account]) -> None:
+        self.accounts = {a.name: a for a in accounts}
+        for account in accounts:
+            self._dir(account).mkdir(parents=True, exist_ok=True)
+
+    def apply_plan(self, name: str, plan_name: str) -> dict[str, Any]:
+        """Rewrite one account's limits in a single atomic write.
+
+        The in-memory map is replaced only after the file is on disk, because a
+        process that crashes between the two would otherwise serve limits that
+        no longer exist anywhere.
+        """
+        from .plans import limits_for
+
+        limits = limits_for(plan_name)
+        with self._lock:
+            accounts = load_accounts(self.accounts_path)
+            if name not in {a.name for a in accounts}:
+                raise ConfigError(f"no such account: {name}")
+            updated = []
+            for account in accounts:
+                if account.name == name:
+                    account = Account(
+                        name=account.name,
+                        token_sha256=account.token_sha256,
+                        plan=plan_name,
+                        max_bytes=limits["max_bytes"],
+                        max_objects=limits["max_objects"],
+                        max_rows=limits["max_rows"],
+                        max_devices=limits["max_devices"],
+                        retention_days=limits["retention_days"],
+                        tokens=account.tokens,
+                    )
+                updated.append(account)
+            write_accounts(self.accounts_path, updated)
+            self._reload(updated)
+            return self.account(name).as_dict()
+
+    def add_device(self, name: str) -> dict[str, Any]:
+        """Mint one more token for an existing account, up to the plan's limit.
+
+        The token comes back once and only its digest is stored, exactly like
+        the first one; a store that can reprint a token can leak every token.
+        """
+        with self._lock:
+            accounts = load_accounts(self.accounts_path)
+            target = None
+            for account in accounts:
+                if account.name == name:
+                    target = account
+            if target is None:
+                raise ConfigError(f"no such account: {name}")
+            devices = len(target.token_digests())
+            if devices >= target.max_devices:
+                raise ConfigError(
+                    f"account {name} already has {devices} devices, plan {target.plan!r} allows "
+                    f"{target.max_devices}; remove one or upgrade the plan"
+                )
+            token = new_token()
+            updated = []
+            for account in accounts:
+                if account.name == name:
+                    account = Account(
+                        name=account.name,
+                        token_sha256=account.token_sha256,
+                        plan=account.plan,
+                        max_bytes=account.max_bytes,
+                        max_objects=account.max_objects,
+                        max_rows=account.max_rows,
+                        max_devices=account.max_devices,
+                        retention_days=account.retention_days,
+                        tokens=account.tokens + (token_digest(token),),
+                    )
+                updated.append(account)
+            write_accounts(self.accounts_path, updated)
+            self._reload(updated)
+            return {
+                "account": name,
+                "device": devices + 1,
+                "max_devices": target.max_devices,
+                "token": token,
+                "note": "this token is shown once and is not stored in clear text anywhere",
+            }
+
+    def prune(self, account: Account, *, now: int | None = None) -> list[str]:
+        """Delete snapshots older than the plan's retention window."""
+        if account.retention_days <= 0:
+            return []
+        cutoff = int(now if now is not None else time.time()) - account.retention_days * 86_400
+        removed: list[str] = []
+        with self._lock:
+            index = self._read_index(account)
+            for sha, entry in list(index["objects"].items()):
+                created = int(entry.get("created_at") or 0)
+                if created and created < cutoff:
+                    self.delete(account, sha)
+                    removed.append(sha)
+        return removed
 
     # -- operations --------------------------------------------------------
     def usage(self, account: Account) -> dict[str, Any]:
@@ -232,6 +378,10 @@ class VaultStore:
             "max_bytes": account.max_bytes,
             "max_objects": account.max_objects,
             "max_rows": account.max_rows,
+            "plan": account.plan,
+            "devices": len(account.token_digests()),
+            "max_devices": account.max_devices,
+            "retention_days": account.retention_days,
             "rows_unit": "client-declared; the store cannot count rows inside ciphertext",
         }
 
@@ -246,6 +396,10 @@ class VaultStore:
         if actual != sha:
             raise ContractViolation(f"hash mismatch: the body hashes to {actual}, not {sha}")
         with self._lock:
+            # Retention before quota: a plan that keeps 30 days must not fail on
+            # day 31 because the 31st day's snapshot has nowhere to go.
+            if account.retention_days > 0:
+                self.prune(account)
             index = self._read_index(account)
             objects = index["objects"]
             existing = objects.get(sha)
@@ -380,6 +534,7 @@ class VaultServer:
         tls: ssl.SSLContext | None = None,
         allow_plaintext: bool = False,
         expose_public: bool = False,
+        admin_secret: str | None = None,
     ) -> None:
         host = (host or "").strip()
         wildcard = host in ("0.0.0.0", "", "::", "*")
@@ -409,6 +564,7 @@ class VaultServer:
         self.host = host
         self.port = int(port)
         self.tls = tls
+        self.admin_secret = admin_secret
         self._httpd: ThreadingHTTPServer | None = None
         self.requests = 0
         self.rejected = 0
@@ -567,6 +723,50 @@ def _make_handler(server: VaultServer):
                 self._fail(507, "S6", str(exc))
                 return
             self._send(200, {"ok": True, "result": result})
+
+        def do_POST(self) -> None:  # noqa: N802
+            """Admin route: a payment provider says which plan an account is on.
+
+            This is the only write that does not need a bearer token, so it is
+            guarded by an HMAC over the raw body plus a replayed-event ledger.
+            Nothing else is reachable over POST.
+            """
+            path = urllib.parse.urlsplit(self.path).path.rstrip("/") or "/"
+            if path != "/v1/admin/entitlement":
+                self._fail(404, "S8", f"no route {path}")
+                return
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                self._fail(400, "S8", "invalid Content-Length")
+                return
+            if length <= 0 or length > 16 * 1024:
+                self._fail(400, "S8", "entitlement body must be 1..16384 bytes")
+                return
+            body = self.rfile.read(length)
+            from .plans import EntitlementLedger, verify_entitlement
+
+            try:
+                claim = verify_entitlement(body, self.headers.get("X-Trick-Signature"), server.admin_secret or "")
+            except ConfigError as exc:
+                server.rejected += 1
+                self._fail(401, "S9", str(exc))
+                return
+            server.requests += 1
+            ledger = EntitlementLedger.load(Path(server.store.root) / "entitlements.json")
+            if ledger.seen(claim["event_id"]):
+                self._send(200, {"ok": True, "result": {**claim, "applied": False, "reason": "already applied"}})
+                return
+            try:
+                account = server.store.apply_plan(claim["account"], claim["plan"])
+            except ConfigError as exc:
+                self._fail(404, "S1", str(exc))
+                return
+            except StorageIO as exc:
+                self._fail(507, "S6", str(exc))
+                return
+            ledger.record(claim["event_id"], int(claim["ts"] or time.time()))
+            self._send(200, {"ok": True, "result": {**claim, "applied": True, "account": account}})
 
         def do_DELETE(self) -> None:  # noqa: N802
             path = urllib.parse.urlsplit(self.path).path.rstrip("/") or "/"

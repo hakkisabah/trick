@@ -485,12 +485,35 @@ def cmd_vault(args) -> int:
             file=sys.stderr,
         )
         return 0
+    if args.action == "plans":
+        from .plans import plans_table
+
+        print(json.dumps(plans_table(), indent=2))
+        return 0
+    if args.action in ("plan", "device"):
+        accounts_path = Path(args.accounts or (Path(args.root) / "accounts.json"))
+        store = VaultStore(Path(args.root), load_accounts(accounts_path), accounts_path=accounts_path)
+        try:
+            if args.action == "plan":
+                if not args.set:
+                    print(json.dumps(store.account(args.account).as_dict(), indent=2))
+                    return 0
+                result = store.apply_plan(args.account, args.set)
+            else:
+                result = store.add_device(args.account)
+        except ConfigError as exc:
+            print(f"vault: {exc.s_code} {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(result, indent=2))
+        return 0
     if args.action != "serve":
         print(f"unknown vault action {args.action!r}", file=sys.stderr)
         return 2
-    accounts = load_accounts(Path(args.accounts or (Path(args.root) / "accounts.json")))
-    store = VaultStore(Path(args.root), accounts)
+    accounts_path = Path(args.accounts or (Path(args.root) / "accounts.json"))
+    accounts = load_accounts(accounts_path)
+    store = VaultStore(Path(args.root), accounts, accounts_path=accounts_path)
     tls = server_ssl_context(Path(args.cert), Path(args.key)) if args.cert and args.key else None
+    admin_secret = args.admin_secret or os.environ.get("TRICK_ADMIN_SECRET") or ""
     server = VaultServer(
         store,
         host=args.host,
@@ -498,6 +521,7 @@ def cmd_vault(args) -> int:
         tls=tls,
         allow_plaintext=args.allow_plaintext,
         expose_public=args.expose_public,
+        admin_secret=admin_secret,
     )
     scheme = "https" if tls is not None else "http"
     print(
@@ -658,10 +682,12 @@ def build_parser() -> argparse.ArgumentParser:
     backup.set_defaults(func=cmd_backup)
 
     vault = sub.add_parser("vault", help="run or initialise the remote memory store")
-    vault.add_argument("action", choices=("init", "serve"))
+    vault.add_argument("action", choices=("init", "serve", "plans", "plan", "device"))
     vault.add_argument("--root", default=str(Path(DEFAULT_HOME) / "vault-store"))
     vault.add_argument("--accounts", help="accounts file (default <root>/accounts.json)")
-    vault.add_argument("--account", default="owner", help="account name for init")
+    vault.add_argument("--account", default="owner", help="account name for init/plan/device")
+    vault.add_argument("--set", help="plan to apply when action is 'plan' (see: vault plans)")
+    vault.add_argument("--admin-secret", help="HMAC secret for /v1/admin/entitlement (or TRICK_ADMIN_SECRET)")
     vault.add_argument("--host", default="127.0.0.1")
     vault.add_argument("--port", type=int, default=8790)
     vault.add_argument("--cert", help="TLS certificate (fullchain)")

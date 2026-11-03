@@ -33,7 +33,7 @@ number is the entire reason a $5 instance is enough.
 
 | line | value | measured or derived |
 | --- | --- | --- |
-| instance | 1 vCPU, 512 MB, 20 GB SSD, 1 TB transfer | Lightsail's cheapest plan, $5/month |
+| instance | 2 vCPU (shared), 512 MB, 20 GB SSD, 1 TB transfer | Lightsail nano_3_0, $5/month with a public IPv4 (verified against the AWS bundle table) |
 | store process resident memory | ~30 MB | derived: one Python process, no index, no model |
 | one archive | 380,781 bytes | measured (`scripts/verify_remote.py`) |
 | requests per backup | 4 (ping, put, read-back, usage) | derived from the client code |

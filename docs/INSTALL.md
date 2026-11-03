@@ -716,6 +716,64 @@ Removal: `systemctl --user disable --now trick-backup.timer`, then delete
 `~/.config/systemd/user/trick-backup.service` and `trick-backup.timer`, then
 `systemctl --user daemon-reload`.
 
+### 10c. Plans and devices (optional)
+
+A plan is a set of limits on the server, not a feature flag on the client: the
+free build is complete, and a plan only buys room for the sealed archive. The
+table and what is enforced where are in `docs/PLANS.md`.
+
+```sh
+# see every row, with the numbers the store actually enforces
+.venv/bin/python -m trick vault plans
+
+# what this account is on right now
+.venv/bin/python -m trick vault plan --root ~/.local/share/trick/vault-store --account owner
+
+# move it to a plan by hand (an operator, not a payment provider)
+.venv/bin/python -m trick vault plan --root ~/.local/share/trick/vault-store \
+    --account owner --set backup
+
+# one more device: prints a token once, refuses beyond the plan's device count
+.venv/bin/python -m trick vault device --root ~/.local/share/trick/vault-store --account owner
+```
+
+Both commands rewrite `accounts.json` in one atomic write and never create an
+account: an unknown name is an error, so a mistyped webhook cannot conjure a disk.
+
+To let a payment provider move plans automatically, give the store a secret. On
+the server, in the file the unit already looks for (absent by default, and with
+it absent the route answers 401):
+
+```sh
+sudo install -m 600 -o trickvault -g trickvault /dev/null /etc/trick-vault/admin.env
+sudo sh -c 'printf "TRICK_ADMIN_SECRET=%s\n" "THE-SHARED-SECRET" > /etc/trick-vault/admin.env'
+sudo systemctl restart trick-vault
+```
+
+The claim body, the signature header, the 300-second timestamp window and the
+replayed-event ledger are documented in `docs/PLANS.md`. Without the secret no
+plan can change, which is the intended default.
+
+For a store you run by hand instead (no systemd), the same secret goes in the
+environment:
+
+```sh
+TRICK_ADMIN_SECRET=the-shared-secret .venv/bin/python -m trick vault serve \
+    --root ~/.local/share/trick/vault-store --host 127.0.0.1 --port 8790 \
+    --cert /etc/trick-vault/tls/cert.pem --key /etc/trick-vault/tls/key.pem
+```
+
+Renting the box itself is scripted, and the script prints before it spends:
+
+```sh
+sh deploy/lightsail.sh plan     # prints the exact AWS commands, runs none
+sh deploy/lightsail.sh status   # needs lightsail:GetInstance
+TRICK_LIGHTSAIL_CONFIRM=yes sh deploy/lightsail.sh create
+```
+
+Its header lists the exact IAM actions required. A publish-only key gets
+`AccessDeniedException`, which is the correct outcome rather than a workaround.
+
 ## 11. Everything this project creates
 
 | Artifact | Created by | Removed by |
@@ -731,6 +789,7 @@ Removal: `systemctl --user disable --now trick-backup.timer`, then delete
 | `~/trick-memory.trk` | step 10, only if you asked for it | `rm -f` that file |
 | `$HOME/.local/share/trick/vault.token` | step 10b, only if you push | `rm -f vault.token` |
 | `$HOME/.local/share/trick/vault-store/` | only if you run a store here | `rm -rf vault-store/` |
+| `$HOME/.local/share/trick/vault-store/entitlements.json` | first signed entitlement (step 10c) | `rm -f entitlements.json` |
 | `$HOME/.config/trick/backup.env` | step 10b timer | `rm -f backup.env` |
 | `$HOME/.config/systemd/user/trick-backup.timer` | step 10b timer | disable it, then delete the unit |
 | laya credentials file | step 3 | `rm -f` that file |

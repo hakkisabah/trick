@@ -64,6 +64,7 @@ def known_state_paths() -> set[str]:
         str(DEFAULT_HISTORY),
         str(token_for_home(Path.home())),
         str(Path(DEFAULT_HOME) / "vault-store"),
+        str(Path(DEFAULT_HOME) / "vault-store" / "entitlements.json"),
     }
 
 
