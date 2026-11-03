@@ -323,11 +323,19 @@ def _clean(text: str) -> str:
 # so cutting from the marker to the end removes exactly what was added. A marker
 # alone is not enough evidence - a user may type the same words - so the tail
 # must also look like a block before anything is cut.
-RESULT_MARKERS = (
+# Two classes of marker, because they carry different amounts of evidence:
+#
+# * structural - the rendered block's own opening. Nothing else in a chat starts
+#   a line with ``<details>\n<summary>Trick · `` or ``**Trick** · ``, so the
+#   marker alone is proof and the block is cut even without a body;
+# * advisory - the bare HTML comment. A person can type it, so the tail must also
+#   look like one of our blocks before anything is removed.
+STRUCTURAL_MARKERS = (
     "<details>\n<summary>Trick · ",
     "**Trick** · ",
-    "<!-- trick:results -->",
 )
+ADVISORY_MARKERS = ("<!-- trick:results -->",)
+RESULT_MARKERS = STRUCTURAL_MARKERS + ADVISORY_MARKERS
 _BLOCK_SIGNALS = (
     "passage",
     "matched:",
@@ -343,7 +351,18 @@ def strip_result_blocks(text: str) -> str:
     if not text:
         return text
     cut = len(text)
-    for marker in RESULT_MARKERS:
+    for marker in STRUCTURAL_MARKERS:
+        at = text.find(marker)
+        if at == -1 or at >= cut:
+            continue
+        tail = text[at:]
+        # A closed element that starts with our own summary is proof even when the
+        # body is empty; the bare prefix on its own is something a person can type
+        # ("**Trick** · is this tool any good?"), so it stays unless it also looks
+        # like a block.
+        if "</details>" in tail or sum(1 for signal in _BLOCK_SIGNALS if signal in tail) >= 2:
+            cut = at
+    for marker in ADVISORY_MARKERS:
         start = 0
         while True:
             at = text.find(marker, start)

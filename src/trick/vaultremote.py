@@ -26,6 +26,7 @@ say so instead of implying an enforcement that does not exist.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import hmac
 import json
@@ -348,18 +349,26 @@ class VaultStore:
                 "note": "this token is shown once and is not stored in clear text anywhere",
             }
 
-    def prune(self, account: Account, *, now: int | None = None) -> list[str]:
+    def prune(self, account: Account, *, now: int | None = None, locked: bool = False) -> list[str]:
         """Delete snapshots older than the plan's retention window."""
         if account.retention_days <= 0:
             return []
         cutoff = int(now if now is not None else time.time()) - account.retention_days * 86_400
         removed: list[str] = []
-        with self._lock:
+        if locked:
             index = self._read_index(account)
             for sha, entry in list(index["objects"].items()):
                 created = int(entry.get("created_at") or 0)
                 if created and created < cutoff:
-                    self.delete(account, sha)
+                    self.delete(account, sha, locked=True)
+                    removed.append(sha)
+            return removed
+        with self._account_lock(account):
+            index = self._read_index(account)
+            for sha, entry in list(index["objects"].items()):
+                created = int(entry.get("created_at") or 0)
+                if created and created < cutoff:
+                    self.delete(account, sha, locked=True)
                     removed.append(sha)
         return removed
 
@@ -385,6 +394,34 @@ class VaultStore:
             "rows_unit": "client-declared; the store cannot count rows inside ciphertext",
         }
 
+    def _account_lock(self, account: Account):
+        """Thread lock plus a file lock, because two processes can share a root.
+
+        Two servers pointed at one store is a realistic mistake, and it used to
+        lose an update: both read the index, both wrote it, one snapshot vanished.
+        ``flock`` on a per-account lock file makes the read-modify-write atomic
+        across processes; the re-entrant thread lock keeps threads inside one
+        process from fighting over the same file description.
+        """
+        import contextlib
+        import fcntl
+
+        @contextlib.contextmanager
+        def holder():
+            with self._lock:
+                lock_path = self._dir(account) / ".lock"
+                fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                    yield
+                finally:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                    finally:
+                        os.close(fd)
+
+        return holder()
+
     def put(self, account: Account, sha: str, blob: bytes, rows: int, created_at: int) -> dict[str, Any]:
         if not SHA_RE.match(sha):
             raise ContractViolation(f"{sha!r} is not a sha256 hex digest")
@@ -395,11 +432,11 @@ class VaultStore:
         actual = hashlib.sha256(blob).hexdigest()
         if actual != sha:
             raise ContractViolation(f"hash mismatch: the body hashes to {actual}, not {sha}")
-        with self._lock:
+        with self._account_lock(account):
             # Retention before quota: a plan that keeps 30 days must not fail on
             # day 31 because the 31st day's snapshot has nowhere to go.
             if account.retention_days > 0:
-                self.prune(account)
+                self.prune(account, locked=True)
             index = self._read_index(account)
             objects = index["objects"]
             existing = objects.get(sha)
@@ -418,7 +455,11 @@ class VaultStore:
                     "delete an old snapshot first"
                 )
             target = self._dir(account) / f"{sha}.trk"
-            tmp = target.with_suffix(".tmp")
+            # A per-writer tmp name: two processes storing the same archive at the
+            # same moment used to pick the same tmp path, and one of them died with
+            # FileNotFoundError on the rename. The content hash names the object;
+            # it must not name the temporary file.
+            tmp = target.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
             tmp.write_bytes(blob)
             os.chmod(tmp, 0o600)
             with open(tmp, "rb") as handle:
@@ -450,10 +491,10 @@ class VaultStore:
             raise StorageIO(f"the stored object {sha} no longer hashes to its name")
         return blob
 
-    def delete(self, account: Account, sha: str) -> dict[str, Any]:
+    def delete(self, account: Account, sha: str, *, locked: bool = False) -> dict[str, Any]:
         if not SHA_RE.match(sha):
             raise ContractViolation(f"{sha!r} is not a sha256 hex digest")
-        with self._lock:
+        with (contextlib.nullcontext() if locked else self._account_lock(account)):
             index = self._read_index(account)
             entry = index["objects"].pop(sha, None)
             if entry is None:

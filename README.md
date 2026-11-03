@@ -32,7 +32,7 @@ question ("which package is this") and stay in the terminal and in MCP. Asking a
 chat question and receiving eight R packages was not a tuning problem, so the
 code that could do it was removed rather than defaulted off.
 
-493 tests pass and `scripts/check.sh` runs 20 repository checks.
+504 tests pass and `scripts/check.sh` runs 20 repository checks.
 
 The R package in `r/trick` is the same find reimplemented under CRAN's rules: no
 dependencies, no compiled code, no network call. Its parity with this engine is
