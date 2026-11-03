@@ -1,0 +1,96 @@
+{
+  "history": {
+    "messages": {
+      "m00": {
+        "id": "m00",
+        "role": "user",
+        "content": "Where did we leave the backup policy change?",
+        "parentId": null
+      },
+      "m01": {
+        "id": "m01",
+        "role": "assistant",
+        "content": "Run 3 finished at 11:42 with 11 items and 11 retries, all green.",
+        "parentId": "m00"
+      },
+      "m02": {
+        "id": "m02",
+        "role": "assistant",
+        "content": "The window is 11 minutes wide, so 11 samples arrive per minute, which is why the dashboard looked flat.",
+        "parentId": "m01"
+      },
+      "m03": {
+        "id": "m03",
+        "role": "assistant",
+        "content": "I opened #11 for the backup policy, and it touches exactly one file: deploy/policy.toml line 24.",
+        "parentId": "m02"
+      },
+      "m04": {
+        "id": "m04",
+        "role": "user",
+        "content": "And the retention window?",
+        "parentId": "m03"
+      },
+      "m05": {
+        "id": "m05",
+        "role": "assistant",
+        "content": "Retention stays at 30 days, set in deploy/policy.toml:24 as retention_days = 30, and the cold tier ages out after that.",
+        "parentId": "m04"
+      },
+      "m06": {
+        "id": "m06",
+        "role": "assistant",
+        "content": "The upload token is created once per device and never rotated, which is the part I would change first.",
+        "parentId": "m05"
+      },
+      "m07": {
+        "id": "m07",
+        "role": "user",
+        "content": "Did the cross-region replication ever get tested?",
+        "parentId": "m06"
+      },
+      "m08": {
+        "id": "m08",
+        "role": "assistant",
+        "content": "Cross-region replication was tested once from eu-central-1 to eu-west-1, and it took 41 minutes for the 900 MB artifact, so it is not a hot path.",
+        "parentId": "m07"
+      },
+      "m09": {
+        "id": "m09",
+        "role": "assistant",
+        "content": "MemoryMax caps the worker at 512 MB; without it the leak reached 3.7 GB over six hours and the host began swapping.",
+        "parentId": "m08"
+      },
+      "m10": {
+        "id": "m10",
+        "role": "user",
+        "content": "Which run had the leak?",
+        "parentId": "m09"
+      },
+      "m11": {
+        "id": "m11",
+        "role": "assistant",
+        "content": "Run 7 had the leak; the CPU profile in MemoryMax was flat, so it was a reference that never got dropped, not a hot loop.",
+        "parentId": "m10"
+      },
+      "m12": {
+        "id": "m12",
+        "role": "assistant",
+        "content": "The service unit writes to ~/.local/share/trick and reads the token from ~/.config/trick/bridge.token.",
+        "parentId": "m11"
+      },
+      "m13": {
+        "id": "m13",
+        "role": "user",
+        "content": "Remind me what the bridge binds to.",
+        "parentId": "m12"
+      },
+      "m14": {
+        "id": "m14",
+        "role": "assistant",
+        "content": "The bridge binds to 172.17.0.1:8765 with --expose-network, which is reachable from the container and from no other host.",
+        "parentId": "m13"
+      }
+    }
+  }
+}

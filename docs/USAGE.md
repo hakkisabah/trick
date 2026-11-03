@@ -94,10 +94,17 @@ What changed:
 - **The coverage filter uses the same rule as the index.** It used to compare
   raw strings, so a passage the index had found was discarded one step later and
   the search returned nothing at all - silently. Both now agree.
-- **A stem falls back to prefixes.** `yapil` reaches `yapildi` and `yapilan`.
-  Prefix expansion runs only when the exact form finds nothing, because using it
-  always cost one exact-surface case: the passage repeating the bare stem three
-  times outranked the one that said it once.
+- **A stem reaches its inflections.** `yapil` reaches `yapildi` and `yapilan`.
+  Prefix expansion used to run only when the exact form found nothing, so a stem
+  that also exists as a word abandoned every inflection of it: measured on a real
+  chat, stem recall@3 was 0.50 against 1.00 for the exact surface form. Both
+  channels now run, and prefix-only hits are damped to 0.8 so a passage that
+  spells the term exactly still outranks one that merely shares the stem.
+- **A verbatim hit outranks the noise it tokenises into.** `#11` becomes the token
+  `11`, which occurs in every count and timestamp, so the passage holding the pull
+  request ranked fourth. The passage that spells out what you typed is now placed
+  above every non-verbatim hit, and it is a candidate even when the prefilter would
+  have truncated it. Measured on a real chat: identifier recall@1 0.43 -> 1.00.
 
 The limit, stated plainly: prefix matching finds inflections that extend the stem
 (`yapil` -> `yapilan`), not ones that change it inside (`yazim` vs `yazilmasi`).
@@ -107,7 +114,15 @@ returns nothing, shorten it by hand or use a word you are sure of.
 `scripts/eval_turkish.py` re-runs this measurement on any chat export, so the
 numbers above can be checked instead of trusted: it takes an Open WebUI export
 and prints the three recalls with a floor per row. On the same three chats with
-60 gold passages it reports exact 0.967, ascii 0.967, stem 0.700.
+60 gold passages it reports exact 0.967, ascii 0.967, stem 0.750.
+
+`scripts/eval_real.py` measures the harder question, the one a real chat asks: it
+has no needles at all. It derives the queries from the chat itself - file names,
+`file:line`, pull-request numbers, constants, words that occur once - and adds
+tokens that occur nowhere, which must return nothing. That last row is the one
+that catches a confident wrong answer. On two real chats with 30 queries per
+shape: identifier recall@3 1.00 and 1.00, rare 1.00 and 1.00, absent-query false
+positives zero.
 
 What laya adds in Turkish, measured rather than assumed: on a single rare word
 it agreed with retrieval's top pick 14 of 15 times. On ambiguous two-word queries

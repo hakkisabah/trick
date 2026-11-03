@@ -105,6 +105,9 @@ PHRASE_BONUS = 1.25
 # reached recall@3 0.25 without prefix matching; the fold-plus-prefix build
 # reaches 0.94, and the exact surface form stays at 0.97.
 PREFIX_MIN = 5
+# Prefix-only hits are damped: sharing a stem is weaker evidence than spelling the
+# term out, and without the damping the stem case wins by repetition.
+PREFIX_PENALTY = 0.8
 # Signature cosine above which two passages are treated as the same passage said
 # twice. Measured on a 30-turn chat: copies of one repeated sentence score
 # 0.944-0.968 against each other, distinct passages 0.08-0.60.
@@ -526,12 +529,20 @@ class TranscriptIndex:
     def bm25(self, query: str, *, limit: int = PREFILTER) -> list[tuple[int, float]]:
         """Rank chunks by BM25, best first, as positive scores.
 
-        Exact terms first; if nothing matches, the same query is retried as
-        prefixes, which is what turns a remembered Turkish stem ("yapil") into
+        Two channels: the terms exactly as typed, and the same terms as prefixes.
+        The prefix channel is what turns a remembered Turkish stem ("yapil") into
         the inflected words the chat actually contains ("yapildi", "yapilan").
+
+        It used to run only when the exact channel found nothing, which meant a
+        stem that also happens to exist as a word abandoned every inflection of
+        it: measured on a real chat, stem recall@3 was 0.40 against 1.00 for the
+        exact surface form. Prefix-only hits are kept at ``PREFIX_PENALTY`` of
+        their score, so a passage that spells the term exactly still outranks one
+        that merely shares the stem.
         """
         if self._conn is None:
             return []
+        best: dict[int, float] = {}
         for prefix in (False, True):
             expression = _fts_expression(query, prefix=prefix)
             if not expression:
@@ -544,12 +555,19 @@ class TranscriptIndex:
                 ).fetchall()
             except sqlite3.Error:
                 return []
-            # bm25() returns negative numbers; flip and shift so the scale is positive
-            # and a phrase bonus can never turn a zero into a hit.
-            scored = [(int(row[0]), -float(row[1])) for row in rows if float(row[1]) < 0.0]
-            if scored:
-                return scored
-        return []
+            weight = PREFIX_PENALTY if prefix else 1.0
+            for row in rows:
+                # bm25() returns negative numbers; flip so the scale is positive and
+                # a phrase bonus can never turn a zero into a hit.
+                score = -float(row[1])
+                if score <= 0.0:
+                    continue
+                chunk_id = int(row[0])
+                weighted = score * weight
+                if weighted > best.get(chunk_id, 0.0):
+                    best[chunk_id] = weighted
+        ranked = sorted(best.items(), key=lambda pair: (-pair[1], pair[0]))
+        return ranked[: max(1, int(limit))]
 
     def candidates(self, query: str, *, limit: int = PREFILTER) -> dict[int, float]:
         """Union of BM25 hits and signature hits, with the phrase bonus applied.
@@ -576,6 +594,31 @@ class TranscriptIndex:
                     scores.setdefault(chunk.chunk_id, cosine)
         phrase = " ".join(fold_tr(query).split())
         if phrase:
+            # A verbatim occurrence of what the user typed is the strongest evidence
+            # a find has, and a boost is not enough: query "#11" tokenises to "11",
+            # which occurs in every count and timestamp, so the passage holding the
+            # pull request was pushed out of the top 3 by pure noise. Verbatim hits
+            # are shifted above the best non-verbatim score instead, and their own
+            # order is still BM25's. Measured on two real chats: identifier recall@1
+            # 0.43 -> 0.90 on the chat full of "#11"-style references.
+            # Word boundaries, not a bare substring: a rare word boosted the
+            # passage that merely contains it inside a longer word, and cost
+            # recall@1 (1.00 -> 0.90) before the boundary was added.
+            boundary = re.compile(r"(?<!\w)" + re.escape(phrase) + r"(?!\w)")
+            verbatim = [
+                chunk.chunk_id
+                for chunk in self.chunks
+                if boundary.search(self.folded[chunk.chunk_id])
+            ]
+            if verbatim and scores:
+                top = max(scores.values())
+                floor = min(scores.values())
+                for chunk_id in verbatim:
+                    # A verbatim hit that BM25 truncated away is seeded at the floor
+                    # rather than dropped: the passage containing what the user typed
+                    # must be a candidate even when the term is too common to survive
+                    # the prefilter.
+                    scores[chunk_id] = scores.get(chunk_id, floor) + top
             for chunk in self.chunks:
                 if chunk.chunk_id in scores and phrase in self.folded[chunk.chunk_id]:
                     scores[chunk.chunk_id] *= PHRASE_BONUS

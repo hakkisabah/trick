@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 from trick.errors import ContractViolation, ResourceExhausted, ScorerUnavailable
-from trick.laya import Ranked
+from trick.laya import MockScorer, Ranked
 from trick.search import SearchEngine
 from trick.textindex import DocumentStore
 from trick.transcript import (
@@ -589,3 +589,64 @@ def test_matched_terms_survive_the_wire_format() -> None:
     # An answer from an older bridge has no such field and must not break.
     payload.pop("matched")
     assert ChatRow.from_dict(1, payload).matched == ()
+
+
+def _chat_with_numbers() -> list[Message]:
+    """A chat where a bare number is noise and the sigil form is the answer."""
+    raw = [
+        ("user", "Which pull request fixed the backup policy?"),
+        ("assistant", "Run 3 finished at 11:42 with 11 items and 11 retries, all green."),
+        ("assistant", "The window is 11 minutes wide, so 11 samples arrive per minute."),
+        ("assistant", "I opened #11 for the backup policy, and it changes one file."),
+        ("user", "Remind me which run that was."),
+        ("assistant", "Run 3, the one with 11 items."),
+    ]
+    return normalise_messages([{"role": role, "content": text} for role, text in raw])
+
+
+def test_a_verbatim_sigil_query_outranks_the_numbers_it_shares() -> None:
+    """'#11' must find the pull request, not the timestamps.
+
+    The query tokenises to "11", which occurs in every count and timestamp, so a
+    plain BM25 ranking put the pull-request passage fourth on a real chat
+    (identifier recall@1 was 0.43). The passage that spells out what the user
+    typed is the answer, and it is now shifted above the noise.
+    """
+    messages = _chat_with_numbers()
+    rows, _report = ConversationSearch(scorer=MockScorer()).search("#11", messages, limit=5)
+    assert rows, "the sigil query found nothing"
+    assert "#11" in rows[0].text
+    assert rows[0].rank == 1
+
+
+def test_a_verbatim_hit_is_a_candidate_even_when_bm25_truncates_it() -> None:
+    """The prefilter may drop the answer; the verbatim channel must not."""
+    messages = _chat_with_numbers()
+    index = TranscriptIndex(messages)
+    # A limit of one keeps only the best-scoring chunk, which is noise here.
+    truncated = index.bm25("#11", limit=1)
+    assert truncated, "the index found nothing at all"
+    assert "#11" not in index.chunks[truncated[0][0]].text
+    candidates = index.candidates("#11", limit=1)
+    verbatim = [cid for cid, chunk in enumerate(index.chunks) if "#11" in chunk.text]
+    assert verbatim and any(cid in candidates for cid in verbatim)
+
+
+def test_a_stem_finds_its_inflections_even_when_the_stem_is_also_a_word() -> None:
+    """Prefix matching used to be a fallback, so a word-shaped stem lost the rest.
+
+    "yapil" exists as a word in the chat, which meant the prefix channel never
+    ran and every inflected form of it became unreachable. Measured on a real
+    chat, stem recall@3 was 0.50 against 0.97 for the exact surface form.
+    """
+    # Written without Turkish letters on purpose: the fold maps them to these, so
+    # this is the same token pair the index sees, and the repository stays ASCII.
+    raw = [
+        ("user", "yapil listesi nerede"),
+        ("assistant", "The list of things to do is in the plan file, second section."),
+        ("assistant", "Kontrol yapildi ve sonuc temiz cikti, ayrinti raporda."),
+    ]
+    messages = normalise_messages([{"role": role, "content": text} for role, text in raw])
+    rows, _report = ConversationSearch(scorer=MockScorer()).search("yapil", messages, limit=3)
+    assert rows, "the stem found nothing"
+    assert any("yapildi" in row.text for row in rows), [row.text for row in rows]

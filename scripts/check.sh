@@ -21,7 +21,7 @@
 #     17. R package    R sources parse; with R installed, both engines agree
 set -eu
 
-TOTAL=17
+TOTAL=18
 
 cd "$(dirname "$0")/.."
 PY="${PY:-.venv/bin/python}"
@@ -341,10 +341,57 @@ print(
 )
 PYCODE
 
-echo "== 15/$TOTAL result rows jump to their message"
+echo "== 15/$TOTAL conversation search on a real chat shape"
+# A real chat has no needles: the answers are whatever happens to be there. The
+# gold set is derived from the chat itself (identifiers, file:line, rare words)
+# and from tokens that occur nowhere (which must return nothing). This is the
+# gate that keeps the "#11 ranked fourth" class of bug from coming back.
+"$PY" - <<'PYCODE'
+import json
+import subprocess
+import sys
+
+proc = subprocess.run(
+    [sys.executable, "scripts/eval_real.py", "tests/fixtures/real_chat_sample.json", "--limit", "30", "--json"],
+    capture_output=True,
+    text=True,
+    timeout=600,
+)
+if proc.returncode != 0:
+    print(proc.stderr.strip()[-800:])
+    raise SystemExit("the real-chat evaluation did not run")
+data = json.loads(proc.stdout)
+summary = data["summary"]
+problems = []
+if summary["identifier"]["queries"] < 4:
+    problems.append(f"only {summary['identifier']['queries']} identifier queries generated")
+if summary["identifier"]["recall@3"] < 0.9:
+    problems.append(f"identifier recall@3 {summary['identifier']['recall@3']} < 0.9")
+if summary["rare"]["recall@3"] < 0.9:
+    problems.append(f"rare recall@3 {summary['rare']['recall@3']} < 0.9")
+if summary["absent"]["false_positive"] > 0.0:
+    problems.append(f"absent-query false positive rate {summary['absent']['false_positive']} > 0")
+for line in problems:
+    print(f"gate: {line}")
+if problems:
+    for failure in data["failures"][:10]:
+        print(f"  {failure}")
+    raise SystemExit(1)
+print(
+    "conversation search ok: identifier %.2f, rare %.2f, absent fp %.2f over %d queries"
+    % (
+        summary["identifier"]["recall@3"],
+        summary["rare"]["recall@3"],
+        summary["absent"]["false_positive"],
+        sum(item["queries"] for item in summary.values()),
+    )
+)
+PYCODE
+
+echo "== 16/$TOTAL result rows jump to their message"
 "$PY" scripts/jump_check.py
 
-echo "== 16/$TOTAL score matrix builds and reads back"
+echo "== 17/$TOTAL score matrix builds and reads back"
 TMPMATRIX=$(mktemp -d)
 "$PY" - "$TMPMATRIX" <<'PYCODE'
 import json
