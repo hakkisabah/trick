@@ -32,7 +32,13 @@ question ("which package is this") and stay in the terminal and in MCP. Asking a
 chat question and receiving eight R packages was not a tuning problem, so the
 code that could do it was removed rather than defaulted off.
 
-415 tests pass and `scripts/check.sh` runs 16 repository checks.
+415 tests pass and `scripts/check.sh` runs 17 repository checks.
+
+The R package in `r/trick` is the same find reimplemented under CRAN's rules: no
+dependencies, no compiled code, no network call. Its parity with this engine is
+measured, not asserted - `scripts/parity_r.py` (gate 17) runs one fixture through
+both and compares passage boundaries, ranking order and the matrix bytes in both
+directions.
 
 Measured on 22 gold queries with the live model and live sources, no re-ranking
 shortcuts (see `scripts/eval_ranking.py`):
