@@ -8,8 +8,9 @@ command in it would have failed with "command not found" on a clean machine.
 
 Checks, all fail-closed:
 
-1. no bare ``trick <subcommand>`` invocation in any tracked document; the only
-   supported form is ``python -m trick <subcommand>``
+1. a bare ``trick <subcommand>`` invocation is allowed only when the package
+   declares a console script, and the declared target must import; without one
+   the only supported form is ``python -m trick <subcommand>``
 2. every subcommand a document mentions exists in the real CLI parser
 3. every repository-relative path a document mentions exists on disk
 4. every state-directory path a document mentions is a real default from cli.py
@@ -18,8 +19,10 @@ Checks, all fail-closed:
 from __future__ import annotations
 
 import argparse
+import importlib
 import re
 import sys
+import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -68,7 +71,35 @@ def known_state_paths() -> set[str]:
     }
 
 
-def check_text(name: str, text: str, commands: set[str], state: set[str]) -> list[str]:
+def console_script() -> str | None:
+    """Return the declared console-script target, but only if it really imports.
+
+    A declared entry point that does not resolve is worse than none: the docs
+    would be allowed to print a command that dies with ImportError. So the
+    declaration is checked against the code, not taken on faith.
+    """
+    data = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    scripts = (data.get("project") or {}).get("scripts") or {}
+    target = scripts.get("trick")
+    if not target or ":" not in target:
+        return None
+    module_name, _, attribute = target.partition(":")
+    try:
+        module = importlib.import_module(module_name)
+    except Exception:
+        return None
+    if not callable(getattr(module, attribute, None)):
+        return None
+    return target
+
+
+def check_text(
+    name: str,
+    text: str,
+    commands: set[str],
+    state: set[str],
+    bare_ok: bool = False,
+) -> list[str]:
     problems: list[str] = []
 
     # Lines that name a process for pkill/pgrep are quoting the command line, not
@@ -89,6 +120,8 @@ def check_text(name: str, text: str, commands: set[str], state: set[str]) -> lis
             continue
         line = text.count("\n", 0, match.start()) + 1
         if line in quoted:
+            continue
+        if bare_ok:
             continue
         problems.append(
             f"{name}:{line}: bare 'trick {word}' - use 'python -m trick {word}' "
@@ -136,17 +169,30 @@ def check_text(name: str, text: str, commands: set[str], state: set[str]) -> lis
 def main() -> int:
     commands = subcommands()
     state = known_state_paths()
+    entry = console_script()
     problems: list[str] = []
     scanned = 0
     for path in documents():
         scanned += 1
-        problems.extend(check_text(str(path.relative_to(ROOT)), path.read_text(encoding="utf-8"), commands, state))
+        problems.extend(
+            check_text(
+                str(path.relative_to(ROOT)),
+                path.read_text(encoding="utf-8"),
+                commands,
+                state,
+                bare_ok=entry is not None,
+            )
+        )
     if problems:
         print("documentation gate failed:", file=sys.stderr)
         for problem in problems:
             print(f"  {problem}", file=sys.stderr)
         return 1
-    print(f"docs ok: {scanned} documents, {len(commands)} subcommands, paths and state defaults agree")
+    form = f"console script trick -> {entry}" if entry else "no console script: python -m only"
+    print(
+        f"docs ok: {scanned} documents, {len(commands)} subcommands, "
+        f"paths and state defaults agree ({form})"
+    )
     return 0
 
 

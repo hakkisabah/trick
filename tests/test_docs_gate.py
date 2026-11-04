@@ -36,6 +36,39 @@ def test_bare_invocation_is_rejected():
     assert problems and "no console script" in problems[0]
 
 
+def test_console_script_declaration_resolves():
+    assert gate.console_script() == "trick.cli:main"
+
+
+def test_bare_invocation_is_accepted_when_the_console_script_resolves():
+    assert gate.check_text("doc.md", "run `trick serve` now\n", COMMANDS, STATE, bare_ok=True) == []
+
+
+def test_bare_form_is_still_checked_against_the_real_parser():
+    problems = gate.check_text("doc.md", "see `python -m trick teleport`\n", COMMANDS, STATE, bare_ok=True)
+    assert problems and "unknown subcommand" in problems[0]
+
+
+def test_entry_point_that_does_not_import_is_treated_as_absent(tmp_path, monkeypatch):
+    """A declared-but-broken entry point is worse than none: the docs would print a
+    command that dies with ImportError. The gate must fall back to python -m."""
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "trick"\n\n[project.scripts]\ntrick = "trick.no_such_module:main"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(gate, "ROOT", tmp_path)
+    assert gate.console_script() is None
+
+
+def test_entry_point_with_a_non_callable_attribute_is_treated_as_absent(tmp_path, monkeypatch):
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "trick"\n\n[project.scripts]\ntrick = "trick.cli:not_a_function"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(gate, "ROOT", tmp_path)
+    assert gate.console_script() is None
+
+
 def test_python_dash_m_form_is_accepted():
     assert gate.check_text("doc.md", "run `.venv/bin/python -m trick serve`\n", COMMANDS, STATE) == []
 

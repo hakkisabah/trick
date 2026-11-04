@@ -17,22 +17,25 @@ the check CRAN runs.
 
 ## Status
 
-Phase 5 of 7 is complete. Phase 1-2: storage, catalogues, ranking. Phase 3: the
-core service, the terminal UI, MCP. Phase 4: the per-source quota. Phase 5:
+All seven phases are complete. Phase 1-2: storage, catalogues, ranking. Phase 3:
+the core service, the terminal UI, MCP. Phase 4: the per-source quota. Phase 5:
 **conversation scope** - the whole chat is chunked, indexed in memory and
-searched, so "where did we say that" is answerable from the chat itself.
+searched, so "where did we say that" is answerable from the chat itself. Phase 5b
+and 6: remote memory, plans, hardening, fuzzing, latency budgets, `doctor`.
+Phase 7: this document, the usage guide and the measured numbers below.
 
 Phase 6 fixed the Open WebUI surface. It was a Pipe, which Open WebUI lists as a
 model, so the tool looked like a chat partner and its query arrived as a chat
 message. It is now an **Action**: a button in the message toolbar that opens an
-input dialog and returns the hits as a card. The search box is the point.
+input dialog and returns the hits as a collapsible block. The search box is the
+point.
 
 That surface has one corpus: the conversation. The catalogues answer a different
 question ("which package is this") and stay in the terminal and in MCP. Asking a
 chat question and receiving eight R packages was not a tuning problem, so the
 code that could do it was removed rather than defaulted off.
 
-582 tests pass and `scripts/check.sh` runs 23 repository checks.
+592 tests pass and `scripts/check.sh` runs 23 repository checks.
 
 The R package in `r/trick` is the same find reimplemented under CRAN's rules: no
 dependencies, no compiled code, no network call. Its parity with this engine is
@@ -40,21 +43,47 @@ measured, not asserted - `scripts/parity_r.py` (gate 18) runs one fixture throug
 both and compares passage boundaries, ranking order and the matrix bytes in both
 directions.
 
-Measured on 22 gold queries with the live model and live sources, no re-ranking
-shortcuts (see `scripts/eval_ranking.py`):
+## Does it work
+
+Two corpora, two measurements, both with the live model and no shortcuts. Re-run
+them: `scripts/eval_real.py` and `scripts/eval_ranking.py`.
+
+Conversation search, on three real chats (142 messages, 222 derived queries, the
+live scorer; queries the harness invents from the chat itself - file names,
+`file:line`, pull-request numbers, constants, words that occur once - plus tokens
+that occur nowhere and must return nothing):
+
+```
+shape          n     r@1     r@3     mrr      false pos
+identifier    84    0.94    1.00    0.97         -
+rare         120    0.97    0.98    0.98         -
+absent        18    0.00    0.00    0.00       0.00
+latency p50 = 5.1 ms, p95 = 214.8 ms (including the laya call when the gate fires)
+```
+
+Catalogue search, 22 gold queries with live sources and live scoring (see
+`scripts/eval_ranking.py`):
 
 ```
                      recall@12   mrr@10   ndcg@10
-laya alone              0.682     0.326    0.414
-retrieval only          0.955     0.788    0.829
-blend (shipped)         0.955     0.779    0.823
+laya alone              0.773     0.479    0.550
+retrieval only          1.000     0.826    0.870
+blend (shipped)         1.000     0.895    0.922
 
-canonical set (12)      0.917     0.764    0.803
-niche set (10)          1.000     0.798    0.846
+canonical set (12)      1.000     0.875    0.908
+niche set (10)          1.000     0.920    0.939
 ```
 
 End-to-end latency with live sources and one laya call: p50 1175 ms, min 810 ms,
 max 1953 ms. The confidence gate skipped the model on 6 of 22 queries.
+
+The honest reading of both tables: the lexical layer does the finding, laya is the
+tie-breaker, and the gate stops a tie-breaker from becoming a tie-maker. In the
+catalogues the blend beats retrieval alone on ranking quality (+0.069 mrr@10,
++0.052 ndcg@10) while recall is already saturated; in the conversation scope laya
+did not change a single decided ranking, which is why the gate keeps it out of most
+chat queries. What this tool is *not* is a question answerer - see `docs/USAGE.md`
+for the query shapes that work.
 
 ## Surfaces
 
@@ -69,11 +98,14 @@ one ranking path:
 integrations/openwebui                            # Open WebUI Action (a button that opens a search box)
 ```
 
-There is no `trick` console script: the package declares no entry point, so the
-`python -m trick` form above is the only invocation that works on a clean machine,
-and the documentation gate fails the build if a document forgets it. Full
-installation, verification and removal steps for every artifact (venv, store,
-bridge token, systemd unit, Open WebUI function) live in `docs/INSTALL.md`.
+There is one console script, `trick`, declared in `pyproject.toml` as
+`trick.cli:main` and installed by `pip install -e .`. The `python -m trick` form
+above always works, even without an install; the documentation gate reads the entry
+point from `pyproject.toml`, imports its target, and only then permits a document to
+print the bare form - a declared entry point that does not resolve is worse than
+none, so it is checked against the code rather than trusted. Full installation,
+verification and removal steps for every artifact (venv, store, bridge token,
+systemd unit, Open WebUI function) live in `docs/INSTALL.md`.
 
 What the tool does, what it does not do, and which query shapes work is
 `docs/USAGE.md` - read it before reporting a result as unrelated: the `matched:`
@@ -417,7 +449,7 @@ src/trick/tui.py          terminal session: Enter submits, history, commands
 src/trick/vault.py        sealed archive: scrypt + AES-GCM, merge on restore
 src/trick/vaultremote.py  remote store: TLS server, pinned client, quotas
 src/trick/cli.py          query / tui / serve / mcp / ingest / doctor / probe
-tests/                    582 tests: layout, corruption, contention, budget,
+tests/                    592 tests: layout, corruption, contention, budget,
                           adapters, client, pipeline, credentials, protocol,
                           permissions, concurrency, session behaviour, chunks,
                           transcript ranking, Turkish folding and stems,

@@ -16,6 +16,24 @@ piece of text occurs, then asks laya to order the closest few. That distinction
 is the whole of this page: a query shaped like a find works, a query shaped like
 a question usually does not.
 
+## Who this is for
+
+Three people, three needs, all of them "I know the text, I cannot find the place":
+
+- **Someone in a long chat.** Past forty turns, the browser's own find returns a
+  scrollbar of hits and no order. You remember the number, the file name, the error
+  string, the sentence - not which turn it was in. Trick returns that passage, ranked,
+  with the turn number and a link that scrolls to it.
+- **A researcher choosing a tool.** "Which R package does negative binomial
+  differential expression for RNA-seq" is a catalogue question with hundreds of
+  plausible neighbours; the catalogues answer it in one call, and the ranking is
+  measured (mrr@10 0.895).
+- **An agent with an MCP host.** The same two lookups, as tools, for a model that
+  would otherwise guess.
+
+Concretely: it replaces `Ctrl+F` in a chat and a page of CRAN search results. That is
+the whole ambition, and it is why the tool is small.
+
 ## The Open WebUI button
 
 Press the magnifier under any answer. A dialog opens; type what to look for and
@@ -42,6 +60,32 @@ Every label on a row is a fact about that row, not decoration:
 | `Weak match` | no passage carries the distinctive words of the question |
 | `One word was searched` | the query was a single token; the block says how many passages contain it |
 | `_degraded: ..._` | a live source or the scorer did not answer; the list is retrieval-only |
+
+## What an administrator does once
+
+A user needs nothing installed: the button lives in the Open WebUI instance, and
+the search runs on the machine that hosts Trick. Five minutes, once:
+
+1. Install Trick on a host the Open WebUI container can reach, and start the bridge
+   on the docker bridge address: `python -m trick serve --http-host 172.17.0.1
+   --expose-network --http-port 8765`. `127.0.0.1` will not work from inside a
+   container - that is the first thing that bites.
+2. In Open WebUI: Settings > Account > API Keys > Create, and copy the key.
+3. Point the installer at it: `TRICK_OPENWEBUI_API_KEY=<key> python
+   integrations/openwebui/install.py`. It uploads the function, enables it globally,
+   writes the bridge token into the function's valves and reads the stored copy back
+   to prove it.
+4. Verify without touching the browser: `python integrations/openwebui/install.py
+   --check --db <copy of webui.db>`. It must say `up to date`.
+5. Open a chat, hover an answer, press the magnifier.
+
+Nothing else is required: no model to select, no Pipe in the model list, no prompt.
+If the magnifier does not appear, the function is not global or not active - check
+the row in Admin Settings > Functions. If it opens but the search fails, the bridge
+is not running or its address is not the docker bridge address.
+
+The full path, with the failure modes and the removal commands, is `docs/INSTALL.md`
+section 8.
 
 ## Query shapes, measured on real chats
 
