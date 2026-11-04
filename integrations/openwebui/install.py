@@ -60,6 +60,64 @@ def request(url: str, key: str, payload: dict | None = None, method: str | None 
         raise SystemExit(2)
 
 
+def check_through_database(db_path: Path) -> int:
+    """Compare the installed function by reading Open WebUI's database, read-only.
+
+    The API path above is authoritative, but it needs an admin key. When Open
+    WebUI runs in Docker on the same host, the database is the only way to
+    answer "is the button running this file?" without one. Nothing is written:
+    the connection is opened with mode=ro.
+    """
+    import sqlite3
+
+    if not db_path.exists():
+        print(f"database not found: {db_path}", file=sys.stderr)
+        return 2
+    content = ACTION_FILE.read_text(encoding="utf-8")
+    try:
+        db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10)
+    except sqlite3.Error as exc:
+        print(f"cannot open {db_path} read-only: {exc}", file=sys.stderr)
+        return 2
+    try:
+        row = db.execute(
+            "SELECT content, type, is_global, is_active FROM function WHERE id = ?",
+            (FUNCTION_ID,),
+        ).fetchone()
+    except sqlite3.Error as exc:
+        print(f"cannot read the function table in {db_path}: {exc}", file=sys.stderr)
+        return 2
+    finally:
+        db.close()
+
+    if row is None:
+        print(f"not installed: no function '{FUNCTION_ID}' in {db_path}", file=sys.stderr)
+        return 1
+    installed, kind, is_global, is_active = row[0] or "", row[1], bool(row[2]), bool(row[3])
+    problems = []
+    if installed != content:
+        problems.append(f"content differs ({len(installed)} bytes installed, {len(content)} in this file)")
+    if kind != EXPECTED_TYPE:
+        problems.append(f"type is {kind!r}, expected {EXPECTED_TYPE!r}")
+    if not is_global:
+        problems.append("the action is not global, so no button appears under answers")
+    if not is_active:
+        problems.append("the action is disabled")
+    for stale in ("SOURCES", "SEARCH_CHAT"):
+        if f"{stale}: " in installed:
+            problems.append(f"the installed release still declares the {stale} valve")
+    if problems:
+        for line in problems:
+            print(f"stale: {line}", file=sys.stderr)
+        print("re-run this script without --check to update the install", file=sys.stderr)
+        return 1
+    print(
+        f"up to date: {len(installed)} bytes, type={kind}, global, active "
+        f"(read from {db_path}, read-only)"
+    )
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default=os.environ.get("TRICK_OPENWEBUI_URL", "http://localhost:3000"))
@@ -75,11 +133,25 @@ def main() -> int:
         action="store_true",
         help="do not write the bridge token into the TRICK_TOKEN valve",
     )
+    parser.add_argument(
+        "--db",
+        default=os.environ.get("TRICK_OPENWEBUI_DB", ""),
+        help=(
+            "path to Open WebUI's webui.db, read-only; lets --check run without an admin "
+            "API key (useful on a host that runs Open WebUI in Docker)"
+        ),
+    )
     args = parser.parse_args()
 
     key = os.environ.get("TRICK_OPENWEBUI_API_KEY", "").strip()
+    if args.check and args.db and not key:
+        return check_through_database(Path(args.db))
     if not key:
-        print("set TRICK_OPENWEBUI_API_KEY to an Open WebUI admin API key", file=sys.stderr)
+        print(
+            "set TRICK_OPENWEBUI_API_KEY to an Open WebUI admin API key, "
+            "or pass --db /path/to/webui.db with --check for a read-only comparison",
+            file=sys.stderr,
+        )
         return 2
 
     content = ACTION_FILE.read_text(encoding="utf-8")

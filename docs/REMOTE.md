@@ -195,6 +195,23 @@ payload it cannot decrypt. It is recorded for display and enforced on the client
 and the `usage` output says so in the `rows_unit` field rather than implying an
 enforcement that does not exist.
 
+## When the object store misbehaves
+
+A self-hosted MinIO, R2 or B2 endpoint -- or a proxy in front of one -- is not
+always polite. Four behaviours are refused rather than trusted, because each one
+is silent when it is handled by accident:
+
+| what the endpoint does | what Trick does |
+| --- | --- |
+| announces or streams a body larger than `max_bytes` | stops at the ceiling and raises, instead of buffering it |
+| answers 3xx with a `Location` on another host | never follows it; reports `http 302` (a followed redirect hands a signed request to whoever the answer names) |
+| returns a 5xx whose body is binary or not XML | one-line `http 500`, no traceback |
+| puts a newline or control characters in `<Message>` | flattened to a single line |
+
+`max_bytes` defaults to 64 MB per object and can be lowered with
+`TRICK_S3_MAX_BYTES`. Nothing from the request is echoed in an error: not the
+Authorization header, not the access key, not the secret.
+
 ## When the box dies
 
 The archive is a file. If the instance is lost, the last snapshot is gone with

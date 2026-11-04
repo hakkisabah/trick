@@ -382,6 +382,19 @@ TRICK_OPENWEBUI_API_KEY=paste-the-key-here \
   .venv/bin/python integrations/openwebui/install.py --check
 ```
 
+If you do not have an admin key to hand and Open WebUI runs in Docker on this
+host, the same comparison works against the database, read-only, and changes
+nothing:
+
+```sh
+docker cp open-webui:/app/backend/data/webui.db /tmp/webui-copy.db
+.venv/bin/python integrations/openwebui/install.py --check --db /tmp/webui-copy.db
+```
+
+`--check --db` prints `up to date: N bytes, type=action, global, active (read
+from ..., read-only)` or names exactly what is stale. It never installs: writing
+needs the admin key, and that asymmetry is deliberate.
+
 Step 1 creates `.venv`, installs the package, downloads the catalogues if the
 store is empty, builds the score matrix and prints `python -m trick doctor`. It
 starts nothing unless you pass `--start`, and it skips work that is already done,

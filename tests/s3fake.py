@@ -26,12 +26,18 @@ BUCKET = "trick-test"
 
 
 class FakeS3:
-    def __init__(self, *, addressing: str = "path", fail_first: int = 0, reject: str = "") -> None:
+    def __init__(self, *, addressing: str = "path", fail_first: int = 0, reject: str = "",
+                 oversize: int = 0, redirect: str = "", garbage: tuple[int, bytes] | None = None) -> None:
         self.objects: dict[str, bytes] = {}
         self.addressing = addressing
         self.requests: list[tuple[str, str]] = []
         self.fail_first = fail_first
         self.reject = reject
+        # Misbehaviour switches. A storage backend that only ever meets a polite
+        # server is untested: these let a test play the hostile or broken one.
+        self.oversize = oversize
+        self.redirect = redirect
+        self.garbage = garbage
         self._lock = threading.Lock()
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
@@ -129,6 +135,15 @@ class FakeS3:
 
             def _guarded(self, body: bytes) -> bool:
                 fake.requests.append((self.command, self._key()))
+                if fake.garbage is not None:
+                    status, payload = fake.garbage
+                    self.send_response(status)
+                    self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    if self.command != "HEAD":
+                        self.wfile.write(payload)
+                    return False
                 if fake.reject:
                     self._send(403, code=fake.reject, message=fake.reject)
                     return False
@@ -156,7 +171,32 @@ class FakeS3:
                 self._send(200)
 
             def do_GET(self):  # noqa: N802
+                if fake.redirect:
+                    # A 302 to another origin, in the shape a misconfigured or
+                    # hostile endpoint would send. Following it would be a
+                    # downgrade and would leak the signed request elsewhere.
+                    self.send_response(302)
+                    self.send_header("Location", fake.redirect)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
                 if not self._guarded(b""):
+                    return
+                if fake.oversize:
+                    # Claims (and sends) more than the client is willing to hold.
+                    chunk = b"A" * 65536
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header("Content-Length", str(fake.oversize))
+                    self.end_headers()
+                    remaining = fake.oversize
+                    try:
+                        while remaining > 0:
+                            piece = chunk[: min(len(chunk), remaining)]
+                            self.wfile.write(piece)
+                            remaining -= len(piece)
+                    except (BrokenPipeError, ConnectionResetError):
+                        return
                     return
                 with fake._lock:
                     blob = fake.objects.get(self._key())

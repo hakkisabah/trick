@@ -133,3 +133,87 @@ def test_without_a_key_the_check_says_which_key_is_missing(monkeypatch, capsys):
     monkeypatch.setattr(sys, "argv", ["install.py", "--check"])
     assert _load_installer().main() == 2
     assert "TRICK_OPENWEBUI_API_KEY" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# the same comparison without an admin key
+# ---------------------------------------------------------------------------
+def _make_db(path: Path, content: str | None, *, is_global: bool = True, is_active: bool = True,
+             kind: str = "action", with_table: bool = True) -> Path:
+    """A minimal copy of the table Open WebUI keeps functions in."""
+    import sqlite3
+
+    db = sqlite3.connect(path)
+    try:
+        if with_table:
+            db.execute(
+                "CREATE TABLE function (id TEXT PRIMARY KEY, content TEXT, type TEXT, "
+                "is_global INTEGER, is_active INTEGER)"
+            )
+            if content is not None:
+                db.execute(
+                    "INSERT INTO function VALUES (?, ?, ?, ?, ?)",
+                    ("trick", content, kind, int(is_global), int(is_active)),
+                )
+        else:
+            db.execute("CREATE TABLE chat (id TEXT)")
+        db.commit()
+    finally:
+        db.close()
+    return path
+
+
+def _run_db(monkeypatch, db_path: Path) -> int:
+    """--check --db, with no API key at all: the read-only path."""
+    monkeypatch.delenv("TRICK_OPENWEBUI_API_KEY", raising=False)
+    monkeypatch.setattr(sys, "argv", ["install.py", "--check", "--db", str(db_path)])
+    return _load_installer().main()
+
+
+def test_the_database_path_reports_a_matching_install(monkeypatch, tmp_path, capsys):
+    content = ACTION.read_text(encoding="utf-8")
+    db = _make_db(tmp_path / "webui.db", content)
+    assert _run_db(monkeypatch, db) == 0
+    out = capsys.readouterr().out
+    assert "up to date" in out
+    assert "read-only" in out
+
+
+def test_the_database_path_reports_a_stale_install(monkeypatch, tmp_path, capsys):
+    stale = ACTION.read_text(encoding="utf-8").replace("version: 0.", "version: 0.0", 1)
+    db = _make_db(tmp_path / "webui.db", stale)
+    assert _run_db(monkeypatch, db) == 1
+    assert "content differs" in capsys.readouterr().err
+
+
+def test_the_database_path_reports_a_missing_function(monkeypatch, tmp_path, capsys):
+    db = _make_db(tmp_path / "webui.db", None)
+    assert _run_db(monkeypatch, db) == 1
+    assert "not installed" in capsys.readouterr().err
+
+
+def test_the_database_path_reports_a_disabled_action(monkeypatch, tmp_path, capsys):
+    content = ACTION.read_text(encoding="utf-8")
+    db = _make_db(tmp_path / "webui.db", content, is_active=False)
+    assert _run_db(monkeypatch, db) == 1
+    assert "disabled" in capsys.readouterr().err
+
+
+def test_a_missing_database_is_a_usage_error(monkeypatch, tmp_path, capsys):
+    assert _run_db(monkeypatch, tmp_path / "absent.db") == 2
+    assert "database not found" in capsys.readouterr().err
+
+
+def test_a_database_without_the_function_table_says_so(monkeypatch, tmp_path, capsys):
+    db = _make_db(tmp_path / "webui.db", None, with_table=False)
+    assert _run_db(monkeypatch, db) == 2
+    assert "function table" in capsys.readouterr().err
+
+
+def test_the_check_does_not_write_to_the_database(monkeypatch, tmp_path):
+    """mode=ro is the whole point: verification must not touch a live database."""
+    content = ACTION.read_text(encoding="utf-8")
+    db = _make_db(tmp_path / "webui.db", content)
+    before = db.read_bytes()
+    assert _run_db(monkeypatch, db) == 0
+    assert db.read_bytes() == before

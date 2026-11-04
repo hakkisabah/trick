@@ -170,6 +170,7 @@ class S3Settings:
     sse: str = ""
     timeout: float = 20.0
     retries: int = 3
+    max_bytes: int = 64 * 1024 * 1024
     access_key: str = field(default="", repr=False)
     secret_key: str = field(default="", repr=False)
 
@@ -311,6 +312,16 @@ class S3Backend(BlobBackend):
             raise ConfigError("addressing must be 'path' or 'virtual'")
         if not self.settings.bucket:
             raise ConfigError("s3 backend needs a bucket name")
+        bucket = self.settings.bucket
+        if any(ch in bucket for ch in "/\\") or any(ch.isspace() for ch in bucket) or ".." in bucket:
+            raise ConfigError(f"bucket name cannot contain slashes, spaces or '..': {bucket!r}")
+        prefix = self.settings.prefix.strip("/")
+        if prefix and any(part in {"", ".", ".."} for part in prefix.split("/")):
+            raise ConfigError(f"prefix must be plain path segments, got {self.settings.prefix!r}")
+        if any(ord(ch) < 32 for ch in prefix):
+            raise ConfigError("prefix contains control characters")
+        if self.settings.max_bytes <= 0:
+            raise ConfigError("max_bytes must be positive")
         if not self.settings.access_key or not self.settings.secret_key:
             raise ConfigError(
                 "s3 backend needs credentials: set TRICK_S3_ACCESS_KEY and TRICK_S3_SECRET_KEY, "
@@ -340,7 +351,30 @@ class S3Backend(BlobBackend):
             return HTTPSConnection(host, parts.port or 443, timeout=timeout, context=ssl.create_default_context())
         return HTTPConnection(host, parts.port or 80, timeout=timeout)
 
-    # -- one request -------------------------------------------------------
+    # -- one request ------------------------------------------------------
+    def _read_bounded(self, response) -> bytes:
+        """Read a response with a ceiling, so a hostile server cannot exhaust memory.
+
+        ``response.read()`` trusts Content-Length (or a chunked stream) to end.
+        A wrong or malicious endpoint can claim a gigabyte, or just keep writing.
+        The archive is the only large object here and it is capped at
+        ``max_bytes``, so a longer body is a fault, not data.
+        """
+        cap = self.settings.max_bytes
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = response.read(min(65536, cap - total + 1))
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > cap:
+                raise StorageIO(
+                    f"s3 response exceeded max_bytes ({cap}); refusing to buffer it"
+                )
+            chunks.append(chunk)
+        return b"".join(chunks)
+
     def _request(self, method: str, key: str, body: bytes | None = None) -> tuple[int, bytes]:
         url = self._url_for(key)
         parts = urllib.parse.urlsplit(url)
@@ -366,8 +400,8 @@ class S3Backend(BlobBackend):
             try:
                 conn.request(method, path, body=payload if method in {"PUT", "POST"} else None, headers=headers)
                 response = conn.getresponse()
-                data = response.read()
                 status = response.status
+                data = self._read_bounded(response)
             except (OSError, ssl.SSLError) as exc:
                 last = exc
                 time.sleep(0.2 * (2**attempt))
@@ -382,6 +416,12 @@ class S3Backend(BlobBackend):
 
     @staticmethod
     def _error(status: int, data: bytes) -> str:
+        """A short, single-line summary of an S3 error document.
+
+        The text comes from the server, so it is untrusted: control characters
+        are stripped (a newline here would forge a log line) and the message is
+        capped. Nothing from the request -- no header, no key -- is echoed.
+        """
         code = ""
         message = ""
         text = data[:2000].decode("utf-8", "replace")
@@ -394,6 +434,12 @@ class S3Backend(BlobBackend):
                     code = value
                 else:
                     message = value
+
+        def clean(value: str, limit: int) -> str:
+            kept = "".join(ch for ch in value if ch.isprintable() and ch not in "\r\n\t")
+            return " ".join(kept.split())[:limit]
+
+        code, message = clean(code, 60), clean(message, 300)
         return f"http {status}" + (f" {code}" if code else "") + (f": {message}" if message else "")
 
     # -- the contract ------------------------------------------------------
@@ -515,6 +561,7 @@ def s3_settings(config: Mapping[str, Any]) -> S3Settings:
         sse=str(config.get("sse") or ""),
         timeout=float(config.get("timeout") or 20.0),
         retries=int(config.get("retries") or 3),
+        max_bytes=int(config.get("max_bytes") or os.environ.get("TRICK_S3_MAX_BYTES") or 64 * 1024 * 1024),
         access_key=access_key,
         secret_key=secret_key,
     )
