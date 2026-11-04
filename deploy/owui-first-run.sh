@@ -52,11 +52,13 @@ say "== 3/6 catalogues =="
 if [ "$INGEST" = 1 ]; then
   # A store with fewer than a thousand documents is not a catalogue; ingest is
   # resumable and skips documents it already holds.
-  docs=$("$PY" -m trick doctor 2>/dev/null | "$PY" -c 'import json,sys
+  docs=$("$PY" -m trick doctor --json 2>/dev/null | "$PY" -c 'import json,sys
 try:
-    print(json.load(sys.stdin)["store"]["docs"])
+    checks = json.load(sys.stdin)["checks"]
 except Exception:
-    print(0)' || echo 0)
+    print(0)
+else:
+    print(next((int(e.get("docs", 0)) for e in checks if e["name"] == "documents"), 0))' || echo 0)
   if [ "${docs:-0}" -ge 1000 ]; then
     say "   store already holds $docs documents; use --skip-ingest to silence this"
   else

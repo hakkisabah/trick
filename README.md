@@ -32,7 +32,7 @@ question ("which package is this") and stay in the terminal and in MCP. Asking a
 chat question and receiving eight R packages was not a tuning problem, so the
 code that could do it was removed rather than defaulted off.
 
-504 tests pass and `scripts/check.sh` runs 20 repository checks.
+582 tests pass and `scripts/check.sh` runs 23 repository checks.
 
 The R package in `r/trick` is the same find reimplemented under CRAN's rules: no
 dependencies, no compiled code, no network call. Its parity with this engine is
@@ -417,18 +417,21 @@ src/trick/tui.py          terminal session: Enter submits, history, commands
 src/trick/vault.py        sealed archive: scrypt + AES-GCM, merge on restore
 src/trick/vaultremote.py  remote store: TLS server, pinned client, quotas
 src/trick/cli.py          query / tui / serve / mcp / ingest / doctor / probe
-tests/                    469 tests: layout, corruption, contention, budget,
+tests/                    582 tests: layout, corruption, contention, budget,
                           adapters, client, pipeline, credentials, protocol,
                           permissions, concurrency, session behaviour, chunks,
                           transcript ranking, Turkish folding and stems,
                           transports, Open WebUI action, action dispatch,
-                          sealed archives, remote store parity and refusals
+                          sealed archives, remote store parity and refusals,
+                          binary fuzzing, doctor diagnosis
 scripts/bench.py          produced numbers (not estimates) for this host
+scripts/bench_gate.py     latency budgets: cold open, scan, conversation search
+scripts/fuzz_binaries.py  deterministic mutation sweep of the matrix and archive
 scripts/eval_ranking.py   22-query ranking harness, three orderings per query
 scripts/eval_quota.py     quota harness over one retrieval per query
 scripts/laya_probe.py     one real call, prints the response shape only
 scripts/verify_remote.py  real TLS store: push, pull, import, compare bytes/rows
-scripts/check.sh          repository gate (21 checks)
+scripts/check.sh          repository gate (23 checks)
 ```
 
 ## Install and verify
@@ -444,7 +447,7 @@ First run:
 
 ```sh
 .venv/bin/python -m trick ingest                 # CRAN + Bioconductor + priors, ~3 min
-.venv/bin/python -m trick doctor                 # store, matrix, credential state
+.venv/bin/python -m trick doctor                 # one screen: what is wrong, and the fix
 .venv/bin/python -m trick query "mixed effects model does not converge"
 .venv/bin/python -m trick query "simple features spatial" --offline --json
 .venv/bin/python -m trick tui                    # interactive; /help lists the commands

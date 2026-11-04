@@ -83,16 +83,37 @@ Remove: `rm -rf .venv`.
 .venv/bin/python -m trick doctor
 ```
 
-One JSON object: store path and document count, FTS5 availability, active scorer,
-shortlist, blend weights, source quota, matrix state, and where credentials were
-found. The key itself is never printed, only `"key_present": true`.
+One screen, sorted so failures come first, and every failing line carries the
+command that fixes it:
 
-| Field | Meaning | Fix |
+```
+trick · /home/hakki/.local/share/trick
+  [fail] store         no store at /home/hakki/.local/share/trick/trick.db
+                       fix: python -m trick ingest --source cran,bioc
+  [warn] matrix        not built; retrieval-only ranking
+                       fix: python -m trick matrix build
+  [ok  ] home          /home/hakki/.local/share/trick mode 700
+  [ok  ] laya          https://your-endpoint/v1/systemone (key present)
+summary: 2 ok, 1 warn, 1 fail
+```
+
+Exit code `0` when nothing failed, `1` when something did, so a script can use
+it as a health check. Add `--json` for the machine-readable form
+(`checks`, `summary`, `engine`). The key itself is never printed, only
+`key present` / `key missing`.
+
+| Line | Meaning | Fix |
 | --- | --- | --- |
-| `"fts5": false` | this Python's SQLite has no FTS5 | use another interpreter, step 1 |
-| `"scorer": "mock"` | no credentials resolved, results are not laya-scored | step 3 |
-| `"credentials": {"error": ...}` | no credential file and no environment | step 3 |
-| `"matrix": null` | optional score matrix absent | nothing; Trick runs without it |
+| `store  fail` | no database at that path | step 4 (ingest), or `--db` |
+| `home   warn` | the state directory is readable by others | `chmod 700 <dir>` |
+| `matrix warn` | optional score matrix absent; ranking is retrieval-only | nothing, or `matrix build` |
+| `matrix fail` | the file exists but does not load or fails its CRC | `python -m trick matrix build` |
+| `laya   warn` | no credentials resolved; results are not laya-scored | step 3 |
+| `bridge warn` | no service running; every command builds its own engine | step 7 if you need the HTTP bridge |
+| `bridge-token fail` | the token file is readable by others | `chmod 600 <file>` |
+
+`doctor` never creates what it is asked to look for: a missing store stays
+missing and the second run says the same thing as the first.
 
 ## 3. Configure the laya endpoint
 
@@ -161,7 +182,8 @@ Verify:
 .venv/bin/python -m trick doctor
 ```
 
-Expected: `"docs"` above 25000 and `"matrix": {"count": ...}` not null.
+Expected: a `documents` line with more than 25000 rows and a `matrix` line that
+is not `warn`/`fail`.
 
 Rebuild just the matrix (safe at any time; it is written to a temporary file and
 published with one rename):
@@ -919,15 +941,17 @@ Run the repository gate before trusting a checkout:
 sh scripts/check.sh
 ```
 
-Nineteen checks: tests, byte-compile, on-disk layout, ranking constants, no
+Twenty-three checks: tests, byte-compile, on-disk layout, ranking constants, no
 network in tests, MCP and bridge surfaces, socket and token permissions,
 English-only repository, no credentials in tracked files, stdout purity,
 integration surfaces, integration secrets, documentation truth (every documented
 command and path must exist), conversation-search quality against planted
 needles, conversation search on a real chat shape (identifiers, rare words and
 tokens that must return nothing), result rows that jump to their message, the
-score matrix build and read-back, R parity with the Python engine, and a real TLS
-memory store pushed, pulled and imported with byte, payload and row parity.
+score matrix build and read-back, R parity with the Python engine, a real TLS
+memory store pushed, pulled and imported with byte, payload and row parity, the
+price table against enforcement, the swappable storage backend (fs, s3 and back),
+a deterministic fuzz sweep of both binary formats, and the latency budgets.
 
 Two of them are floors, not targets. Conversation quality fails the gate if
 `recall@3` drops below 0.9, `MRR@10` below 0.8 or a decoy becomes the top hit

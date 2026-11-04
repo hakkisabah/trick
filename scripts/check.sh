@@ -16,15 +16,18 @@
 #     12. integ. secrets no literal credentials under integrations/
 #     13. docs         every documented command and path actually exists
 #     14. chat quality conversation search still finds the planted passages
-#     15. jump         every result row links to the turn it came from
-#     16. matrix       the score matrix builds from the store and reads back
-#     17. R package    R sources parse; with R installed, both engines agree
-#     18. remote store a real TLS store pushed, pulled and imported with parity
-#     19. plans        price table == docs == enforcement, entitlement applies once
-#     20. storage      the store runs on fs, on s3 and back, same bytes each leg
+#     15. chat shape   result rows resolve to real messages on a long chat
+#     16. jump         every result row links to the turn it came from
+#     17. matrix       the score matrix builds from the store and reads back
+#     18. R package    R sources parse; with R installed, both engines agree
+#     19. remote store a real TLS store pushed, pulled and imported with parity
+#     20. plans        price table == docs == enforcement, entitlement applies once
+#     21. storage      the store runs on fs, on s3 and back, same bytes each leg
+#     22. fuzz         mutated matrix and archive files are classified, never guessed
+#     23. budget       cold open, scan and chat latency stay inside their budgets
 set -eu
 
-TOTAL=21
+TOTAL=23
 
 cd "$(dirname "$0")/.."
 PY="${PY:-.venv/bin/python}"
@@ -478,7 +481,7 @@ for name in exports:
 print(f"R sources ok: {len(sources)} files, {len(man)} man pages, {len(exports)} exports")
 PYCODE
 
-echo "== $((TOTAL-1))/$TOTAL remote store"
+echo "== 19/$TOTAL remote store"
 # The store is the only part of this product that runs on someone else's disk,
 # so it is the part where "it worked" has to be measured rather than assumed.
 # The script starts a real TLS server as its own process, pins the certificate,
@@ -486,7 +489,7 @@ echo "== $((TOTAL-1))/$TOTAL remote store"
 # cache and compares bytes, payload and rows.
 "$PY" scripts/verify_remote.py
 
-echo "== $((TOTAL-1))/$TOTAL plans"
+echo "== 20/$TOTAL plans"
 # The commercial layer is the easiest place in this project to lie, because a
 # price table is prose and prose is not checked. This gate parses the table in
 # docs/PLANS.md, compares it cell by cell with src/trick/plans.py, then posts a
@@ -494,11 +497,24 @@ echo "== $((TOTAL-1))/$TOTAL plans"
 # and stale are refused, a replay is a no-op.
 "$PY" scripts/check_plans.py
 
-echo "== $TOTAL/$TOTAL storage backend"
+echo "== 21/$TOTAL storage backend"
 # The store is not tied to one disk. This starts the real store over real TLS,
 # pushes a real archive, migrates the blobs to an S3-compatible server that
 # verifies SigV4, restarts, pulls and compares, then migrates back to local disk
 # and does it again. A backend swap that changes a single byte fails the gate.
 "$PY" scripts/verify_storage.py
+
+echo "== 22/$TOTAL fuzz (mutated binaries are classified, never guessed)"
+# Both binary formats are read from disks this project does not own. A flip in
+# the header float used to load fine and rank nothing; a truncated archive used
+# to surface as somebody else's exception. The sweep is deterministic and the
+# assertion is narrow on purpose: declared error or usable value, nothing else.
+"$PY" scripts/fuzz_binaries.py
+
+echo "== 23/$TOTAL latency budgets"
+# Constants rot silently: a lost mmap or an accidental O(n) in the open path
+# shows up as a slow shortcut, not as a failing test. This measures the three
+# numbers a user feels and refuses to pass if any of them leaves its budget.
+"$PY" scripts/bench_gate.py
 
 echo "gate: all checks passed"

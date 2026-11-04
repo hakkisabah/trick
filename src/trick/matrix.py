@@ -35,6 +35,7 @@ Guarantees proven by the test suite:
 from __future__ import annotations
 
 import mmap
+import math
 import os
 import struct
 import zlib
@@ -334,10 +335,18 @@ class MatrixIndex:
         if size != expected:
             raise MatrixCorrupt("size-mismatch", f"expected {expected} bytes, file has {size}")
 
+        # A flipped bit in the float must not become a silent rescaling. ``nan``
+        # fails every comparison, ``inf`` turns every score into 0.0 and a huge
+        # finite value turns every score into ~0 as well - in all three cases the
+        # file would load happily and rank nothing, which is the worst outcome
+        # this index can produce. Only the documented scale band is accepted.
+        if not math.isfinite(qscale) or not (0.0 < qscale <= 1e6):
+            raise MatrixCorrupt("bad-qscale", repr(qscale))
+
         self.count = count
         self.crc32 = crc
         self.header_flags = hflags
-        self.qscale = qscale if qscale > 0 else 127.0
+        self.qscale = qscale
 
     def verify(self) -> None:
         """Recompute the body CRC. O(n) and only run on demand or after a crash."""

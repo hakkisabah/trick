@@ -23,6 +23,7 @@ import argparse
 import json
 import os
 import signal
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -654,22 +655,162 @@ def cmd_vault(args) -> int:
     return 0
 
 
-def cmd_doctor(args) -> int:
-    engine = _engine(args)
-    info = engine.health()
-    engine.store.close()
+def _check(name: str, status: str, detail: str, fix: str = "", **extra: Any) -> dict[str, Any]:
+    """One diagnosis line. ``extra`` carries the machine-readable numbers.
+
+    The detail string is for a human; anything a script needs is a separate field,
+    so parsing prose never becomes part of an interface again.
+    """
+    entry: dict[str, Any] = {"name": name, "status": status, "detail": detail}
+    if fix:
+        entry["fix"] = fix
+    entry.update(extra)
+    return entry
+
+
+def _state_checks(args) -> list[dict[str, str]]:
+    """Everything that can be wrong without building a search engine.
+
+    ``doctor`` exists to answer one question - "why is this not working" - so it
+    has to work when the engine does not, and it must not open a network
+    connection. Each failing check carries the command that fixes it; advice
+    without a command is not a diagnosis.
+    """
+    checks: list[dict[str, str]] = []
+    home = Path(args.home or DEFAULT_HOME)
+    # Every path follows --home. Inheriting the module-level defaults here would
+    # make `doctor --home /somewhere/else` silently inspect the real install and
+    # report it as healthy - a diagnosis that reads the wrong patient.
+    db = Path(args.db or home / "trick.db")
+    matrix = Path(args.matrix) if getattr(args, "matrix", None) else home / "scores.trk"
+
+    if not home.exists():
+        checks.append(_check("home", "fail", f"{home} does not exist",
+                             "python -m trick ingest --source cran,bioc"))
+    else:
+        mode = home.stat().st_mode & 0o777
+        status = "ok" if mode & 0o077 == 0 else "warn"
+        checks.append(_check("home", status, f"{home} mode {mode:o}",
+                             "chmod 700 " + str(home) if status == "warn" else ""))
+
+    if db.exists():
+        size_mb = db.stat().st_size / 1e6
+        checks.append(_check("store", "ok", f"{db} ({size_mb:.1f} MB)"))
+        try:
+            conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            try:
+                docs = conn.execute("SELECT count(*) FROM docs").fetchone()[0]
+                try:
+                    decisions = conn.execute("SELECT count(*) FROM decisions").fetchone()[0]
+                except sqlite3.Error:
+                    decisions = 0
+            finally:
+                conn.close()
+            status = "ok" if docs else "warn"
+            checks.append(_check(
+                "documents", status, f"{docs} rows, {decisions} cached decisions",
+                "python -m trick ingest --source cran,bioc" if not docs else "",
+                docs=docs, decisions=decisions,
+            ))
+        except sqlite3.Error as exc:
+            checks.append(_check("documents", "fail", f"cannot read the store: {exc}",
+                                 "delete the store and ingest again"))
+    else:
+        checks.append(_check("store", "fail", f"no store at {db}",
+                             "python -m trick ingest --source cran,bioc"))
+
+    if matrix.exists():
+        try:
+            index = MatrixIndex(matrix)
+            try:
+                detail = f"{index.count} records, {matrix.stat().st_size / 1e6:.2f} MB"
+                if index.synthetic:
+                    detail += ", synthetic signatures (not embeddings)"
+                checks.append(_check("matrix", "ok", detail))
+                try:
+                    index.verify()
+                except TrickError as exc:
+                    checks.append(_check("matrix-crc", "fail", str(exc),
+                                         "python -m trick matrix build"))
+            finally:
+                index.close()
+        except TrickError as exc:
+            checks.append(_check("matrix", "fail", f"{exc.s_code}: {exc}",
+                                 "python -m trick matrix build"))
+    else:
+        checks.append(_check("matrix", "warn", "not built; retrieval-only ranking",
+                             "python -m trick matrix build"))
+
     try:
         creds = load_laya_credentials()
-        info["credentials"] = {
-            "origin": creds.origin,
-            "base_url": creds.base_url,
-            "timeout_ms": creds.timeout_ms,
-            "key_present": bool(creds.api_key),
-        }
+        status = "ok" if creds.api_key else "warn"
+        checks.append(_check("laya", status, f"{creds.base_url} (key {'present' if creds.api_key else 'missing'})",
+                             "" if creds.api_key else f"write the key to {DEFAULT_CREDENTIALS_PATH}"))
     except ConfigError as exc:
-        info["credentials"] = {"error": str(exc), "s_code": exc.s_code}
-    print(json.dumps(info, indent=2, ensure_ascii=False))
-    return 0
+        checks.append(_check("laya", "warn", f"{exc.s_code}: {exc}",
+                             f"write {DEFAULT_CREDENTIALS_PATH}"))
+
+    token = Path(args.token_file or home / "bridge.token")
+    socket_path = Path(args.socket or home / "run" / "trick.sock")
+    if socket_path.exists():
+        checks.append(_check("bridge", "ok", f"service socket {socket_path}"))
+    else:
+        checks.append(_check("bridge", "warn", "no service running; commands build an engine in process",
+                             "python -m trick serve --http-host 172.17.0.1 --expose-network"))
+    if token.exists():
+        mode = token.stat().st_mode & 0o777
+        status = "ok" if mode & 0o077 == 0 else "fail"
+        checks.append(_check("bridge-token", status, f"{token} mode {mode:o}",
+                             "chmod 600 " + str(token) if status == "fail" else ""))
+    return checks
+
+
+def cmd_doctor(args) -> int:
+    """One screen: what works, what does not, and the command that fixes it."""
+    checks = _state_checks(args)
+    engine_info: dict[str, Any] = {}
+    # Diagnosis must not change what it diagnoses: building an engine creates the
+    # store and the schema, so a second `doctor` run would report a healthy store
+    # that the first run said was missing.
+    home = Path(args.home or DEFAULT_HOME)
+    if not getattr(args, "db", None):
+        args.db = str(home / "trick.db")
+    if not getattr(args, "matrix", None):
+        args.matrix = str(home / "scores.trk")
+    db = Path(args.db)
+    if not db.exists():
+        engine_info = {"skipped": "no store yet"}
+    else:
+        try:
+            engine = _engine(args)
+            engine_info = engine.health()
+            engine.store.close()
+        except TrickError as exc:
+            engine_info = {"error": f"{exc.s_code}: {exc}"}
+            checks.append(_check("engine", "fail", f"{exc.s_code}: {exc}",
+                                 "see the store and matrix lines above"))
+
+    order = {"fail": 0, "warn": 1, "ok": 2}
+    summary = {
+        "ok": sum(1 for c in checks if c["status"] == "ok"),
+        "warn": sum(1 for c in checks if c["status"] == "warn"),
+        "fail": sum(1 for c in checks if c["status"] == "fail"),
+    }
+    if getattr(args, "json", False):
+        print(json.dumps({"checks": checks, "summary": summary, "engine": engine_info},
+                         indent=2, ensure_ascii=False))
+        return 1 if summary["fail"] else 0
+
+    # The banner deliberately does not repeat the command name: a document that
+    # quotes this output would otherwise look like it recommends a bare `trick`
+    # invocation, and the docs gate (correctly) refuses that.
+    print(f"trick · {home}")
+    for entry in sorted(checks, key=lambda c: (order.get(c["status"], 3), c["name"])):
+        print(f"  [{entry['status']:4}] {entry['name']:13} {entry['detail']}")
+        if entry.get("fix"):
+            print(f"         {'':13} fix: {entry['fix']}")
+    print(f"summary: {summary['ok']} ok, {summary['warn']} warn, {summary['fail']} fail")
+    return 1 if summary["fail"] else 0
 
 
 def cmd_probe(args) -> int:
@@ -766,7 +907,11 @@ def build_parser() -> argparse.ArgumentParser:
     matrix.add_argument("--matrix", help=f"matrix path (default {DEFAULT_MATRIX})")
     matrix.set_defaults(func=cmd_matrix)
 
-    doctor = sub.add_parser("doctor", help="print environment, store and credential state")
+    doctor = sub.add_parser("doctor", help="diagnose the install: what is wrong and how to fix it")
+    doctor.add_argument("--home", help=f"state directory (default {DEFAULT_HOME})")
+    doctor.add_argument("--socket", help=f"core service socket (default {DEFAULT_SOCKET})")
+    doctor.add_argument("--token-file", help=f"bridge token file (default {DEFAULT_TOKEN})")
+    doctor.add_argument("--json", action="store_true", help="machine readable output")
     doctor.set_defaults(func=cmd_doctor)
 
     probe = sub.add_parser("probe", help="one real laya call")
