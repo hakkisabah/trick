@@ -428,7 +428,7 @@ scripts/eval_ranking.py   22-query ranking harness, three orderings per query
 scripts/eval_quota.py     quota harness over one retrieval per query
 scripts/laya_probe.py     one real call, prints the response shape only
 scripts/verify_remote.py  real TLS store: push, pull, import, compare bytes/rows
-scripts/check.sh          repository gate (20 checks)
+scripts/check.sh          repository gate (21 checks)
 ```
 
 ## Install and verify

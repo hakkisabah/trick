@@ -71,6 +71,70 @@ money, and that is a decision for the person paying. When one exists, the same
    printf '%s' 'THE-TOKEN-PRINTED-ON-THE-SERVER' > ~/.local/share/trick/vault.token
    ```
 
+## Where the bytes are kept
+
+The store is a Linux process; where it writes is a choice. `<store-root>/storage.json`
+names the backend, and nothing else about the deployment changes -- same routes,
+same token, same quota, same TLS, same client commands.
+
+* **`fs`** (default): blobs on the store's own disk, 0600, atomic write via a
+  per-writer temporary file, fsync and rename. One box serving about a thousand
+  snapshots fits in a 20 GB disk.
+* **`s3`**: any S3-compatible endpoint (AWS S3, MinIO, Cloudflare R2, Backblaze
+  B2) with path-style or virtual-host addressing. The signing is SigV4 over the
+  real payload hash, implemented on the standard library, so no boto3 is needed
+  on the smallest instance. Plain `http://` is accepted only for a loopback
+  endpoint such as a MinIO on the same host; anything else must be TLS.
+
+The index (`accounts.json`, `objects/<account>/index.json`) stays on local disk in
+both cases. It is what the store locks while it enforces quota; S3 has no atomic
+read-modify-write, so moving the index there would replace a lock with a race.
+
+Credentials are not in that file. The store reads `TRICK_S3_ACCESS_KEY` and
+`TRICK_S3_SECRET_KEY` from its environment (a systemd `EnvironmentFile`), or from a
+file named by `credentials_file` that must be mode 0600 -- a world-readable
+credential file is refused, not warned about.
+
+```sh
+# prove the bucket works before the store depends on it: write, read back, delete
+.venv/bin/python -m trick vault storage test --root /var/lib/trick-vault \
+    --backend s3 --endpoint https://s3.eu-central-1.amazonaws.com \
+    --bucket YOUR-BUCKET --region eu-central-1 \
+    --credentials-file /etc/trick/s3.credentials
+
+# what the store is actually using
+.venv/bin/python -m trick vault storage show --root /var/lib/trick-vault
+```
+
+### Moving existing snapshots to another backend
+
+Content-addressed keys (`objects/<account>/<sha256>.trk`) are the same string in
+every backend, so a migration is a copy plus a check, not a reformat.
+
+```sh
+systemctl --user stop trick-vault
+.venv/bin/python -m trick vault storage migrate --root /var/lib/trick-vault \
+    --backend s3 --endpoint https://s3.eu-central-1.amazonaws.com \
+    --bucket YOUR-BUCKET --region eu-central-1 \
+    --credentials-file /etc/trick/s3.credentials
+systemctl --user start trick-vault
+```
+
+Order matters and is enforced: each object is read from the source, hashed,
+written, read back from the target and hashed again; `storage.json` is rewritten
+only after every object has passed. A refused write stops the run and leaves the
+config alone, so the store never points at a half-copied target. `--dry-run`
+counts without writing; `--keep-source` is the default, which is what makes the
+reverse command (`--backend fs`) a migration back rather than a loss.
+
+Deleting the old copy is a separate, deliberate step: do it after a real restore
+from the new backend has been imported and compared, not after a green exit code.
+
+The measured proof, run by `scripts/verify_storage.py` as part of the repository
+gate: one real archive (380,781 bytes, 77 decisions) pushed through three legs --
+local disk, S3, local disk again -- pulled back each time to the same sha256 and
+imported to the same rows.
+
 ## Client use
 
 ```sh

@@ -200,17 +200,37 @@ def init_store(root: Path, name: str = "owner") -> dict[str, Any]:
 # the store
 # ---------------------------------------------------------------------------
 class VaultStore:
-    """A directory of opaque objects, one subdirectory per account."""
+    """A directory of opaque objects, one subdirectory per account.
 
-    def __init__(self, root: Path, accounts: list[Account], accounts_path: Path | None = None) -> None:
+    The blobs are written through a pluggable backend (local disk by default,
+    S3-compatible object storage when configured); the index stays on local disk
+    because quota and pruning are read-modify-write under a lock, which an object
+    store cannot do atomically.
+    """
+
+    def __init__(
+        self,
+        root: Path,
+        accounts: list[Account],
+        accounts_path: Path | None = None,
+        backend: Any | None = None,
+    ) -> None:
+        from .blobstore import FsBackend
+
         self.root = Path(root)
         self.accounts = {a.name: a for a in accounts}
         self.accounts_path = Path(accounts_path) if accounts_path else Path(root) / "accounts.json"
         self._lock = threading.RLock()
         self.root.mkdir(parents=True, exist_ok=True)
         (self.root / OBJECTS_DIR).mkdir(parents=True, exist_ok=True)
+        self.backend = backend if backend is not None else FsBackend(self.root)
         for account in accounts:
             self._dir(account).mkdir(parents=True, exist_ok=True)
+
+    def _key(self, account: Account, sha: str) -> str:
+        from .blobstore import object_key
+
+        return object_key(account.name, sha)
 
     # -- paths -------------------------------------------------------------
     def _dir(self, account: Account) -> Path:
@@ -392,6 +412,7 @@ class VaultStore:
             "max_devices": account.max_devices,
             "retention_days": account.retention_days,
             "rows_unit": "client-declared; the store cannot count rows inside ciphertext",
+            "storage": self.backend.describe(),
         }
 
     def _account_lock(self, account: Account):
@@ -454,18 +475,10 @@ class VaultStore:
                     f"quota: object count would exceed {account.max_objects}; "
                     "delete an old snapshot first"
                 )
-            target = self._dir(account) / f"{sha}.trk"
-            # A per-writer tmp name: two processes storing the same archive at the
-            # same moment used to pick the same tmp path, and one of them died with
-            # FileNotFoundError on the rename. The content hash names the object;
-            # it must not name the temporary file.
-            tmp = target.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
-            tmp.write_bytes(blob)
-            os.chmod(tmp, 0o600)
-            with open(tmp, "rb") as handle:
-                os.fsync(handle.fileno())
-            os.replace(tmp, target)
-            _fsync_dir(target.parent)
+            # The backend owns durability: the local one writes a per-writer tmp
+            # file, fsyncs it and renames; the object store answers with a 200
+            # that the caller then verifies by reading the object back.
+            self.backend.put(self._key(account, sha), blob)
             entry = {
                 "bytes": len(blob),
                 "rows": int(max(rows, 0)),
@@ -483,10 +496,12 @@ class VaultStore:
             index = self._read_index(account)
             if sha not in index["objects"]:
                 raise ConfigError(f"no such snapshot: {sha}")
-            path = self._dir(account) / f"{sha}.trk"
-        if not path.exists():
-            raise StorageIO(f"index lists {sha} but the file is gone")
-        blob = path.read_bytes()
+        try:
+            blob = self.backend.get(self._key(account, sha))
+        except ConfigError as exc:
+            # The index listed it, so a missing object is a broken store, not a
+            # wrong id: that is S6 storage-io, not S9 config.
+            raise StorageIO(f"index lists {sha} but the object is gone: {exc}") from exc
         if hashlib.sha256(blob).hexdigest() != sha:
             raise StorageIO(f"the stored object {sha} no longer hashes to its name")
         return blob
@@ -499,9 +514,7 @@ class VaultStore:
             entry = index["objects"].pop(sha, None)
             if entry is None:
                 raise ConfigError(f"no such snapshot: {sha}")
-            path = self._dir(account) / f"{sha}.trk"
-            if path.exists():
-                path.unlink()
+            self.backend.delete(self._key(account, sha))
             self._write_index(account, index)
         return {"deleted": sha, "bytes": int(entry.get("bytes", 0))}
 

@@ -21,9 +21,10 @@
 #     17. R package    R sources parse; with R installed, both engines agree
 #     18. remote store a real TLS store pushed, pulled and imported with parity
 #     19. plans        price table == docs == enforcement, entitlement applies once
+#     20. storage      the store runs on fs, on s3 and back, same bytes each leg
 set -eu
 
-TOTAL=20
+TOTAL=21
 
 cd "$(dirname "$0")/.."
 PY="${PY:-.venv/bin/python}"
@@ -485,12 +486,19 @@ echo "== $((TOTAL-1))/$TOTAL remote store"
 # cache and compares bytes, payload and rows.
 "$PY" scripts/verify_remote.py
 
-echo "== $TOTAL/$TOTAL plans"
+echo "== $((TOTAL-1))/$TOTAL plans"
 # The commercial layer is the easiest place in this project to lie, because a
 # price table is prose and prose is not checked. This gate parses the table in
 # docs/PLANS.md, compares it cell by cell with src/trick/plans.py, then posts a
 # signed entitlement to a real store and reads the applied limits back: unsigned
 # and stale are refused, a replay is a no-op.
 "$PY" scripts/check_plans.py
+
+echo "== $TOTAL/$TOTAL storage backend"
+# The store is not tied to one disk. This starts the real store over real TLS,
+# pushes a real archive, migrates the blobs to an S3-compatible server that
+# verifies SigV4, restarts, pulls and compares, then migrates back to local disk
+# and does it again. A backend swap that changes a single byte fails the gate.
+"$PY" scripts/verify_storage.py
 
 echo "gate: all checks passed"

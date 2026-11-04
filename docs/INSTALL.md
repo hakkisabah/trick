@@ -716,6 +716,92 @@ Removal: `systemctl --user disable --now trick-backup.timer`, then delete
 `~/.config/systemd/user/trick-backup.service` and `trick-backup.timer`, then
 `systemctl --user daemon-reload`.
 
+### 10b-2. Where the blobs live: local disk, S3, or another Linux box
+
+The store process is the same in every case: same routes, same bearer token, same
+quota logic, same TLS. Only the place the sealed blobs are written changes, and it
+is one config file (`<root>/storage.json`).
+
+| Backend | What it is | When it is the right answer |
+| --- | --- | --- |
+| `fs` (default) | a directory on the store's own disk | one box, up to ~1000 snapshots in 20 GB, no third party involved |
+| `s3` | any S3-compatible endpoint: AWS S3, MinIO, Cloudflare R2, Backblaze B2 | the disk is small, the provider must hold the bytes, or the box must be disposable |
+
+The index stays on local disk in every case. It is a few kilobytes that the store
+locks and rewrites while enforcing quota, and an object store has no atomic
+read-modify-write, so putting it there would turn a quota check into a race.
+
+Credentials never go into `storage.json`; it holds bucket names, not keys, because
+config files end up in bug reports. On a box installed by `deploy/vault-server.sh`
+there is already a 0600 file for them, wired into the unit as an
+`EnvironmentFile`:
+
+```sh
+sudo editor /etc/trick-vault/storage.env      # TRICK_S3_ACCESS_KEY=... ; TRICK_S3_SECRET_KEY=...
+sudo chmod 600 /etc/trick-vault/storage.env
+sudo systemctl restart trick-vault
+```
+
+Anywhere else, the same two variables in the service environment, or a 0600 file
+passed as `--credentials-file`:
+
+```sh
+install -m 600 /dev/null ~/.config/trick/s3.credentials
+printf 'TRICK_S3_ACCESS_KEY=%s\nTRICK_S3_SECRET_KEY=%s\n' 'AKIA...' 'THE-SECRET' > ~/.config/trick/s3.credentials
+```
+
+Check a bucket before trusting it. `storage test` writes a probe object, reads it
+back, compares and deletes it; a wrong bucket, region or secret fails here instead
+of at 03:30:
+
+```sh
+.venv/bin/python -m trick vault storage test --root /var/lib/trick-vault \
+    --backend s3 --endpoint https://s3.eu-central-1.amazonaws.com \
+    --bucket YOUR-BUCKET --region eu-central-1 \
+    --credentials-file ~/.config/trick/s3.credentials
+
+.venv/bin/python -m trick vault storage show --root /var/lib/trick-vault
+```
+
+Switching backends. This is a copy plus a read-back check per object; the config
+is rewritten **last**, so an interrupted migration leaves the store pointing at a
+source that is still complete. The old blobs are kept unless you say otherwise.
+
+```sh
+# 1. stop the store so nothing writes while the blobs move
+systemctl --user stop trick-vault
+
+# 2. copy, verify every object, then switch the config to s3
+.venv/bin/python -m trick vault storage migrate --root /var/lib/trick-vault \
+    --backend s3 --endpoint https://s3.eu-central-1.amazonaws.com \
+    --bucket YOUR-BUCKET --region eu-central-1 \
+    --credentials-file ~/.config/trick/s3.credentials
+
+# 3. start it again and confirm what it reads
+systemctl --user start trick-vault
+.venv/bin/python -m trick backup list --remote https://YOUR-HOST:8790 --fingerprint THE-FINGERPRINT
+
+# going back is the same command with --backend fs
+```
+
+What the migration reports, and what it refuses to do:
+
+* every object is read from the source, hashed, written to the target, read back
+  from the target and hashed again; only then does it count as copied;
+* one refused write stops the run and the config is left unchanged, because a
+  half-migrated store that already points at the target is worse than one that
+  never moved;
+* `--dry-run` prints the byte and object totals and writes nothing;
+* `--keep-source` is the default; add nothing and the old blobs stay, so you can
+  migrate back by running the command in reverse. Only when the new backend has
+  served a real restore should you delete the old copies.
+
+Measured on this tree with a real archive (380,781 bytes, 77 decisions) through
+three legs -- local disk, S3, local disk again -- the pulled file hashed to the
+pushed sha256 every time, and the rows after import were identical. The script
+that does it is `scripts/verify_storage.py`; run it once on your own stack before
+pointing production at a new bucket.
+
 ### 10c. Plans and devices (optional)
 
 A plan is a set of limits on the server, not a feature flag on the client: the

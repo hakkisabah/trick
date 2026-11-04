@@ -69,6 +69,19 @@ PY
   echo
 fi
 
+# A place for storage credentials that is not in the config file and not in the
+# environment of everyone on the box: 0600, read only by the unit above.
+if [ ! -f "$ETC/storage.env" ]; then
+  cat >"$ETC/storage.env" <<'ENV'
+# Only needed for backend "s3" (see docs/REMOTE.md). Uncomment and fill in, or
+# leave the file empty and keep the blobs on this disk.
+# TRICK_S3_ACCESS_KEY=
+# TRICK_S3_SECRET_KEY=
+ENV
+  chmod 600 "$ETC/storage.env"
+fi
+chmod 600 "$ETC/storage.env"
+
 chown -R "$USER_NAME:$USER_NAME" "$STORE" "$APP"
 chmod 700 "$STORE"
 
@@ -86,6 +99,9 @@ WorkingDirectory=$APP
 # Optional: the shared secret a payment provider signs plan changes with.
 # Absent by default, and with it absent /v1/admin/entitlement answers 401.
 EnvironmentFile=-$ETC/admin.env
+# Optional: TRICK_S3_ACCESS_KEY / TRICK_S3_SECRET_KEY, needed only when the blobs
+# live in object storage instead of the disk. Absent means backend "fs".
+EnvironmentFile=-$ETC/storage.env
 ExecStart=$APP/venv/bin/python -m trick vault serve \\
     --root $STORE --host 0.0.0.0 --port $PORT --expose-public \\
     --cert $ETC/tls/cert.pem --key $ETC/tls/key.pem

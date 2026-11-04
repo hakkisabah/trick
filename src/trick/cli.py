@@ -26,10 +26,11 @@ import signal
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 from .bridge import BridgeServer, cors_from_env
 from .credentials import DEFAULT_CREDENTIALS_PATH, load_laya_credentials
-from .errors import ConfigError, ContractViolation, TrickError
+from .errors import ConfigError, ContractViolation, StorageIO, TrickError
 from .laya import LayaClient, build_scorer
 from .matrix import MatrixIndex, MatrixMissing
 from .matrixbuild import build_from_store
@@ -484,6 +485,111 @@ def cmd_vault(args) -> int:
         server_ssl_context,
     )
 
+    if args.action == "storage":
+        from . import blobstore
+
+        root = Path(args.root)
+        which = args.storage_action or "show"
+        try:
+            if which == "show":
+                config = blobstore.load_config(root)
+                info: dict[str, Any] = {
+                    "root": str(root),
+                    "config_file": str(root / blobstore.CONFIG_NAME),
+                    "config": config,
+                }
+                try:
+                    backend = blobstore.make_backend(config, root)
+                    info["backend"] = backend.describe()
+                    keys = blobstore.iter_keys(root)
+                    info["objects"] = len(keys)
+                except ConfigError as exc:
+                    # A store whose config cannot be built must still be able to
+                    # say so; refusing to print the config would hide the reason.
+                    info["backend_error"] = f"{exc.s_code} {exc}"
+                print(json.dumps(info, indent=2))
+                return 0
+            if which == "test":
+                config = blobstore.load_config(root)
+                if args.backend:
+                    config = blobstore.config_from_args(
+                        args.backend,
+                        endpoint=args.endpoint,
+                        bucket=args.bucket,
+                        region=args.region,
+                        prefix=args.prefix,
+                        addressing=args.addressing,
+                        sse=args.sse,
+                        credentials_file=args.credentials_file,
+                    )
+                result = blobstore.probe(blobstore.make_backend(config, root))
+                print(json.dumps(result, indent=2))
+                return 0
+            if which == "set":
+                if not args.backend:
+                    raise ConfigError("storage set needs --backend fs|s3")
+                config = blobstore.config_from_args(
+                    args.backend,
+                    endpoint=args.endpoint,
+                    bucket=args.bucket,
+                    region=args.region,
+                    prefix=args.prefix,
+                    addressing=args.addressing,
+                    sse=args.sse,
+                    credentials_file=args.credentials_file,
+                )
+                backend = blobstore.make_backend(config, root)
+                # Prove the backend works before the server is told to use it.
+                # A config file that only fails at the next start takes the store
+                # down; a probe fails this command instead.
+                check = blobstore.probe(backend)
+                path = blobstore.save_config(root, config)
+                print(
+                    json.dumps(
+                        {
+                            "written": str(path),
+                            "config": config,
+                            "probe": check,
+                            "next": "restart the store so it reads the new backend: "
+                            "systemctl --user restart trick-vault (or rerun trick vault serve)",
+                        },
+                        indent=2,
+                    )
+                )
+                return 0
+            if which == "migrate":
+                if not args.backend:
+                    raise ConfigError("storage migrate needs --backend fs|s3 for the target")
+                config = blobstore.config_from_args(
+                    args.backend,
+                    endpoint=args.endpoint,
+                    bucket=args.bucket,
+                    region=args.region,
+                    prefix=args.prefix,
+                    addressing=args.addressing,
+                    sse=args.sse,
+                    credentials_file=args.credentials_file,
+                )
+                target = blobstore.make_backend(config, root)
+                blobstore.probe(target)
+                result = blobstore.migrate(
+                    root,
+                    target,
+                    keep_source=bool(args.keep_source),
+                    dry_run=bool(args.dry_run),
+                    target_config=config,
+                    progress=lambda line: print(line, file=sys.stderr, flush=True),
+                )
+                print(json.dumps(result, indent=2))
+                return 0 if not result["failed"] else 1
+            print(f"unknown storage action {which!r}", file=sys.stderr)
+            return 2
+        except ConfigError as exc:
+            print(f"vault: {exc.s_code} {exc}", file=sys.stderr)
+            return 1
+        except StorageIO as exc:
+            print(f"vault: {exc.s_code} {exc}", file=sys.stderr)
+            return 1
     if args.action == "init":
         result = init_store(Path(args.root), name=args.account)
         print(json.dumps(result, indent=2))
@@ -519,7 +625,10 @@ def cmd_vault(args) -> int:
         return 2
     accounts_path = Path(args.accounts or (Path(args.root) / "accounts.json"))
     accounts = load_accounts(accounts_path)
-    store = VaultStore(Path(args.root), accounts, accounts_path=accounts_path)
+    from .blobstore import backend_for_root
+
+    backend = backend_for_root(Path(args.root))
+    store = VaultStore(Path(args.root), accounts, accounts_path=accounts_path, backend=backend)
     tls = server_ssl_context(Path(args.cert), Path(args.key)) if args.cert and args.key else None
     admin_secret = args.admin_secret or os.environ.get("TRICK_ADMIN_SECRET") or ""
     server = VaultServer(
@@ -534,7 +643,7 @@ def cmd_vault(args) -> int:
     scheme = "https" if tls is not None else "http"
     print(
         f"vault: listening on {scheme}://{args.host}:{args.port} "
-        f"root={args.root} accounts={len(accounts)}",
+        f"root={args.root} accounts={len(accounts)} storage={backend.name}",
         file=sys.stderr,
         flush=True,
     )
@@ -690,7 +799,16 @@ def build_parser() -> argparse.ArgumentParser:
     backup.set_defaults(func=cmd_backup)
 
     vault = sub.add_parser("vault", help="run or initialise the remote memory store")
-    vault.add_argument("action", choices=("init", "serve", "plans", "plan", "device"))
+    vault.add_argument(
+        "action",
+        choices=("init", "serve", "plans", "plan", "device", "storage"),
+    )
+    vault.add_argument(
+        "storage_action",
+        nargs="?",
+        choices=("show", "set", "test", "migrate"),
+        help="with action='storage': show, set, test or migrate",
+    )
     vault.add_argument("--root", default=str(Path(DEFAULT_HOME) / "vault-store"))
     vault.add_argument("--accounts", help="accounts file (default <root>/accounts.json)")
     vault.add_argument("--account", default="owner", help="account name for init/plan/device")
@@ -707,6 +825,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="permit a wildcard bind; requires TLS, meant for a store behind a firewall",
     )
+    # storage backend selection (action='storage')
+    vault.add_argument("--backend", choices=("fs", "s3"), help="storage backend for 'storage set/migrate'")
+    vault.add_argument("--endpoint", help="s3 endpoint, e.g. https://s3.eu-central-1.amazonaws.com")
+    vault.add_argument("--bucket", help="s3 bucket")
+    vault.add_argument("--region", default=None, help="s3 region (default us-east-1)")
+    vault.add_argument("--prefix", help="key prefix inside the bucket")
+    vault.add_argument("--addressing", choices=("path", "virtual"), default=None)
+    vault.add_argument("--sse", help="server-side encryption header, e.g. AES256")
+    vault.add_argument("--credentials-file", help="0600 file holding TRICK_S3_ACCESS_KEY / TRICK_S3_SECRET_KEY")
+    vault.add_argument("--keep-source", action="store_true", help="migration: leave the old blobs in place")
+    vault.add_argument("--dry-run", action="store_true", help="migration: copy nothing, only count")
     vault.set_defaults(func=cmd_vault)
     return parser
 
